@@ -1,1 +1,18 @@
-/target
+# Rust / Cargo
+**/target/
+
+# Tauri generated files
+src-tauri/gen/schemas/
+
+# Node / frontend
+node_modules/
+**/dist/
+
+# Logs
+*.log
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
