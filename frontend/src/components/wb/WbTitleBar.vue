@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { appWindow } from '../../lib/tauri'
+import AppLogo from '../AppLogo.vue'
 import { showNewConn } from '../../stores/hosts'
 import { showSettings } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
@@ -59,11 +60,7 @@ function onSettings() {
 
     <!-- 品牌（点击返回首页；不参与窗口拖拽以接收点击） -->
     <div class="logo" title="返回首页" @click="goHome">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="4 17 10 11 4 5"></polyline>
-        <line x1="12" y1="19" x2="20" y2="19"></line>
-      </svg>
+      <AppLogo />
       <span>Rhost</span>
     </div>
 

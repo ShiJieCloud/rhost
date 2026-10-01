@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import AppLogo from '../AppLogo.vue'
 import { toast } from '../../composables/useToast'
 import { hosts, showNewConn } from '../../stores/hosts'
 import {
-  activeHost, activeSessionId, connected, openSession, reconnectTick, setSessionState,
+  activeHost, activeSessionId, connected, openSession, reconnectTick, sessions, setSessionState,
 } from '../../stores/session'
+import type { Session, SessionState } from '../../stores/session'
 import type { Host, HostStatus } from '../../types'
 
 /* TODO: 接入后端后由 IPC 二进制流 + xterm.js 替换 DOM 模拟 */
@@ -156,25 +158,23 @@ watch(reconnectTick, () => {
 })
 
 /* ---- 命令模拟 ---- */
-function clearScreen() {
-  const st = current.value
-  if (st) st.lines = []
+function clearTerm(st: TermState) {
+  st.lines = []
 }
 
-function disconnect() {
-  const host = activeHost.value
-  const st = current.value
-  if (!host || !st) return
+function clearScreen() {
+  if (current.value) clearTerm(current.value)
+}
+
+function disconnect(st: TermState, host: Host) {
   st.lines.push('<span class="c-dim">logout</span>')
   st.lines.push(`<span class="c-dim">Connection to ${esc(host.ip)} closed.</span>`)
   st.enabled = false
   setSessionState(host.id, 'offline')
-  toast('会话已断开', 'info')
 }
 
-function runCommand(raw: string) {
-  const st = current.value!
-  const host = activeHost.value!
+/** 在指定会话的终端中执行命令（广播与当前会话共用） */
+function runCommandFor(st: TermState, host: Host, raw: string) {
   const cmd = raw.toLowerCase().replace(/\s+/g, ' ')
 
   const table = (rows: string[][]) =>
@@ -261,10 +261,10 @@ function runCommand(raw: string) {
       return
     }
     case 'clear':
-      clearScreen()
+      clearTerm(st)
       return
     case 'exit':
-      disconnect()
+      disconnect(st, host)
       return
   }
 
@@ -276,6 +276,144 @@ function runCommand(raw: string) {
   st.lines.push('<span class="c-dim">输入 </span><span class="c-green">help</span><span class="c-dim"> 查看可用命令</span>')
 }
 
+/** 当前活动会话执行命令（保留原有 toast 反馈） */
+function runCommand(raw: string) {
+  const st = current.value
+  const host = activeHost.value
+  if (!st || !host) return
+  runCommandFor(st, host, raw)
+  if (raw.toLowerCase().trim() === 'exit') toast('会话已断开', 'info')
+}
+
+/* ---- 广播命令（一次发送到多个会话） ---- */
+const bcastOpen = ref(false)
+const bcastCmd = ref('')
+const bcastPopOpen = ref(false)
+const selectedIds = ref<string[]>([])
+const bcastInputEl = ref<HTMLInputElement | null>(null)
+const bcastHistory: string[] = []
+let bcastHistIdx = 0
+
+/** 可作为广播目标的在线会话 */
+const onlineTargets = computed(() => sessions.value.filter(s => s.state === 'online'))
+
+/** 选中且仍然在线的会话（自动过滤已断开/已关闭的选择） */
+const effectiveSelected = computed<Session[]>(() =>
+  selectedIds.value
+    .map(id => sessions.value.find(s => s.id === id))
+    .filter((s): s is Session => !!s && s.state === 'online'),
+)
+
+const targetLabel = computed(() => {
+  const total = onlineTargets.value.length
+  const n = effectiveSelected.value.length
+  if (!total) return '无在线会话'
+  if (n === total) return `全部在线 · ${n}`
+  if (n === 0) return '未选择会话'
+  return `已选 ${n} / ${total} 台`
+})
+
+function toggleBroadcast() {
+  if (!bcastOpen.value) {
+    if (!onlineTargets.value.length) {
+      toast('当前没有可广播的在线会话', 'warn')
+      return
+    }
+    bcastOpen.value = true
+    // 打开时若选择已失效（如上次的会话全部关闭），默认全选在线会话
+    if (!effectiveSelected.value.length) selectedIds.value = onlineTargets.value.map(s => s.id)
+    nextTick(() => {
+      bcastInputEl.value?.focus()
+      scrollToBottom(true)
+    })
+  } else {
+    bcastOpen.value = false
+    bcastPopOpen.value = false
+  }
+}
+
+function toggleTarget(id: string) {
+  const i = selectedIds.value.indexOf(id)
+  if (i === -1) selectedIds.value.push(id)
+  else selectedIds.value.splice(i, 1)
+}
+
+function selectAllOnline() {
+  selectedIds.value = onlineTargets.value.map(s => s.id)
+}
+
+function broadcastSend() {
+  const raw = bcastCmd.value.trim()
+  if (!raw) return
+  const targets = effectiveSelected.value
+  if (!targets.length) {
+    toast('请选择至少一个在线会话', 'warn')
+    return
+  }
+  let n = 0
+  for (const s of targets) {
+    const st = terms[s.id]
+    if (!st || !st.enabled) continue
+    st.lines.push(`${st.promptHtml} ${esc(raw)}`)
+    st.history.push(raw)
+    st.histIdx = st.history.length
+    runCommandFor(st, s.host, raw)
+    n++
+  }
+  if (n && bcastHistory[0] !== raw) {
+    bcastHistory.unshift(raw)
+    if (bcastHistory.length > 30) bcastHistory.pop()
+  }
+  bcastHistIdx = bcastHistory.length
+  bcastCmd.value = ''
+  scrollToBottom(true)
+  toast(n ? `已向 ${n} 个会话广播命令` : '没有可发送的在线会话', n ? 'ok' : 'warn')
+}
+
+function onBcastKey(e: KeyboardEvent) {
+  e.stopPropagation()
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    broadcastSend()
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    if (bcastHistIdx > 0) {
+      bcastHistIdx--
+      bcastCmd.value = bcastHistory[bcastHistIdx]
+    }
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    if (bcastHistIdx < bcastHistory.length - 1) {
+      bcastHistIdx++
+      bcastCmd.value = bcastHistory[bcastHistIdx]
+    } else {
+      bcastHistIdx = bcastHistory.length
+      bcastCmd.value = ''
+    }
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    if (bcastPopOpen.value) bcastPopOpen.value = false
+    else if (bcastCmd.value) bcastCmd.value = ''
+    else bcastOpen.value = false
+  }
+}
+
+function stateDotCls(state: SessionState) {
+  return state === 'online' ? 'st-ok'
+    : state === 'connecting' ? 'st-info'
+    : state === 'reconnecting' ? 'st-warn'
+    : state === 'idle' ? 'st-idle'
+    : 'st-err'
+}
+
+function stateLabel(state: SessionState) {
+  return state === 'online' ? '在线'
+    : state === 'connecting' ? '连接中'
+    : state === 'reconnecting' ? '重连中'
+    : state === 'idle' ? '空闲'
+    : '已断开'
+}
+
 /* ---- 键盘 ---- */
 function onKey(e: KeyboardEvent) {
   if (showNewConn.value) return
@@ -285,6 +423,12 @@ function onKey(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 't') {
     e.preventDefault()
     showNewConn.value = true
+    return
+  }
+  // ⌘/Ctrl+Shift+B：切换广播命令条
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'b') {
+    e.preventDefault()
+    toggleBroadcast()
     return
   }
   const st = current.value
@@ -363,7 +507,7 @@ function dotClass(status: HostStatus) {
 <template>
   <div ref="wrapEl" class="terminal-wrap">
     <!-- 工具栏（仅在终端活跃时显示） -->
-    <div v-if="current" class="term-tools">
+    <div v-if="current" class="term-tools" :class="{ pinned: bcastOpen }">
       <button title="滚动到顶部" @click="termEl && (termEl.scrollTop = 0)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="12" y1="19" x2="12" y2="5"></line>
@@ -382,10 +526,24 @@ function dotClass(status: HostStatus) {
           <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
         </svg>
       </button>
+      <button
+        class="bcast-tool"
+        :class="{ on: bcastOpen }"
+        title="广播命令到多个会话 (⌘⇧B)"
+        @click="toggleBroadcast"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="5.5" cy="12" r="2.2"></circle>
+          <circle cx="18.5" cy="6" r="2.2"></circle>
+          <circle cx="18.5" cy="18" r="2.2"></circle>
+          <path d="M7.6 10.9 16.4 7.1"></path>
+          <path d="M7.6 13.1l8.8 3.8"></path>
+        </svg>
+      </button>
     </div>
 
     <!-- 终端（有会话时） -->
-    <div v-if="current" ref="termEl" class="terminal" @scroll="onScroll">
+    <div v-if="current" ref="termEl" class="terminal" :class="{ 'bcast-on': bcastOpen }" @scroll="onScroll">
       <div v-for="(line, i) in current.lines" :key="i" class="line" v-html="line"></div>
       <div class="line" :class="{ hidden: !current.enabled }">
         <span class="prompt" v-html="current.promptHtml"></span>
@@ -394,15 +552,83 @@ function dotClass(status: HostStatus) {
       </div>
     </div>
 
+    <!-- 广播命令条：一次发送命令到多个会话 -->
+    <div v-if="current && bcastOpen" class="bcast">
+      <div v-if="bcastPopOpen" class="bcast-scrim" @click="bcastPopOpen = false"></div>
+
+      <div v-if="bcastPopOpen" class="bcast-pop">
+        <div class="bp-head">
+          目标会话
+          <span>{{ effectiveSelected.length }} / {{ onlineTargets.length }}</span>
+        </div>
+        <div class="bp-list">
+          <button
+            v-for="s in sessions"
+            :key="s.id"
+            class="bp-item"
+            :class="{ disabled: s.state !== 'online' }"
+            :disabled="s.state !== 'online'"
+            @click="toggleTarget(s.id)"
+          >
+            <span class="bp-check" :class="{ on: selectedIds.includes(s.id) }">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </span>
+            <span class="dot" :class="stateDotCls(s.state)"></span>
+            <span class="bp-name">{{ s.host.id }}</span>
+            <span class="bp-addr">{{ s.host.user }}@{{ s.host.ip }}</span>
+            <span class="bp-state">{{ stateLabel(s.state) }}</span>
+          </button>
+          <div v-if="!sessions.length" class="bp-empty">暂无可选会话</div>
+        </div>
+        <div class="bp-foot">
+          <button @click="selectAllOnline">全选在线</button>
+          <button @click="selectedIds = []">清空</button>
+        </div>
+      </div>
+
+      <div class="bcast-bar">
+        <span class="bcast-ico" title="广播模式">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="5.5" cy="12" r="2.2"></circle>
+            <circle cx="18.5" cy="6" r="2.2"></circle>
+            <circle cx="18.5" cy="18" r="2.2"></circle>
+            <path d="M7.6 10.9 16.4 7.1"></path>
+            <path d="M7.6 13.1l8.8 3.8"></path>
+          </svg>
+        </span>
+
+        <button class="bcast-targets" :class="{ none: effectiveSelected.length === 0 }" @click.stop="bcastPopOpen = !bcastPopOpen">
+          <span>{{ targetLabel }}</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </button>
+
+        <input
+          ref="bcastInputEl"
+          v-model="bcastCmd"
+          class="bcast-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="输入命令，按 Enter 广播到所选会话（↑/↓ 切换历史，Esc 关闭）"
+          @keydown="onBcastKey"
+        >
+
+        <button
+          class="bcast-send"
+          :disabled="!bcastCmd.trim() || effectiveSelected.length === 0"
+          @click="broadcastSend"
+        >
+          发送
+          <kbd>↵</kbd>
+        </button>
+      </div>
+    </div>
+
     <!-- 空态（关闭所有 Tab 后） -->
-    <div v-else class="tp-empty">
+    <div v-if="!current" class="tp-empty">
       <div class="icon-wrap">
         <div class="icon-box">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2.5" y="4" width="19" height="16" rx="3"/>
-            <path d="M7 9.5L9.5 12L7 14.5"/>
-            <path d="M13 14.5h4"/>
-          </svg>
+          <AppLogo />
         </div>
       </div>
       <h1>没有活动的会话</h1>

@@ -93,6 +93,16 @@ export function openSession(hostId: string) {
   persistSessions()
 }
 
+/** 主机被编辑（可能改名/替换对象）后，同步重挂已打开的会话 */
+export function rehostSession(oldId: string, host: Host) {
+  const s = sessions.value.find(x => x.id === oldId)
+  if (!s) return
+  s.id = host.id
+  s.host = host
+  if (activeSessionId.value === oldId) activeSessionId.value = host.id
+  persistSessions()
+}
+
 export function closeSession(id: string) {
   const idx = sessions.value.findIndex(s => s.id === id)
   if (idx === -1) return

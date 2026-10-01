@@ -35,3 +35,24 @@ export const filterInfo = computed(() =>
 export function addHost(h: Host) {
   hosts.value.push(h)
 }
+
+/** 正在编辑的主机；非 null 时新建连接弹窗以编辑态打开 */
+export const editingHost = ref<Host | null>(null)
+
+export function openEdit(h: Host) {
+  editingHost.value = h
+  showNewConn.value = true
+}
+
+/** 按 id 局部更新主机，返回更新后的新对象（未找到返回 null） */
+export function updateHost(id: string, patch: Partial<Host>): Host | null {
+  const idx = hosts.value.findIndex(h => h.id === id)
+  if (idx === -1) return null
+  hosts.value[idx] = { ...hosts.value[idx]!, ...patch }
+  return hosts.value[idx]!
+}
+
+export function removeHost(id: string) {
+  const idx = hosts.value.findIndex(h => h.id === id)
+  if (idx !== -1) hosts.value.splice(idx, 1)
+}

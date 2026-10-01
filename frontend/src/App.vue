@@ -6,6 +6,8 @@ import HomeView from './views/HomeView.vue'
 import Workbench from './views/Workbench.vue'
 import NewConnectionModal from './components/NewConnectionModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
+import GroupModal from './components/GroupModal.vue'
+import KeysModal from './components/KeysModal.vue'
 import AppToast from './components/AppToast.vue'
 import { appView, restoreSessions } from './stores/session'
 
@@ -27,6 +29,8 @@ onMounted(restoreSessions)
 
     <NewConnectionModal />
     <SettingsModal />
+    <GroupModal />
+    <KeysModal />
     <AppToast />
   </div>
 </template>

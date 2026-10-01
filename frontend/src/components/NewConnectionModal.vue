@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { toast } from '../composables/useToast'
-import { addHost, showNewConn } from '../stores/hosts'
-import { COLOR_MAP, GROUP_OPTIONS } from '../data/mockHosts'
+import { addHost, editingHost, showNewConn, updateHost } from '../stores/hosts'
+import { rehostSession } from '../stores/session'
+import { GROUP_OPTIONS } from '../data/mockHosts'
 import type { HostColor } from '../types'
 
 /* =========================================================
    类型与表单定义（数据驱动）
    ========================================================= */
-type ConnType = 'ssh' | 'local' | 'serial' | 'docker' | 'telnet'
+type ConnType = 'ssh' | 'sftp' | 'local' | 'serial' | 'docker' | 'telnet'
 type Values = Record<string, string>
 
 interface FieldOption { v: string; t: string }
@@ -17,7 +18,7 @@ interface FieldDef {
   name: string
   span: 1 | 2
   required?: boolean
-  type?: 'text' | 'number' | 'password' | 'select' | 'segmented' | 'color' | 'textarea'
+  type?: 'text' | 'number' | 'password' | 'select' | 'segmented' | 'tags' | 'textarea'
   value?: string
   placeholder?: string
   hint?: string
@@ -47,10 +48,13 @@ const ICONS: Record<string, string> = {
   serial: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 01-6 6 6 6 0 01-6-6V8zM12 18v4"/></svg>',
   docker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18v3a5 5 0 01-5 5H8a5 5 0 01-5-5v-3z"/><path d="M7 12V9h3v3M12 12V9h3v3M12 8V5h3v3"/></svg>',
   telnet: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 010 18 15 15 0 010-18z"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  sftp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3.5l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 9.5v5M10 12.5l2 2 2-2"/></svg>',
 }
 
 const TYPES: { v: ConnType; t: string; icon: string; sub: string }[] = [
   { v: 'ssh', t: 'SSH', icon: 'ssh', sub: 'SSH · 安全远程主机连接' },
+  { v: 'sftp', t: 'SFTP', icon: 'sftp', sub: 'SFTP · 安全文件传输' },
   { v: 'local', t: '本地', icon: 'local', sub: '本地 Shell 会话' },
   { v: 'serial', t: '串口', icon: 'serial', sub: '串口设备连接' },
   { v: 'docker', t: 'Docker', icon: 'docker', sub: 'Docker 容器终端' },
@@ -73,7 +77,8 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
           { label: '主机地址', name: 'host', span: 2, required: true, placeholder: '192.168.1.10 或 example.com' },
           { label: '端口', name: 'port', span: 1, required: true, value: '22', type: 'number' },
           { label: '用户名', name: 'user', span: 1, required: true, placeholder: 'root' },
-          { label: '颜色标签', name: 'color', span: 2, type: 'color', value: 'green' },
+          { label: '标签', name: 'tags', span: 2, type: 'tags',
+            placeholder: '输入标签后回车，如：生产、数据库' },
         ],
       },
       {
@@ -184,6 +189,117 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
     ],
   },
 
+  sftp: {
+    cards: [
+      {
+        id: 'basic', title: '基本信息', icon: 'info',
+        desc: '设置 SFTP 连接的显示名称、目标主机与颜色标签。',
+        summary: v => [v.name, v.host && (v.host + (v.port && v.port !== '22' ? ':' + v.port : ''))]
+          .filter(Boolean).join(' · '),
+        fields: [
+          { label: '名称', name: 'name', span: 1, placeholder: '留空自动生成' },
+          { label: '分组', name: 'group', span: 1, type: 'select', value: GROUP_OPTIONS[0], options: GROUP_OPTS },
+          { label: '主机地址', name: 'host', span: 2, required: true, placeholder: '192.168.1.10 或 example.com' },
+          { label: '端口', name: 'port', span: 1, required: true, value: '22', type: 'number' },
+          { label: '用户名', name: 'user', span: 1, required: true, placeholder: 'root' },
+          { label: '标签', name: 'tags', span: 2, type: 'tags',
+            placeholder: '输入标签后回车，如：生产、文件服务器' },
+        ],
+      },
+      {
+        id: 'auth', title: '认证方式', icon: 'lock',
+        desc: '选择登录凭据类型。密码与私钥口令将加密保存到系统钥匙串。',
+        summary: v => v.auth === 'password' ? '密码'
+          : v.auth === 'key' ? (v.keyfile ? '公钥 · ' + v.keyfile : '公钥')
+          : v.auth === 'agent' ? 'SSH Agent' : '',
+        fields: [
+          { label: '认证方式', name: 'auth', span: 2, type: 'segmented', value: 'key',
+            options: [
+              { v: 'key', t: '公钥' },
+              { v: 'password', t: '密码' },
+              { v: 'agent', t: 'SSH Agent' },
+            ] },
+          { label: '私钥文件', name: 'keyfile', span: 2, value: '~/.ssh/id_ed25519',
+            hint: '支持 RSA / ECDSA / Ed25519 格式的私钥',
+            showWhen: v => v.auth === 'key' },
+          { label: '密码', name: 'password', span: 2, type: 'password',
+            placeholder: '输入登录密码', showWhen: v => v.auth === 'password' },
+        ],
+      },
+      {
+        id: 'transfer', title: '目录与传输', icon: 'folder',
+        desc: '连接后默认打开的本地 / 远程目录，以及文件传输策略。',
+        summary: v => {
+          const p: string[] = []
+          if (v.remotePath) p.push(v.remotePath)
+          if (v.transferMode === 'binary') p.push('二进制')
+          else if (v.transferMode === 'ascii') p.push('文本')
+          if (v.resume === 'on') p.push('断点续传')
+          return p.join(' · ')
+        },
+        fields: [
+          { label: '默认远程目录', name: 'remotePath', span: 1, placeholder: '/var/www 或 /home/user' },
+          { label: '默认本地目录', name: 'localPath', span: 1, placeholder: '~/Downloads' },
+          { label: '传输模式', name: 'transferMode', span: 1, type: 'select', value: 'auto',
+            options: [
+              { v: 'auto', t: '自动识别' },
+              { v: 'binary', t: '二进制' },
+              { v: 'ascii', t: '文本' },
+            ] },
+          { label: '传输并发数', name: 'concurrency', span: 1, type: 'select', value: '4',
+            options: ['1', '2', '4', '8'].map(n => ({ v: n, t: n + ' 线程' })) },
+          { label: '保留权限', name: 'keepPerms', span: 1, type: 'select', value: 'on',
+            options: [{ v: 'on', t: '开启' }, { v: 'off', t: '关闭' }] },
+          { label: '保留时间戳', name: 'keepTimes', span: 1, type: 'select', value: 'on',
+            options: [{ v: 'on', t: '开启' }, { v: 'off', t: '关闭' }] },
+          { label: '断点续传', name: 'resume', span: 1, type: 'select', value: 'on',
+            options: [{ v: 'on', t: '开启' }, { v: 'off', t: '关闭' }] },
+          { label: '同名文件', name: 'onExists', span: 1, type: 'select', value: 'ask',
+            options: [
+              { v: 'ask', t: '每次询问' },
+              { v: 'overwrite', t: '直接覆盖' },
+              { v: 'rename', t: '自动重命名' },
+              { v: 'skip', t: '跳过' },
+            ] },
+        ],
+      },
+      {
+        id: 'network', title: '网络与代理', icon: 'globe',
+        desc: '配置代理、跳板机与连接保活。跳板机支持多级串联。',
+        summary: v => {
+          const p: string[] = []
+          if (v.proxyType && v.proxyType !== 'none') p.push('代理')
+          if (v.jumpHost) p.push('跳板机')
+          if (v.keepalive && v.keepalive !== '0') p.push('保活 ' + v.keepalive + 's')
+          return p.join(' · ')
+        },
+        fields: [
+          { label: '代理类型', name: 'proxyType', span: 1, type: 'select', value: 'none',
+            options: [
+              { v: 'none', t: '不使用代理' },
+              { v: 'http', t: 'HTTP 代理' },
+              { v: 'socks5', t: 'SOCKS5' },
+            ] },
+          { label: '代理地址', name: 'proxyHost', span: 1, placeholder: '127.0.0.1:7890',
+            showWhen: v => !!v.proxyType && v.proxyType !== 'none' },
+          { label: '跳板机', name: 'jumpHost', span: 2, type: 'textarea',
+            placeholder: 'user@jump.example.com:22\n支持多级，每行一台，从上到下依次连接',
+            hint: '多条跳板机按顺序串联' },
+          { label: '保活间隔（秒）', name: 'keepalive', span: 1, value: '60', type: 'number', hint: '0 = 禁用' },
+          { label: '连接超时（秒）', name: 'timeout', span: 1, value: '15', type: 'number' },
+          { label: '压缩传输', name: 'compression', span: 1, type: 'select', value: 'off',
+            options: [{ v: 'off', t: '关闭' }, { v: 'on', t: '开启' }] },
+          { label: '主机密钥验证', name: 'hostKeyCheck', span: 1, type: 'select', value: 'ask',
+            options: [
+              { v: 'ask', t: '每次询问' },
+              { v: 'accept', t: '自动接受' },
+              { v: 'strict', t: '严格拒绝未知' },
+            ] },
+        ],
+      },
+    ],
+  },
+
   local: {
     cards: [
       {
@@ -204,7 +320,8 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
             ] },
           { label: '启动参数', name: 'args', span: 1, placeholder: '-l' },
           { label: '工作目录', name: 'cwd', span: 1, placeholder: '留空使用默认目录' },
-          { label: '颜色标签', name: 'color', span: 1, type: 'color', value: 'blue' },
+          { label: '标签', name: 'tags', span: 1, type: 'tags',
+            placeholder: '输入后回车' },
         ],
       },
       {
@@ -231,7 +348,8 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
           { label: '串口设备', name: 'device', span: 2, required: true,
             placeholder: '/dev/ttyUSB0 或 COM3',
             hint: 'Linux/macOS：/dev/tty*；Windows：COMx' },
-          { label: '颜色标签', name: 'color', span: 2, type: 'color', value: 'yellow' },
+          { label: '标签', name: 'tags', span: 2, type: 'tags',
+            placeholder: '输入标签后回车，如：交换机、现场设备' },
         ],
       },
       {
@@ -295,7 +413,8 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
           { label: '容器', name: 'container', span: 2, required: true,
             placeholder: '容器名或 ID，如 nginx-prod',
             hint: '支持模糊匹配' },
-          { label: '颜色标签', name: 'color', span: 2, type: 'color', value: 'cyan' },
+          { label: '标签', name: 'tags', span: 2, type: 'tags',
+            placeholder: '输入标签后回车，如：容器、nginx' },
         ],
       },
       {
@@ -329,7 +448,8 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
           { label: '分组', name: 'group', span: 1, type: 'select', value: GROUP_OPTIONS[0], options: GROUP_OPTS },
           { label: '主机地址', name: 'host', span: 1, required: true, placeholder: '192.168.1.1' },
           { label: '端口', name: 'port', span: 1, required: true, value: '23', type: 'number' },
-          { label: '颜色标签', name: 'color', span: 2, type: 'color', value: 'purple' },
+          { label: '标签', name: 'tags', span: 2, type: 'tags',
+            placeholder: '输入标签后回车，如：路由器、网络设备' },
         ],
       },
       {
@@ -361,16 +481,16 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
    ========================================================= */
 const currentType = ref<ConnType>('ssh')
 const currentCardId = ref('basic')
+/** 编辑态：正在编辑的主机原 id；null 表示新建 */
+const editingId = ref<string | null>(null)
+const isEdit = computed(() => !!editingId.value)
 const formData = reactive({} as Record<ConnType, Values>)
 const fieldErrors = reactive<Record<string, boolean>>({})
-const errorCards = reactive<Record<string, boolean>>({})
 const pwShown = reactive<Record<string, boolean>>({})
 const testing = ref(false)
 const saving = ref(false)
 const testResult = ref<{ kind: 'ok' | 'err' | 'loading'; text: string } | null>(null)
 const modalEl = ref<HTMLElement | null>(null)
-
-const COLOR_KEYS = Object.keys(COLOR_MAP) as HostColor[]
 
 const cards = computed(() => FORMS[currentType.value].cards)
 const card = computed(() => cards.value.find(c => c.id === currentCardId.value) ?? cards.value[0])
@@ -389,15 +509,33 @@ TYPES.forEach(t => initType(t.v))
    ========================================================= */
 watch(showNewConn, v => {
   if (!v) return
+  const h = editingHost.value
   TYPES.forEach(t => initType(t.v))
   Object.keys(fieldErrors).forEach(k => delete fieldErrors[k])
-  Object.keys(errorCards).forEach(k => delete errorCards[k])
   Object.keys(pwShown).forEach(k => delete pwShown[k])
-  currentType.value = 'ssh'
-  currentCardId.value = FORMS.ssh.cards[0].id
+  tagDraft.value = ''
   testResult.value = null
   testing.value = false
   saving.value = false
+  if (h) {
+    // 编辑态：当前持久化的主机只有 SSH / SFTP 两种
+    const type: ConnType = h.os === 'SFTP 主机' ? 'sftp' : 'ssh'
+    currentType.value = type
+    currentCardId.value = FORMS[type].cards[0].id
+    const d = formData[type]
+    d.name = h.id
+    d.user = h.user
+    d.host = h.ip
+    d.port = String(h.port)
+    d.group = GROUP_OPTIONS.includes(h.group) ? h.group : GROUP_OPTIONS[0]
+    // 新建时的兜底标记不回填为用户标签
+    d.tags = h.tag === '新建' || h.tag === 'SFTP' ? '' : h.tag
+    editingId.value = h.id
+  } else {
+    currentType.value = 'ssh'
+    currentCardId.value = FORMS.ssh.cards[0].id
+    editingId.value = null
+  }
   nextTick(() => setTimeout(() => {
     const el = modalEl.value?.querySelector('.content-pane input:not([type=hidden])') as HTMLElement | null
     el?.focus()
@@ -406,6 +544,8 @@ watch(showNewConn, v => {
 
 function close() {
   showNewConn.value = false
+  editingHost.value = null
+  editingId.value = null
 }
 
 function onKey(e: KeyboardEvent) {
@@ -429,7 +569,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
    切换与输入
    ========================================================= */
 function selectType(t: ConnType) {
-  if (t === currentType.value) return
+  if (isEdit.value || t === currentType.value) return
   currentType.value = t
   currentCardId.value = FORMS[t].cards[0].id
   testResult.value = null
@@ -442,9 +582,46 @@ function selectCard(id: string) {
 function setField(name: string, val: string) {
   values.value[name] = val
   delete fieldErrors[`${currentType.value}.${name}`]
-  delete errorCards[`${currentType.value}.${currentCardId.value}`]
   testResult.value = null
 }
+
+/* ---- 标签（chips）输入：值以逗号分隔存入 Values ---- */
+const tagDraft = ref('')
+
+function tagsOf(name: string): string[] {
+  return (values.value[name] || '')
+    .split(',').map(s => s.trim()).filter(Boolean)
+}
+function writeTags(name: string, list: string[]) {
+  values.value[name] = list.join(',')
+  testResult.value = null
+}
+function commitTag(name: string) {
+  const parts = tagDraft.value.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+  if (parts.length) {
+    const list = tagsOf(name)
+    parts.forEach(t => { if (!list.includes(t)) list.push(t) })
+    writeTags(name, list)
+  }
+  tagDraft.value = ''
+}
+function removeTag(name: string, t: string) {
+  writeTags(name, tagsOf(name).filter(x => x !== t))
+}
+function onTagKeydown(name: string, e: KeyboardEvent) {
+  if (e.key === 'Enter' || e.key === ',' || e.key === '，') {
+    if (e.metaKey || e.ctrlKey) return // 让 ⌘↵ 走保存
+    e.preventDefault()
+    commitTag(name)
+  } else if (e.key === 'Backspace' && !tagDraft.value) {
+    const list = tagsOf(name)
+    if (list.length) writeTags(name, list.slice(0, -1))
+  }
+}
+function focusTagControl(e: Event) {
+  (e.currentTarget as HTMLElement).querySelector('input')?.focus()
+}
+watch([currentType, currentCardId], () => { tagDraft.value = '' })
 
 function isVisible(f: FieldDef) {
   return !f.showWhen || f.showWhen(values.value)
@@ -459,7 +636,7 @@ function errorText(f: FieldDef) {
 }
 
 /* =========================================================
-   侧栏摘要与状态点
+   侧栏摘要
    ========================================================= */
 function summaryOf(c: CardDef) {
   try {
@@ -469,23 +646,16 @@ function summaryOf(c: CardDef) {
   }
 }
 
-function cardStatus(cardId: string): 'error' | 'done' | 'partial' | 'empty' {
-  if (errorCards[`${currentType.value}.${cardId}`]) return 'error'
-  const c = cards.value.find(x => x.id === cardId)
-  if (!c) return 'empty'
-  const req = c.fields.filter(f => f.required && isVisible(f))
-  if (!req.length) return 'done'
-  const filled = req.filter(f => (values.value[f.name] ?? '').trim()).length
-  if (filled === 0) return 'empty'
-  return filled < req.length ? 'partial' : 'done'
-}
-
 /* =========================================================
    校验
    ========================================================= */
 function validate(): boolean {
+  // 提交标签输入框中尚未确认的草稿，避免漏存
+  if (tagDraft.value) {
+    const tagField = card.value.fields.find(f => f.type === 'tags')
+    if (tagField) commitTag(tagField.name)
+  }
   Object.keys(fieldErrors).forEach(k => delete fieldErrors[k])
-  Object.keys(errorCards).forEach(k => delete errorCards[k])
 
   let firstBadCard = ''
   let firstBadField = ''
@@ -501,7 +671,6 @@ function validate(): boolean {
       }
       if (bad) {
         fieldErrors[`${currentType.value}.${f.name}`] = true
-        errorCards[`${currentType.value}.${c.id}`] = true
         if (!firstBadCard) {
           firstBadCard = c.id
           firstBadField = f.name
@@ -559,6 +728,7 @@ async function testConnection() {
 function autoName(v: Values): string {
   switch (currentType.value) {
     case 'ssh':
+    case 'sftp':
     case 'telnet':
       return `${v.user ? v.user + '@' : ''}${v.host}`
     case 'serial':
@@ -588,18 +758,42 @@ async function save() {
   // TODO: 接入后端后替换为 invoke('save_connection', { type, ...v })
   await new Promise(r => setTimeout(r, 500))
 
-  if (currentType.value === 'ssh') {
-    const label =
-      v.name.replace(/[^a-zA-Z0-9一-龥]/g, '').slice(0, 2).toUpperCase() || 'SS'
+  const label =
+    v.name.replace(/[^a-zA-Z0-9一-龥]/g, '').slice(0, 2).toUpperCase() ||
+    (currentType.value === 'sftp' ? 'SF' : 'SS')
+  const tagList = (v.tags || '').split(',').map(t => t.trim()).filter(Boolean)
+  const tagVal = tagList.length ? tagList.join(',') : (currentType.value === 'sftp' ? 'SFTP' : '新建')
+
+  // 编辑态：局部更新并同步已打开的会话，不新建、不连接
+  if (editingId.value) {
+    const oldId = editingId.value
+    const updated = updateHost(oldId, {
+      id: v.name,
+      user: v.user,
+      ip: v.host,
+      port: parseInt(v.port, 10) || 22,
+      label,
+      tag: tagVal,
+      group: v.group || GROUP_OPTIONS[0],
+    })
+    if (updated) rehostSession(oldId, updated)
+    saving.value = false
+    close()
+    toast(`已保存连接「${v.name}」的修改`, 'ok', 2400)
+    return
+  }
+
+  if (currentType.value === 'ssh' || currentType.value === 'sftp') {
+    const isSftp = currentType.value === 'sftp'
     addHost({
       id: v.name,
       user: v.user,
       ip: v.host,
       port: parseInt(v.port, 10) || 22,
-      os: 'Linux (未知发行版)',
-      color: (v.color || 'green') as HostColor,
+      os: isSftp ? 'SFTP 主机' : 'Linux (未知发行版)',
+      color: (isSftp ? 'cyan' : 'green') as HostColor,
       label,
-      tag: '新建',
+      tag: tagVal,
       status: 'idle',
       lat: null,
       cpu: '—',
@@ -621,14 +815,18 @@ async function save() {
       <!-- 头部 -->
       <div class="modal-head">
         <div class="modal-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+          <svg v-if="isEdit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
+          </svg>
+          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
                stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="5" x2="12" y2="19"></line>
             <line x1="5" y1="12" x2="19" y2="12"></line>
           </svg>
         </div>
         <div class="modal-title">
-          <h2 id="newConnTitle">新建连接</h2>
+          <h2 id="newConnTitle">{{ isEdit ? '编辑连接' : '新建连接' }}</h2>
           <p>{{ typeSub }}</p>
         </div>
         <button class="modal-close" title="关闭" @click="close">
@@ -638,8 +836,8 @@ async function save() {
         </button>
       </div>
 
-      <!-- 类型选择条 -->
-      <div class="type-bar">
+      <!-- 类型选择条（编辑态锁定为原类型） -->
+      <div class="type-bar" :class="{ locked: isEdit }">
         <div
           v-for="t in TYPES"
           :key="t.v"
@@ -660,7 +858,6 @@ async function save() {
             :key="c.id"
             class="snav-item"
             :class="{ active: currentCardId === c.id }"
-            :data-status="cardStatus(c.id)"
             @click="selectCard(c.id)"
           >
             <div class="snav-icon" v-html="ICONS[c.icon] || ICONS.info"></div>
@@ -668,18 +865,14 @@ async function save() {
               <div class="snav-title">{{ c.title }}</div>
               <div class="snav-summary">{{ summaryOf(c) }}</div>
             </div>
-            <div class="snav-badge"></div>
           </div>
         </nav>
 
         <section class="content-pane">
           <div class="pane-inner" :key="`${currentType}:${currentCardId}`">
-            <div class="pane-header">
-              <div class="pane-title">
-                <span class="dot"></span>
-                {{ card.title }}
-              </div>
-              <div v-if="card.desc" class="pane-desc">{{ card.desc }}</div>
+            <div class="st-panel-head">
+              <div class="st-panel-title">{{ card.title }}</div>
+              <div v-if="card.desc" class="st-panel-sub">{{ card.desc }}</div>
             </div>
 
             <div class="form-grid">
@@ -743,17 +936,29 @@ async function save() {
                   </button>
                 </div>
 
-                <div v-else-if="f.type === 'color'" class="color-row">
-                  <button
-                    v-for="c in COLOR_KEYS"
-                    :key="c"
-                    type="button"
-                    class="color-dot"
-                    :class="{ active: values[f.name] === c }"
-                    :style="{ '--c': COLOR_MAP[c] }"
-                    :title="c"
-                    @click="setField(f.name, c)"
-                  ></button>
+                <div v-else-if="f.type === 'tags'" class="tags-input" @click="focusTagControl">
+                  <span v-for="t in tagsOf(f.name)" :key="t" class="tag-chip">
+                    {{ t }}
+                    <button
+                      type="button"
+                      class="tag-chip-x"
+                      title="移除标签"
+                      @click.stop="removeTag(f.name, t)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"
+                           stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                  </span>
+                  <input
+                    type="text"
+                    :value="tagDraft"
+                    :placeholder="tagsOf(f.name).length ? '' : f.placeholder"
+                    autocomplete="off"
+                    spellcheck="false"
+                    @input="tagDraft = ($event.target as HTMLInputElement).value"
+                    @keydown="onTagKeydown(f.name, $event)"
+                    @blur="commitTag(f.name)"
+                  >
                 </div>
 
                 <textarea
@@ -828,7 +1033,7 @@ async function save() {
             <polyline points="17 21 17 13 7 13 7 21"></polyline>
             <polyline points="7 3 7 8 15 8"></polyline>
           </svg>
-          {{ saving ? '保存中…' : '保存并连接' }}
+          {{ saving ? '保存中…' : (isEdit ? '保存修改' : '保存并连接') }}
         </button>
       </div>
     </div>

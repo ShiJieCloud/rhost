@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import AppLogo from './AppLogo.vue'
 import { toast } from '../composables/useToast'
 import {
   DEFAULT_SETTINGS, savedSettings, saveSettings, showSettings,
@@ -500,7 +501,7 @@ function segActive(key: keyof AppSettings, v: string): boolean {
 
               <!-- 关于卡片 -->
               <div v-if="p.about" class="st-about">
-                <div class="st-about-logo">&gt;_</div>
+                <div class="st-about-logo"><AppLogo /></div>
                 <div>
                   <div class="st-about-name">Rhost</div>
                   <div class="st-about-ver">v0.1.0 · 开发版</div>
