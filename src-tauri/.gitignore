@@ -2,3 +2,7 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# 移动端图标（仅桌面端发布，由 tauri icon 生成）
+/icons/android/
+/icons/ios/

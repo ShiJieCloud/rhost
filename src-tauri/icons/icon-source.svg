@@ -1,15 +1,18 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
+    <!-- 底座渐变：深灰蓝，中心略亮 -->
     <radialGradient id="plate" cx="50%" cy="38%" r="80%">
       <stop offset="0%" stop-color="#232b3a"/>
       <stop offset="55%" stop-color="#181f2b"/>
       <stop offset="100%" stop-color="#10151e"/>
     </radialGradient>
+    <!-- 底部绿色环境光 -->
     <radialGradient id="glow" cx="50%" cy="62%" r="46%">
       <stop offset="0%" stop-color="#3ddc84" stop-opacity="0.16"/>
       <stop offset="60%" stop-color="#3ddc84" stop-opacity="0.05"/>
       <stop offset="100%" stop-color="#3ddc84" stop-opacity="0"/>
     </radialGradient>
+    <!-- 顶部高光 -->
     <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#ffffff" stop-opacity="0.09"/>
       <stop offset="45%" stop-color="#ffffff" stop-opacity="0.015"/>
@@ -21,14 +24,19 @@
     </linearGradient>
   </defs>
 
+  <!-- macOS 风格圆角底座 -->
   <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#plate)"/>
   <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#glow)"/>
   <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#sheen)"/>
+  <!-- 底座描边 -->
   <rect x="4" y="4" width="1016" height="1016" rx="228" stroke="#ffffff" stroke-opacity="0.06" stroke-width="8"/>
 
   <g>
+    <!-- 终端窗口 -->
     <rect x="272" y="312" width="480" height="400" rx="80" stroke="url(#stroke)" stroke-width="40"/>
+    <!-- 提示符 > -->
     <path d="M380 448 L456 512 L380 576" stroke="url(#stroke)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- 光标 _ -->
     <path d="M528 576 H648" stroke="url(#stroke)" stroke-width="40" stroke-linecap="round"/>
   </g>
 </svg>
