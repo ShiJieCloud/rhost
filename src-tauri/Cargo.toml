@@ -21,3 +21,16 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.12.0", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+russh = "0.63.3"
+russh-sftp = "3.0.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "io-util", "fs"] }
+tokio-util = "0.7.19"
+uuid = { version = "1.26.1", features = ["v4"] }
+bytes = "1.12.1"
+thiserror = "2.0.21"
+keyring = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sysinfo = "0.38.4"
+libc = "0.2"
+tauri-plugin-clipboard-manager = "2.4.1"

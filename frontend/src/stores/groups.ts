@@ -15,8 +15,6 @@ export interface GroupStat {
   online: number
   warn: number
   offline: number
-  /** 在线主机的平均延迟；无在线主机时为 null */
-  avgLat: number | null
 }
 
 /** 模块级单例状态；后续接 Pinia 或 Tauri 后端时仅需替换此处 */
@@ -77,12 +75,11 @@ const unregistered = computed<GroupDef[]>(() => {
 /** 渲染用全量分组列表 */
 export const allGroups = computed<GroupDef[]>(() => [...groups.value, ...unregistered.value])
 
-/** 各分组统计（主机列表、状态计数、平均延迟） */
+/** 各分组统计（主机列表、状态计数） */
 export const groupStats = computed<GroupStat[]>(() =>
   allGroups.value.map(def => {
     const list = hosts.value.filter(h => h.group === def.name)
     const onlineList = list.filter(h => h.status === 'online')
-    const withLat = onlineList.filter(h => h.lat !== null)
     return {
       def,
       hosts: list,
@@ -90,9 +87,6 @@ export const groupStats = computed<GroupStat[]>(() =>
       online: onlineList.length,
       warn: list.filter(h => h.status === 'warn').length,
       offline: list.filter(h => h.status === 'offline').length,
-      avgLat: withLat.length
-        ? Math.round(withLat.reduce((s, h) => s + (h.lat ?? 0), 0) / withLat.length)
-        : null,
     }
   }),
 )

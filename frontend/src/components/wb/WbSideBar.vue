@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { hosts, onlineCount } from '../../stores/hosts'
-import { activeSessionId, openSession } from '../../stores/session'
+import { activeSession, openSession } from '../../stores/session'
 
 const q = ref('')
 
@@ -18,10 +18,6 @@ const groups = computed(() => {
   })
   return [...map.entries()].map(([name, list]) => ({ name, list }))
 })
-
-function lat(h: (typeof hosts.value)[number]) {
-  return h.lat ? h.lat + 'ms' : '—'
-}
 </script>
 
 <template>
@@ -40,7 +36,7 @@ function lat(h: (typeof hosts.value)[number]) {
           v-for="h in g.list"
           :key="h.id"
           class="host"
-          :class="{ active: activeSessionId === h.id }"
+          :class="{ active: activeSession?.host.id === h.id }"
           @click="openSession(h.id)"
         >
           <span class="dot" :class="h.status === 'offline' ? 'offline' : h.status === 'warn' ? 'warn' : 'online'"></span>
@@ -48,7 +44,6 @@ function lat(h: (typeof hosts.value)[number]) {
             <div class="host-name">{{ h.id }}</div>
             <div class="host-meta">{{ h.user }}@{{ h.ip }}:{{ h.port }}</div>
           </div>
-          <span class="host-lat">{{ lat(h) }}</span>
         </div>
       </template>
     </div>

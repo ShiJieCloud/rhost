@@ -1,14 +1,11 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
 import WbSideBar from '../components/wb/WbSideBar.vue'
 import WbTabs from '../components/wb/WbTabs.vue'
 import TerminalPane from '../components/wb/TerminalPane.vue'
 import DockPanel from '../components/wb/DockPanel.vue'
 import Inspector from '../components/wb/Inspector.vue'
 import StatusBar from '../components/wb/StatusBar.vue'
-import { dockVisible, inspectorVisible, sidebarVisible, startMonitor } from '../stores/session'
-
-onMounted(() => startMonitor())
+import { dockVisible, inspectorVisible, sidebarVisible } from '../stores/session'
 </script>
 
 <template>

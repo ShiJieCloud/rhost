@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import AppLogo from '../../components/AppLogo.vue'
 import { toast } from '../../composables/useToast'
-import { hosts } from '../../stores/hosts'
+import { promptPassword } from '../../composables/usePasswordPrompt'
+import { addHost, hosts } from '../../stores/hosts'
 import { openSession } from '../../stores/session'
+import { isTauri } from '../../lib/tauri'
+import type { Host } from '../../types'
 
 /* ================= 命令解析 ================= */
 interface ParsedCmd {
@@ -179,6 +183,8 @@ const historyVisible = ref(false)
 const historyIndex = ref(-1)
 const invalid = ref(false)
 const shaking = ref(false)
+/** 正在测试连接（门禁：失败不跳转） */
+const testing = ref(false)
 
 const parsed = computed<ParsedCmd | null>(() => {
   if (!cmdInput.value.trim()) return null
@@ -223,6 +229,7 @@ function applyHistory(cmd: string, focus = true) {
 function connect(raw?: string) {
   const cmd = (raw ?? cmdInput.value).trim()
   if (!cmd) return
+  if (testing.value) return
   const p = parseCommand(cmd)
   if (!p) {
     invalid.value = true
@@ -238,22 +245,147 @@ function connect(raw?: string) {
   pushHistory(cmd)
   historyVisible.value = false
 
-  // 在 hosts 中匹配：user@ip:port 任一匹配 ip+port 即认为已配置
   const port = parseInt(p.port, 10)
-  const target = hosts.value.find(
+  const user = p.user || 'root'
+  // 在 hosts 中匹配：ip+port 相同且（命令未指定用户 或 用户也相同）即视为已配置
+  let target = hosts.value.find(
     h => h.ip === p.host && h.port === port && (!p.user || h.user === p.user),
   )
 
+  // 未找到则自动创建主机：一键连接 = 输入即建连，无需先去主机列表手动新建
   if (!target) {
-    toast(`未找到主机 ${p.host}:${p.port}，请先在「主机」中新建连接`, 'warn', 2600)
-    return
+    const id = `${user}@${p.host}${port !== 22 ? ':' + port : ''}`
+    const label =
+      id.replace(/[^a-zA-Z0-9一-龥]/g, '').slice(0, 2).toUpperCase() || 'SS'
+    target = {
+      id,
+      user,
+      ip: p.host,
+      port,
+      os: 'Linux (未知发行版)',
+      color: 'green',
+      label,
+      tag: '新建',
+      status: 'idle',
+      lat: null,
+      cpu: '—',
+      mem: '—',
+      uptime: '—',
+      group: '开发环境',
+    } satisfies Host
+    void addHost(target)
   }
+
   if (target.status === 'offline') {
     toast(`主机 ${target.id} 处于离线状态，无法连接`, 'err', 2400)
     return
   }
 
-  openSession(target.id)
+  // -i 指定了私钥 → 密钥认证：路径已在命令中给出，不弹窗；
+  // 仅当后端判定私钥加密（KEY_ENCRYPTED 标记）时才弹口令框
+  if (p.key) {
+    void runKeyConnect(target, p.key)
+    return
+  }
+
+  // 门禁：先测试连接，失败不跳转工作台；非 Tauri 环境无后端，跳过测试直接进入
+  if (isTauri) {
+    void runTestAndConnect(target)
+  } else {
+    openSession(target.id)
+  }
+}
+
+/** 密钥认证：先试无口令加载；私钥加密时弹口令框重试，口令错误可反复重试 */
+async function runKeyConnect(host: Host, keyPath: string) {
+  // 非 Tauri 环境无后端，直接 mock 进入
+  if (!isTauri) {
+    openSession(host.id)
+    return
+  }
+  testing.value = true
+  host.keyPath = keyPath
+  let passphrase = ''
+  try {
+    for (;;) {
+      try {
+        await invoke<{ latencyMs: number }>('test_ssh_connection', {
+          payload: {
+            host: host.ip,
+            port: host.port,
+            username: host.user,
+            keyPath,
+            passphrase,
+            cols: 0,
+            rows: 0,
+          },
+        })
+        // 测试通过：口令暂存到主机（重连免输），打开会话
+        host.keyPassphrase = passphrase || undefined
+        openSession(host.id)
+        return
+      } catch (e) {
+        const msg = String(e)
+        if (msg.startsWith('KEY_ENCRYPTED')) {
+          // 私钥已加密（或上一轮口令错误）：弹口令框重试
+          // 口令是私钥的本地解密口令（passphrase），与服务器登录密码无关
+          const pw = await promptPassword(
+            `密钥 ${keyPath} 已加密，输入口令解锁：`,
+            '输入私钥口令',
+            '输入私钥口令（passphrase）',
+          )
+          if (pw == null) return // 用户取消
+          passphrase = pw
+          continue
+        }
+        // 其它失败：报错留在一键连接页，不跳转
+        toast(`连接失败：${msg}`, 'err', 3000)
+        return
+      }
+    }
+  } finally {
+    testing.value = false
+  }
+}
+
+/** 测试连接 → 成功才跳转，失败留在当前页 */
+async function runTestAndConnect(host: Host) {
+  testing.value = true
+  // 解析密码：主机已存则用之，否则弹专用密码框询问（Tauri 下 window.prompt 不可用）
+  const password = host.password ?? await promptPassword(`输入 ${host.user}@${host.ip} 的登录密码：`)
+  if (password == null) {
+    testing.value = false
+    return // 用户取消
+  }
+  try {
+    await invoke<{ latencyMs: number }>('test_ssh_connection', {
+      payload: {
+        host: host.ip,
+        port: host.port,
+        username: host.user,
+        password,
+        cols: 0,
+        rows: 0,
+      },
+    })
+  } catch (e) {
+    // 测试失败：报错并留在一键连接页，不跳转
+    toast(`连接失败：${String(e)}`, 'err', 3000)
+    return
+  } finally {
+    testing.value = false
+  }
+  // 测试通过：保存密码（若之前是弹窗输入的）并打开会话
+  if (!host.password) {
+    host.password = password
+    // 回写系统钥匙串，下次启动免询问
+    if (isTauri) {
+      invoke('save_connection_password', { id: host.id, password }).catch(e =>
+        console.error('save_connection_password 失败:', e),
+      )
+    }
+  }
+  openSession(host.id)
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -351,16 +483,18 @@ onUnmounted(() => {
           <button
             type="button"
             class="qc-go"
-            title="连接 (Enter)"
+            :class="{ loading: testing }"
+            :title="testing ? '正在测试连接…' : '连接 (Enter)'"
             aria-label="连接"
-            :disabled="!canGo"
+            :disabled="!canGo || testing"
             @click="connect()"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.7"
+            <svg v-if="!testing" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.7"
                  stroke-linecap="round" stroke-linejoin="round">
               <path d="M5 12h13" />
               <path d="m12 5 7 7-7 7" />
             </svg>
+            <span v-else class="qc-spin" aria-hidden="true"></span>
           </button>
         </div>
 
@@ -423,7 +557,15 @@ onUnmounted(() => {
       <!-- 解析预览 -->
       <div class="qc-preview" aria-live="polite">
         <span v-if="!cmdInput.trim()" class="qc-preview-text">例如 ssh root@10.0.1.25 -p 22</span>
-        <span v-else-if="!parsed" class="qc-preview-text err">无法识别，请检查主机地址或端口</span>
+        <span v-else-if="!parsed" class="qc-chip err">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <span class="v">SSH 命令解析失败，请检查命令格式</span>
+        </span>
         <template v-else>
           <span class="qc-chip">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"

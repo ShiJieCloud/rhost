@@ -12,7 +12,7 @@ import {
    ========================================================= */
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
-  | 'keys' | 'buttons'
+  | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -25,6 +25,10 @@ interface RowDef {
   min?: number
   max?: number
   step?: number
+  /** select 值以 Number 转换后写入 draft（默认字符串） */
+  num?: boolean
+  /** 依赖的开关设置项：该开关为 false 时本控件置灰禁用 */
+  disabledKey?: keyof AppSettings
   unit?: string
   width?: number
   placeholder?: string
@@ -33,7 +37,7 @@ interface RowDef {
 interface GroupDef {
   label: string
   rows: RowDef[]
-  extra?: 'themeGrid' | 'envEditor' | 'preview'
+  extra?: 'envEditor' | 'preview'
 }
 interface PanelDef {
   id: string
@@ -51,21 +55,11 @@ const ICONS: Record<string, string> = {
   terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M13 14h4"/></svg>',
   keymap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>',
   advanced: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
+  monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>',
+  sftp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/><path d="M12 8v6"/><path d="M9.5 11.5L12 14l2.5-2.5"/></svg>',
   about: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
 }
 
-const THEME_SWATCHES: Record<string, string[]> = {
-  'one-dark': ['#282c34', '#61afef', '#98c379', '#e06c75', '#e5c07b'],
-  dracula: ['#282a36', '#bd93f9', '#50fa7b', '#ff79c6', '#f1fa8c'],
-  nord: ['#2e3440', '#88c0d0', '#a3be8c', '#bf616a', '#ebcb8b'],
-  solarized: ['#002b36', '#268bd2', '#859900', '#dc322f', '#b58900'],
-}
-const THEME_LABELS: Record<string, string> = {
-  'one-dark': 'One Dark',
-  dracula: 'Dracula',
-  nord: 'Nord',
-  solarized: 'Solarized',
-}
 const ACCENTS = [
   { v: '#3ddc84', t: '绿' },
   { v: '#7aa2f7', t: '蓝' },
@@ -78,30 +72,15 @@ const ACCENTS = [
 const PANELS: PanelDef[] = [
   {
     id: 'appearance', label: '外观', glyph: 'appearance',
-    title: '外观', sub: '调整配色、光标与窗口效果，更改会即时反映在应用中',
+    title: '外观', sub: '调整主题、光标与显示效果，更改会即时反映在应用中',
     groups: [
-      {
-        label: '主题', extra: 'themeGrid',
-        rows: [
-          { key: 'colorScheme', title: '配色方案', desc: '终端内容的 ANSI 调色板', keywords: '配色 主题 theme color scheme 颜色' },
-        ],
-      },
       {
         label: '界面',
         rows: [
           { key: 'uiTheme', title: '界面主题', desc: '跟随系统时随系统外观自动切换', kind: 'segmented', keywords: '界面 主题 明暗 深色 浅色 跟随系统',
             options: [{ v: 'dark', t: '深色' }, { v: 'light', t: '浅色' }, { v: 'auto', t: '跟随系统' }] },
           { key: 'accent', title: '强调色', desc: '用于按钮、选中态与焦点环', kind: 'color', keywords: '强调色 主题色 accent 颜色' },
-        ],
-      },
-      {
-        label: '窗口',
-        rows: [
           { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur' },
-          { key: 'padding', title: '内容内边距', desc: '终端内容与窗口边缘的距离', kind: 'range', min: 0, max: 24, unit: 'px', keywords: '内边距 padding 边距' },
-          { key: 'hideTitlebar', title: '隐藏标题栏', desc: '仅保留内容区域，视觉更沉浸', kind: 'switch', keywords: '标题栏 隐藏 沉浸 titlebar' },
-          { key: 'tabPosition', title: '标签栏位置', kind: 'segmented', keywords: '标签栏 位置 tab 顶部 底部',
-            options: [{ v: 'top', t: '顶部' }, { v: 'bottom', t: '底部' }] },
         ],
       },
       {
@@ -127,7 +106,6 @@ const PANELS: PanelDef[] = [
           { key: 'lineHeight', title: '行高', kind: 'range', min: 100, max: 200, unit: '%', keywords: '行高 行距 line height' },
           { key: 'fontWeight', title: '字重', kind: 'select', width: 120, keywords: '字重 粗细 weight',
             options: [{ v: '300', t: '细体' }, { v: '400', t: '常规' }, { v: '500', t: '中等' }, { v: '700', t: '粗体' }] },
-          { key: 'ligatures', title: '编程连字', desc: '将 =>、!= 等符号合并显示', kind: 'switch', keywords: '连字 编程连字 ligature 合字' },
         ],
       },
       {
@@ -143,10 +121,8 @@ const PANELS: PanelDef[] = [
       {
         label: '启动',
         rows: [
-          { key: 'shellPath', title: 'Shell 路径', desc: '留空则使用系统默认 Shell', kind: 'text', width: 230, keywords: 'shell 路径 程序' },
-          { key: 'startDir', title: '启动目录', kind: 'text', width: 230, keywords: '启动目录 工作目录 cwd 路径' },
-          { key: 'loginShell', title: '登录 Shell', desc: '以登录模式启动，加载完整环境变量', kind: 'switch', keywords: '登录 shell login 环境变量' },
-          { key: 'startupCommand', title: '启动时执行', desc: '每次新建会话后自动运行，可留空', kind: 'text', width: 230, placeholder: '例如：source ~/.zshrc', keywords: '启动命令 执行 初始化 command' },
+          { key: 'colorPrompt', title: '彩色提示符', desc: '登录后为无颜色的远端 shell 配置彩色 PS1 与 ls/grep 颜色；远端已有彩色配置（oh-my-zsh 等）时自动跳过，不覆盖用户设置', kind: 'switch', keywords: '彩色 提示符 颜色 prompt ps1 注入 高亮' },
+          { key: 'motd', title: '登录欢迎面板', desc: '连接成功后采集服务器负载、内存、磁盘、IP 等状态，在终端绘制 Rhost MOTD 欢迎横幅；开启时自动屏蔽 sshd 原生 MOTD 与 Last login 避免重复', kind: 'switch', keywords: 'motd 欢迎 面板 横幅 banner 登录 系统状态 负载 内存 磁盘 屏蔽 抑制 原生 last login' },
         ],
       },
       {
@@ -154,15 +130,73 @@ const PANELS: PanelDef[] = [
         rows: [
           { key: 'scrollback', title: '回滚缓冲区', desc: '可向上滚动的历史行数', kind: 'range', min: 1000, max: 100000, step: 1000, unit: ' 行', keywords: '回滚 缓冲 历史 行数 scrollback' },
           { key: 'trimOnCopy', title: '复制时去除行尾空格', kind: 'switch', keywords: '复制 行尾空格 修剪 trim copy' },
-          { key: 'bell', title: '终端响铃', desc: '命令完成或出错时发出提示音', kind: 'switch', keywords: '响铃 提示音 bell 声音' },
           { key: 'pasteGuard', title: '粘贴保护', desc: '多行粘贴时弹窗确认，避免误执行', kind: 'switch', keywords: '粘贴 保护 确认 paste 安全' },
-          { key: 'rightClick', title: '右键行为', kind: 'segmented', keywords: '右键 粘贴 菜单 right click 鼠标',
+          { key: 'rightClick', title: '右键行为', desc: '终端内右键：弹出操作菜单，或直接粘贴剪贴板', kind: 'segmented', keywords: '右键 粘贴 菜单 right click 鼠标',
             options: [{ v: 'menu', t: '菜单' }, { v: 'paste', t: '粘贴' }] },
         ],
       },
       {
         label: '环境变量', extra: 'envEditor',
         rows: [],
+      },
+    ],
+  },
+  {
+    id: 'sftp', label: 'SFTP', glyph: 'sftp',
+    title: 'SFTP 文件传输', sub: '配置远端文件浏览与上传/下载行为',
+    groups: [
+      {
+        label: '传输',
+        rows: [
+          { key: 'sftpChunkKb', title: '传输块大小', desc: '单次读写的数据量；大块吞吐更高，小块进度更细腻、弱网下重试成本更低', kind: 'select', num: true, width: 150, keywords: 'sftp 传输 块 分块 缓冲 chunk 大小 吞吐 速度',
+            options: [32, 64, 128, 256, 512, 1024].map(v => ({ v: String(v), t: v >= 1024 ? '1 MB' : `${v} KB${v === 64 ? '（默认）' : ''}` })) },
+          { key: 'sftpOverwritePolicy', title: '文件覆盖策略', desc: '上传或下载时，如果目标位置已存在同名文件，执行对应的处理规则', kind: 'select', width: 230, keywords: 'sftp 覆盖 策略 同名 冲突 overwrite skip 跳过 询问 更新 mtime',
+            options: [
+              { v: 'newer', t: '仅源文件更新时覆盖（默认）' },
+              { v: 'skip', t: '不覆盖，跳过文件' },
+              { v: 'overwrite', t: '直接覆盖全部' },
+              { v: 'ask', t: '每次冲突询问' },
+            ] },
+          { key: 'sftpUploadTemp', title: '上传临时文件机制', desc: '上传先写入临时文件，传输完成后原子重命名，避免远端产生损坏文件', kind: 'switch', keywords: 'sftp 上传 临时文件 原子 重命名 temp atomic rename 损坏' },
+          { key: 'sftpPreserveMeta', title: '保留文件元数据', desc: '传输文件时同步保留文件修改时间与权限属性，备份场景推荐开启；受服务器账号权限限制', kind: 'switch', keywords: 'sftp 元数据 保留 修改时间 权限 preserve mtime chmod 备份' },
+        ],
+      },
+      {
+        label: '断点续传',
+        rows: [
+          { key: 'sftpResume', title: '启用断点续传', desc: '传输中断后再次发起任务，可以从已传输完成位置继续传输，无需从头重传。关闭后所有文件每次都完整从头传输', kind: 'switch', keywords: 'sftp 断点续传 续传 resume 中断 重传 偏移' },
+          { key: 'sftpResumeCheck', title: '断点校验方式', desc: '续传前校验已存在的半截文件，确认未被改动后从偏移位置续传；仅判断能否续传，与传输完成后的完整性校验相互独立', kind: 'select', width: 200, disabledKey: 'sftpResume', keywords: 'sftp 断点 校验 大小 mtime sha256 哈希 续传 半截',
+            options: [
+              { v: 'size', t: '文件大小（推荐）' },
+              { v: 'sizeMtime', t: '文件大小 + mtime' },
+              { v: 'sha256', t: 'SHA256 哈希' },
+            ] },
+        ],
+      },
+      {
+        label: '并发与限速',
+        rows: [
+          { key: 'sftpGlobalConcurrency', title: '全局最大并发传输任务', desc: '整个客户端所有主机同时运行的上传与下载任务总数上限，超出上限的任务进入排队', kind: 'number', width: 100, min: 1, max: 20, step: 1, unit: ' 个', keywords: 'sftp 全局 并发 任务 上传 下载 排队 上限' },
+          { key: 'sftpHostConcurrency', title: '单主机最大并发传输任务', desc: '同一台服务器同时运行的上传、下载任务上限，防止单台服务器并发过高导致连接卡顿', kind: 'number', width: 100, min: 1, max: 10, step: 1, unit: ' 个', keywords: 'sftp 单主机 服务器 并发 任务 卡顿 上限' },
+          { key: 'sftpGlobalRateKb', title: '全局带宽限速', desc: '全部传输任务合计的总带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 全局 带宽 限速 速率 限流 总带宽 KB' },
+          { key: 'sftpTaskRateKb', title: '单任务带宽限速', desc: '单个文件传输任务的最大带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 单任务 带宽 限速 速率 限流 KB' },
+          { key: 'sftpRetryCount', title: '失败重试次数', desc: '遇到网络抖动、临时超时等可恢复错误时自动重试的最大次数，达到次数后任务标记失败', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', keywords: 'sftp 失败 重试 次数 网络抖动 超时 错误' },
+          { key: 'sftpRetryIntervalMs', title: '重试间隔', desc: '单次传输失败后等待指定毫秒再发起下一次重试，避免短时间密集请求冲击服务器', kind: 'number', width: 130, min: 0, step: 100, unit: ' ms', keywords: 'sftp 重试 间隔 等待 毫秒 退避 backoff' },
+        ],
+      },
+      {
+        label: '安全与完整性校验',
+        rows: [
+          { key: 'sftpIdleTimeoutSec', title: 'SFTP 会话空闲超时', desc: 'SFTP 子通道长时间没有文件操作时自动关闭释放资源，不会断开 SSH 终端会话，后续传输会自动重建通道；填 0 表示不自动关闭', kind: 'number', width: 130, min: 0, step: 10, unit: ' 秒', keywords: 'sftp 会话 空闲 超时 自动关闭 释放 通道 重建' },
+          { key: 'sftpVerifyHash', title: '传输完成后完整性 Hash 校验', desc: '文件完整传输结束后，对整个文件计算 SHA256 哈希做完整性校验，校验失败标记任务异常；开启会增加 CPU 与 IO 开销', kind: 'switch', keywords: 'sftp 完整性 hash sha256 校验 哈希 完成 异常 cpu io' },
+          { key: 'sftpBlacklist', title: '文件黑名单 glob 过滤列表', desc: '上传文件时，文件名匹配黑名单规则将自动跳过，不创建上传任务，一行一条 glob 表达式', kind: 'textarea', placeholder: '例如：*.tmp', keywords: 'sftp 黑名单 过滤 glob 跳过 上传 DS_Store Thumbs.db 排除 ignore' },
+        ],
+      },
+      {
+        label: '浏览',
+        rows: [
+          { key: 'sftpShowHidden', title: '显示隐藏文件', desc: '在本地与远端文件树中显示以 . 开头的文件', kind: 'switch', keywords: 'sftp 隐藏文件 点文件 hidden dotfile 显示' },
+        ],
       },
     ],
   },
@@ -186,6 +220,28 @@ const PANELS: PanelDef[] = [
           { key: 'key.palette', title: '命令面板', kind: 'keys', keywords: '命令 面板 command palette 快捷键' },
           { key: 'key.find', title: '查找', kind: 'keys', keywords: '搜索 查找 find 快捷键' },
           { key: 'key.settings', title: '打开设置', kind: 'keys', keywords: '设置 偏好 preferences 快捷键' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'monitor', label: '监控', glyph: 'monitor',
+    title: '监控', sub: '客户端内存指标的采集频率、后台策略与告警阈值',
+    groups: [
+      {
+        label: '性能与采集',
+        rows: [
+          { key: 'memInterval', title: '内存采集间隔', desc: '采集 Rhost 主进程驻留内存 (RSS) 用于底部状态栏监控；间隔越短折线越实时，IPC 开销越高', kind: 'select', num: true, width: 150, keywords: '监控 内存 采集 间隔 频率 interval 轮询 秒 性能',
+            options: [1, 2, 3, 5, 10, 30, 60].map(v => ({ v: String(v), t: `${v} 秒${v === 2 ? '（默认）' : ''}` })) },
+          { key: 'metricsInterval', title: '主机指标采集间隔', desc: '采集远端服务器的 CPU/内存/网络/磁盘/进程/GPU 并刷新右侧监控面板；间隔越短越实时，对远端与本机开销越高。允许 1~10 秒', kind: 'select', num: true, width: 150, keywords: '监控 主机 服务器 指标 cpu 内存 网络 磁盘 进程 gpu 采集 间隔 频率 轮询 秒 性能 ssh',
+            options: [1, 2, 3, 5, 10].map(v => ({ v: String(v), t: `${v} 秒${v === 3 ? '（默认）' : ''}` })) },
+          { key: 'memPauseHidden', title: '不可见时暂停采集', desc: '回到首页或窗口最小化时停止内存采集以降低后台开销；关闭后无论面板是否可见均持续采集', kind: 'switch', keywords: '暂停 后台 隐藏 最小化 不可见 pause 采集 cpu 开销' },
+        ],
+      },
+      {
+        label: '内存告警',
+        rows: [
+          { key: 'memAlertMb', title: '内存告警阈值', desc: '主进程常驻内存持续超过该值时，状态栏内存指标以告警色提示；此为监控告警阈值，不是硬性内存上限。允许范围 50 MB ~ 8 GB', kind: 'numberUnit', keywords: '内存 告警 阈值 上限 提醒 rss 占用 MB GB 预警' },
         ],
       },
     ],
@@ -247,6 +303,8 @@ watch(showSettings, v => {
   query.value = ''
   activePanelId.value = 'appearance'
   recordingKey.value = null
+  alertUnit.value = 'MB'
+  syncAlertRaw()
   nextTick(() => searchEl.value?.focus())
 })
 
@@ -295,6 +353,17 @@ const changedCount = computed(() => {
 function setVal(key: keyof AppSettings, v: unknown) {
   ;(draft as Record<string, unknown>)[key] = v
 }
+/** 数字输入：仅接受有限数字；失焦时收敛到 [min, max] */
+function onNumInput(key: keyof AppSettings, e: Event) {
+  const v = Number((e.target as HTMLInputElement).value)
+  if (Number.isFinite(v)) setVal(key, v)
+}
+function onNumBlur(r: RowDef) {
+  if (!r.key) return
+  const v = Number(numVal(r.key)) || 0
+  const clamped = Math.min(r.max ?? Number.MAX_SAFE_INTEGER, Math.max(r.min ?? 0, v))
+  if (clamped !== v) setVal(r.key, clamped)
+}
 function strVal(key: keyof AppSettings | undefined): string {
   if (!key) return ''
   const v = draft[key]
@@ -308,7 +377,78 @@ function boolVal(key: keyof AppSettings): boolean {
 }
 function resetOne(key: keyof AppSettings) {
   setVal(key, JSON.parse(JSON.stringify(savedSettings[key])))
+  if (key === 'memAlertMb') syncAlertRaw()
   toast('已重置该项', 'info', 1500)
+}
+
+/* ---- 监控：采集间隔提示 ---- */
+function ctlHint(r: RowDef): string {
+  if (r.key === 'memInterval' || r.key === 'metricsInterval') {
+    const n = numVal(r.key)
+    const perMin = 60 / n
+    const rate = perMin >= 10 ? String(Math.round(perMin)) : perMin.toFixed(1).replace(/\.0$/, '')
+    return `每 ${n} 秒采集一次 · 约 ${rate} 次/分钟`
+  }
+  return ''
+}
+
+/* ---- 监控：内存告警阈值（数值 + MB/GB 单位） ---- */
+const ALERT_MIN_MB = 50
+const ALERT_MAX_MB = 8192
+const alertUnit = ref<'MB' | 'GB'>('MB')
+const alertRaw = ref(String(numVal('memAlertMb')))
+
+/** 按当前单位把 draft 中的 MB 值格式化为输入框文本 */
+function fmtByUnit(mb: number, unit: 'MB' | 'GB'): string {
+  if (unit === 'GB') {
+    const s = (Math.round((mb / 1024) * 100) / 100).toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+    return s === '' ? '0' : s
+  }
+  return String(Math.round(mb))
+}
+function syncAlertRaw() {
+  alertRaw.value = fmtByUnit(numVal('memAlertMb'), alertUnit.value)
+}
+/** 原始输入换算 MB；空值/非正数返回 NaN */
+function alertToMb(raw: string): number {
+  const v = Number(raw.trim())
+  if (!Number.isFinite(v) || v <= 0) return NaN
+  return alertUnit.value === 'GB' ? v * 1024 : v
+}
+const alertError = computed(() => {
+  const raw = alertRaw.value.trim()
+  if (raw === '') return '请输入内存告警阈值'
+  const v = Number(raw)
+  if (!Number.isFinite(v)) return '请输入有效数字'
+  const mb = alertToMb(raw)
+  if (Math.round(mb) < ALERT_MIN_MB) return `最小 ${ALERT_MIN_MB} MB：低于此值容易频繁告警`
+  if (Math.round(mb) > ALERT_MAX_MB) return '最大 8 GB：超过此值告警基本不会触发，请确认单位'
+  return ''
+})
+const alertStep = computed(() => (alertUnit.value === 'GB' ? '0.1' : '1'))
+
+function onAlertInput(e: Event) {
+  const raw = (e.target as HTMLInputElement).value
+  alertRaw.value = raw
+  const mb = alertToMb(raw)
+  if (Number.isFinite(mb)) setVal('memAlertMb', Math.round(mb))
+}
+function onAlertBlur() {
+  const raw = alertRaw.value.trim()
+  if (raw === '') { syncAlertRaw(); return }
+  const v = Number(raw)
+  if (!Number.isFinite(v)) { syncAlertRaw(); return }
+  // 失焦收敛到合法区间，再按单位回显
+  const clamped = Math.min(ALERT_MAX_MB, Math.max(ALERT_MIN_MB, alertToMb(raw)))
+  setVal('memAlertMb', Math.round(clamped))
+  syncAlertRaw()
+}
+function onAlertUnitChange(e: Event) {
+  const unit = (e.target as HTMLSelectElement).value as 'MB' | 'GB'
+  const mb = alertToMb(alertRaw.value)
+  alertUnit.value = unit
+  // 切换单位时按原语义换算，避免阈值被静默改变；非法输入则按 draft 值重显
+  alertRaw.value = Number.isFinite(mb) ? fmtByUnit(mb, unit) : fmtByUnit(numVal('memAlertMb'), unit)
 }
 
 /* ---- 环境变量 ---- */
@@ -420,8 +560,7 @@ const previewStyle = computed(() => ({
   lineHeight: (draft.lineHeight / 100).toFixed(2),
   fontWeight: draft.fontWeight,
 }))
-const previewAccent = computed(() =>
-  ({ 'one-dark': '#61afef', dracula: '#bd93f9', nord: '#88c0d0', solarized: '#268bd2' })[draft.colorScheme] ?? 'var(--blue)')
+const previewAccent = 'var(--blue)'
 
 /* ---- 控件辅助 ---- */
 function segActive(key: keyof AppSettings, v: string): boolean {
@@ -527,7 +666,7 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                   v-for="r in g.rows"
                   :key="r.title"
                   class="st-row"
-                  :class="{ modified: r.key && isDirty(r.key) }"
+                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' }"
                 >
                   <div class="st-row-main">
                     <div class="st-row-title">
@@ -569,10 +708,38 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                       class="st-select"
                       :style="{ width: (r.width ?? 150) + 'px' }"
                       :value="strVal(r.key)"
-                      @change="setVal(r.key!, ($event.target as HTMLSelectElement).value)"
+                      :disabled="!!r.disabledKey && !boolVal(r.disabledKey)"
+                      @change="setVal(r.key!, r.num ? Number(($event.target as HTMLSelectElement).value) : ($event.target as HTMLSelectElement).value)"
                     >
                       <option v-for="op in r.options" :key="op.v" :value="op.v">{{ op.t }}</option>
                     </select>
+
+                    <!-- 数值 + 单位（内存告警阈值） -->
+                    <div v-else-if="r.kind === 'numberUnit'" class="st-num-unit">
+                      <input
+                        class="st-input"
+                        :class="{ invalid: alertError }"
+                        type="number"
+                        inputmode="decimal"
+                        :min="r.min"
+                        :max="r.max"
+                        :step="alertStep"
+                        :value="alertRaw"
+                        spellcheck="false"
+                        autocomplete="off"
+                        @input="onAlertInput"
+                        @blur="onAlertBlur"
+                      >
+                      <select
+                        class="st-select st-unit-select"
+                        :value="alertUnit"
+                        @change="onAlertUnitChange"
+                      >
+                        <option value="MB">MB</option>
+                        <option value="GB">GB</option>
+                      </select>
+                      <span v-if="alertError" class="st-ctl-err">{{ alertError }}</span>
+                    </div>
 
                     <!-- 滑块 -->
                     <template v-else-if="r.kind === 'range'">
@@ -599,6 +766,38 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                       autocomplete="off"
                       @input="setVal(r.key!, ($event.target as HTMLInputElement).value)"
                     >
+
+                    <!-- 数字 + 单位后缀 -->
+                    <div v-else-if="r.kind === 'number'" class="st-num-unit">
+                      <input
+                        class="st-input"
+                        type="number"
+                        inputmode="numeric"
+                        :style="{ width: (r.width ?? 120) + 'px' }"
+                        :min="r.min"
+                        :max="r.max"
+                        :step="r.step ?? 1"
+                        :value="numVal(r.key!)"
+                        spellcheck="false"
+                        autocomplete="off"
+                        @input="onNumInput(r.key!, $event)"
+                        @blur="onNumBlur(r)"
+                      >
+                      <span v-if="r.unit" class="st-unit-label">{{ r.unit.trim() }}</span>
+                    </div>
+
+                    <!-- 多行文本（glob 列表等，一行一条） -->
+                    <textarea
+                      v-else-if="r.kind === 'textarea'"
+                      class="st-input st-textarea"
+                      :style="{ width: '100%' }"
+                      rows="4"
+                      :value="strVal(r.key)"
+                      :placeholder="r.placeholder"
+                      spellcheck="false"
+                      autocomplete="off"
+                      @input="setVal(r.key!, ($event.target as HTMLTextAreaElement).value)"
+                    ></textarea>
 
                     <!-- 强调色 -->
                     <div v-else-if="r.kind === 'color'" class="st-colors">
@@ -640,25 +839,15 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                         @click="onAction(a.id)"
                       >{{ a.label }}</button>
                     </template>
+
+                    <!-- 控件下方辅助提示（独占一行右对齐） -->
+                    <span v-if="ctlHint(r)" class="st-ctl-hint">{{ ctlHint(r) }}</span>
+                    <span
+                      v-if="r.key === 'memPauseHidden' && !boolVal(r.key)"
+                      class="st-ctl-hint warn"
+                    >关闭后窗口最小化或回到首页时仍持续采集，可能增加后台开销</span>
                   </div>
                 </div>
-              </div>
-
-              <!-- 配色方案卡片 -->
-              <div v-if="g.extra === 'themeGrid' && !p.searching" class="st-theme-grid">
-                <button
-                  v-for="(sw, name) in THEME_SWATCHES"
-                  :key="name"
-                  type="button"
-                  class="st-theme-card"
-                  :class="{ active: strVal('colorScheme') === name }"
-                  @click="setVal('colorScheme', name)"
-                >
-                  <div class="st-theme-swatches">
-                    <span v-for="c in sw" :key="c" :style="{ background: c }"></span>
-                  </div>
-                  <div class="st-theme-name">{{ THEME_LABELS[name] }}</div>
-                </button>
               </div>
 
               <!-- 环境变量编辑 -->

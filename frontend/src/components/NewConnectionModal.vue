@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { toast } from '../composables/useToast'
 import { addHost, editingHost, showNewConn, updateHost } from '../stores/hosts'
 import { rehostSession } from '../stores/session'
 import { GROUP_OPTIONS } from '../data/mockHosts'
+import { isTauri } from '../lib/tauri'
 import type { HostColor } from '../types'
 
 /* =========================================================
@@ -176,8 +178,6 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
           { label: '字符编码', name: 'encoding', span: 1, type: 'select', value: 'utf-8',
             options: [
               { v: 'utf-8', t: 'UTF-8' },
-              { v: 'gbk', t: 'GBK' },
-              { v: 'latin1', t: 'Latin-1' },
             ] },
           { label: 'X11 转发', name: 'x11', span: 1, type: 'select', value: 'off',
             options: [{ v: 'off', t: '关闭' }, { v: 'on', t: '开启 (-X)' }] },
@@ -507,7 +507,7 @@ TYPES.forEach(t => initType(t.v))
 /* =========================================================
    打开 / 关闭 / 快捷键
    ========================================================= */
-watch(showNewConn, v => {
+watch(showNewConn, async v => {
   if (!v) return
   const h = editingHost.value
   TYPES.forEach(t => initType(t.v))
@@ -530,6 +530,22 @@ watch(showNewConn, v => {
     d.group = GROUP_OPTIONS.includes(h.group) ? h.group : GROUP_OPTIONS[0]
     // 新建时的兜底标记不回填为用户标签
     d.tags = h.tag === '新建' || h.tag === 'SFTP' ? '' : h.tag
+    // 回填认证方式与密码：优先内存缓存，否则按需从钥匙串读取
+    if (h.password) {
+      d.auth = 'password'
+      d.password = h.password
+    } else if (isTauri) {
+      try {
+        const pwd = await invoke<string | null>('get_connection_password', { id: h.id })
+        if (pwd) {
+          d.auth = 'password'
+          d.password = pwd
+          h.password = pwd // 缓存到内存，避免重复读取
+        }
+      } catch (e) {
+        console.error('回填密码失败:', e)
+      }
+    }
     editingId.value = h.id
   } else {
     currentType.value = 'ssh'
@@ -701,17 +717,46 @@ async function testConnection() {
     return
   }
 
+  const v = values.value
+  // 仅 SSH/SFTP 的密码认证走真实后端测试；其余类型/认证方式暂用 mock
+  const canRealTest =
+    isTauri &&
+    (currentType.value === 'ssh' || currentType.value === 'sftp') &&
+    v.auth === 'password'
+
   testing.value = true
   testResult.value = { kind: 'loading', text: '正在连接…' }
 
-  // TODO: 接入后端后替换为 invoke('test_connection', { type, ...values })
-  await new Promise(r => setTimeout(r, 900 + Math.random() * 700))
+  if (canRealTest) {
+    const port = parseInt(v.port, 10) || 22
+    const target = `${v.user}@${v.host}:${port}`
+    try {
+      const res = await invoke<{ latencyMs: number }>('test_ssh_connection', {
+        payload: {
+          host: v.host,
+          port,
+          username: v.user,
+          password: v.password,
+          cols: 0,
+          rows: 0,
+        },
+      })
+      testResult.value = { kind: 'ok', text: `连接成功 · ${target} · ${res.latencyMs}ms` }
+      toast(`测试成功 · ${target} · ${res.latencyMs}ms`, 'ok', 2200)
+    } catch (e) {
+      testResult.value = { kind: 'err', text: `连接失败：${String(e)}` }
+      toast(`连接失败：${String(e)}`, 'err', 2800)
+    } finally {
+      testing.value = false
+    }
+    return
+  }
 
-  const v = values.value
+  // ---- mock 兜底：非 Tauri 环境 / 非密码认证 / 其他连接类型 ----
+  await new Promise(r => setTimeout(r, 900 + Math.random() * 700))
   const target = (v.host || v.device || v.container || v.shell || '').trim()
   const fail = /(bad|fail)/i.test(target) || /^0\./.test(target) || /^255\./.test(target) || /^999/.test(target)
   const lat = 8 + Math.floor(Math.random() * 40)
-
   testing.value = false
   if (fail) {
     testResult.value = { kind: 'err', text: `连接失败：无法访问 ${target || '目标'}（超时）` }
@@ -755,19 +800,28 @@ async function save() {
   if (!v.name?.trim()) v.name = autoName(v)
 
   saving.value = true
-  // TODO: 接入后端后替换为 invoke('save_connection', { type, ...v })
-  await new Promise(r => setTimeout(r, 500))
 
   const label =
     v.name.replace(/[^a-zA-Z0-9一-龥]/g, '').slice(0, 2).toUpperCase() ||
     (currentType.value === 'sftp' ? 'SF' : 'SS')
   const tagList = (v.tags || '').split(',').map(t => t.trim()).filter(Boolean)
   const tagVal = tagList.length ? tagList.join(',') : (currentType.value === 'sftp' ? 'SFTP' : '新建')
+  const connType = currentType.value
+  const hasPassword = v.auth === 'password' && !!v.password
+
+  /** 保存密码到系统钥匙串（Tauri 环境）；浏览器 dev 模式跳过。
+   *  改名场景下旧 id 的钥匙串条目已由 updateHost 内部清理。 */
+  async function persistPassword(hostId: string) {
+    if (!isTauri || !hasPassword) return
+    await invoke('save_connection_password', { id: hostId, password: v.password }).catch(
+      e => console.error('save_connection_password 失败:', e),
+    )
+  }
 
   // 编辑态：局部更新并同步已打开的会话，不新建、不连接
   if (editingId.value) {
     const oldId = editingId.value
-    const updated = updateHost(oldId, {
+    const updated = await updateHost(oldId, {
       id: v.name,
       user: v.user,
       ip: v.host,
@@ -775,8 +829,15 @@ async function save() {
       label,
       tag: tagVal,
       group: v.group || GROUP_OPTIONS[0],
-    })
-    if (updated) rehostSession(oldId, updated)
+      keyPath: v.auth === 'key' ? v.keyfile : undefined,
+      // 密码仅暂存内存（hostToStored 不会写入 JSON），供本次会话连接直接使用；
+      // 同时异步写入系统钥匙串，供下次启动读取
+      password: v.auth === 'password' ? v.password : undefined,
+    }, connType)
+    if (updated) {
+      rehostSession(oldId, updated)
+      await persistPassword(updated.id)
+    }
     saving.value = false
     close()
     toast(`已保存连接「${v.name}」的修改`, 'ok', 2400)
@@ -785,7 +846,7 @@ async function save() {
 
   if (currentType.value === 'ssh' || currentType.value === 'sftp') {
     const isSftp = currentType.value === 'sftp'
-    addHost({
+    const newHost = {
       id: v.name,
       user: v.user,
       ip: v.host,
@@ -794,13 +855,18 @@ async function save() {
       color: (isSftp ? 'cyan' : 'green') as HostColor,
       label,
       tag: tagVal,
-      status: 'idle',
+      status: 'idle' as const,
       lat: null,
       cpu: '—',
       mem: '—',
       uptime: '—',
       group: v.group || GROUP_OPTIONS[0],
-    })
+      keyPath: v.auth === 'key' ? v.keyfile : undefined,
+      // 密码仅暂存内存（不入 JSON），首次连接直接使用免弹框；钥匙串持久化由 persistPassword 完成
+      password: v.auth === 'password' ? v.password : undefined,
+    }
+    await addHost(newHost, connType)
+    await persistPassword(newHost.id)
   }
 
   saving.value = false
@@ -919,6 +985,9 @@ async function save() {
                     :placeholder="f.placeholder"
                     :class="{ invalid: hasError(f.name) }"
                     autocomplete="new-password"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    spellcheck="false"
                     @input="setField(f.name, ($event.target as HTMLInputElement).value)"
                   >
                   <button
@@ -954,6 +1023,8 @@ async function save() {
                     :value="tagDraft"
                     :placeholder="tagsOf(f.name).length ? '' : f.placeholder"
                     autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
                     spellcheck="false"
                     @input="tagDraft = ($event.target as HTMLInputElement).value"
                     @keydown="onTagKeydown(f.name, $event)"
@@ -967,6 +1038,9 @@ async function save() {
                   :value="values[f.name]"
                   :placeholder="f.placeholder"
                   :class="{ invalid: hasError(f.name) }"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck="false"
                   @input="setField(f.name, ($event.target as HTMLTextAreaElement).value)"
                 ></textarea>
 
@@ -978,6 +1052,9 @@ async function save() {
                   :placeholder="f.placeholder"
                   :class="{ invalid: hasError(f.name) }"
                   autocomplete="off"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck="false"
                   @input="setField(f.name, ($event.target as HTMLInputElement).value)"
                 >
 

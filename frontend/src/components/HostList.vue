@@ -48,8 +48,8 @@ function onDeleteClick(e: MouseEvent, h: Host) {
   e.stopPropagation()
   if (confirmingId.value === h.id) {
     clearConfirm()
-    removeHost(h.id)
-    closeSession(h.id) // 若工作台中已打开该会话，一并关闭
+    void removeHost(h.id) // 若工作台中已打开该会话，一并关闭
+    closeSession(h.id)
     toast(`已删除连接「${h.id}」`, 'ok', 2200)
     return
   }
@@ -139,7 +139,6 @@ onUnmounted(clearConfirm)
 
           <div class="proj-kv"><span class="k">地址</span><span class="v">{{ h.ip }}:{{ h.port }}</span></div>
           <div class="proj-kv"><span class="k">用户</span><span class="v">{{ h.user }}</span></div>
-          <div class="proj-kv"><span class="k">延迟</span><span class="v">{{ h.lat ? h.lat + ' ms' : '—' }}</span></div>
           <div class="proj-kv"><span class="k">运行</span><span class="v">{{ h.uptime }}</span></div>
 
           <div class="proj-foot">

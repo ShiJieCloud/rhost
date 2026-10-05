@@ -128,6 +128,8 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
             maxlength="20"
             spellcheck="false"
             autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
             @input="onInput"
           />
           <span class="error-text">{{ dupError || '请输入分组名称' }}</span>
