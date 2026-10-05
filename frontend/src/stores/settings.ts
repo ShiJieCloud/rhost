@@ -13,8 +13,6 @@ export interface AppSettings {
   uiTheme: string
   accent: string
   opacity: number
-  cursorStyle: string
-  cursorBlink: boolean
   /* ---- 字体 ---- */
   fontFamily: string
   fontSize: number
@@ -29,6 +27,10 @@ export interface AppSettings {
   trimOnCopy: boolean
   pasteGuard: boolean
   rightClick: string
+  /** 终端光标样式：block 方块 / bar 竖线 / underline 下划线 */
+  cursorStyle: string
+  /** 终端光标空闲 1 秒后闪烁 */
+  cursorBlink: boolean
   env: EnvVar[]
   /* ---- 快捷键 ---- */
   'key.newTab': string
@@ -94,8 +96,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiTheme: 'dark',
   accent: '#3ddc84',
   opacity: 96,
-  cursorStyle: 'bar',
-  cursorBlink: true,
 
   fontFamily: 'JetBrains Mono',
   fontSize: 13,
@@ -108,6 +108,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   trimOnCopy: true,
   pasteGuard: false,
   rightClick: 'menu',
+  cursorStyle: 'bar',
+  cursorBlink: true,
   env: [
     { key: 'EDITOR', value: 'nvim' },
     { key: 'LANG', value: 'zh_CN.UTF-8' },

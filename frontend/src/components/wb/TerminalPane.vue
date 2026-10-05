@@ -194,6 +194,12 @@ function openTermMenu(id: string, x: number, y: number) {
   termMenuOpen.value = true
 }
 
+/** xterm 合法光标样式；settings 中为 string，归一化同时兜底持久化脏值 */
+type TermCursorStyle = 'block' | 'bar' | 'underline'
+function resolveCursorStyle(v: string): TermCursorStyle {
+  return v === 'block' || v === 'underline' ? v : 'bar'
+}
+
 /** xterm 主题：与项目配色（--status-ok 等设计令牌）对齐 */
 const XTERM_THEME = {
   background: '#00000000', // 透明，透出 .terminal 的背景渐变
@@ -238,8 +244,8 @@ function mountTerminal(id: string) {
   if (!el) return
 
   const term = new Terminal({
-    cursorBlink: true,
-    cursorStyle: 'bar',
+    cursorBlink: savedSettings.cursorBlink,
+    cursorStyle: resolveCursorStyle(savedSettings.cursorStyle),
     fontSize: 12.5,
     fontFamily: "'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace",
     lineHeight: 1.4,
@@ -324,6 +330,19 @@ function mountTerminal(id: string) {
   attachTerminal(id, bytes => term.write(bytes), term.cols, term.rows)
   term.focus()
 }
+
+/** 光标设置（样式/闪烁）变更 → 实时应用到全部已有终端实例。
+ *  xterm 渲染器内部监听这两个选项变化并自动刷新光标行，无需重挂载；
+ *  远端程序经 DECSCUSR 设置的临时光标样式（vim 等）优先级更高，不受影响。 */
+watch(
+  () => [savedSettings.cursorStyle, savedSettings.cursorBlink] as const,
+  ([style, blink]) => {
+    for (const inst of termInsts.values()) {
+      inst.term.options.cursorStyle = resolveCursorStyle(style)
+      inst.term.options.cursorBlink = blink
+    }
+  },
+)
 
 /** 销毁已关闭会话的 xterm 实例（后端断开在 closeSession 中处理） */
 watch(

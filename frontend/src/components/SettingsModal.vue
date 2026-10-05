@@ -72,7 +72,7 @@ const ACCENTS = [
 const PANELS: PanelDef[] = [
   {
     id: 'appearance', label: '外观', glyph: 'appearance',
-    title: '外观', sub: '调整主题、光标与显示效果，更改会即时反映在应用中',
+    title: '外观', sub: '调整主题与显示效果，更改会即时反映在应用中',
     groups: [
       {
         label: '界面',
@@ -81,14 +81,6 @@ const PANELS: PanelDef[] = [
             options: [{ v: 'dark', t: '深色' }, { v: 'light', t: '浅色' }, { v: 'auto', t: '跟随系统' }] },
           { key: 'accent', title: '强调色', desc: '用于按钮、选中态与焦点环', kind: 'color', keywords: '强调色 主题色 accent 颜色' },
           { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur' },
-        ],
-      },
-      {
-        label: '光标',
-        rows: [
-          { key: 'cursorStyle', title: '光标样式', kind: 'segmented', keywords: '光标 样式 cursor 方块 竖线 下划线',
-            options: [{ v: 'block', t: '方块' }, { v: 'bar', t: '竖线' }, { v: 'underline', t: '下划线' }] },
-          { key: 'cursorBlink', title: '光标闪烁', desc: '空闲 1 秒后开始闪烁', kind: 'switch', keywords: '光标 闪烁 blink cursor' },
         ],
       },
     ],
@@ -116,7 +108,7 @@ const PANELS: PanelDef[] = [
   },
   {
     id: 'terminal', label: '终端', glyph: 'terminal',
-    title: '终端', sub: '配置 Shell 启动方式、会话行为与环境变量',
+    title: '终端', sub: '配置 Shell 启动方式、光标、会话行为与环境变量',
     groups: [
       {
         label: '启动',
@@ -133,6 +125,14 @@ const PANELS: PanelDef[] = [
           { key: 'pasteGuard', title: '粘贴保护', desc: '多行粘贴时弹窗确认，避免误执行', kind: 'switch', keywords: '粘贴 保护 确认 paste 安全' },
           { key: 'rightClick', title: '右键行为', desc: '终端内右键：弹出操作菜单，或直接粘贴剪贴板', kind: 'segmented', keywords: '右键 粘贴 菜单 right click 鼠标',
             options: [{ v: 'menu', t: '菜单' }, { v: 'paste', t: '粘贴' }] },
+        ],
+      },
+      {
+        label: '光标',
+        rows: [
+          { key: 'cursorStyle', title: '光标样式', kind: 'segmented', keywords: '光标 样式 cursor 方块 竖线 下划线',
+            options: [{ v: 'block', t: '方块' }, { v: 'bar', t: '竖线' }, { v: 'underline', t: '下划线' }] },
+          { key: 'cursorBlink', title: '光标闪烁', desc: '空闲 1 秒后开始闪烁', kind: 'switch', keywords: '光标 闪烁 blink cursor' },
         ],
       },
       {
