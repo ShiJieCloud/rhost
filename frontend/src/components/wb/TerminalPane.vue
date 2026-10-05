@@ -10,7 +10,7 @@ import AppLogo from '../AppLogo.vue'
 import ContextMenu, { type MenuItem } from './ContextMenu.vue'
 import { toast } from '../../composables/useToast'
 import { hosts, showNewConn } from '../../stores/hosts'
-import { savedSettings } from '../../stores/settings'
+import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
 import {
   activeSessionId, attachTerminal, detachTerminal, openSession, reconnectBackend, reconnectTick, resizeTerminal,
   sendInput, sessions,
@@ -200,6 +200,17 @@ function resolveCursorStyle(v: string): TermCursorStyle {
   return v === 'block' || v === 'underline' ? v : 'bar'
 }
 
+/** 字重设置（字符串 '300'~'700'）→ xterm 合法值；非法时回退 normal */
+function resolveFontWeight(v: string): number | 'normal' {
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 1 && n <= 1000 ? n : 'normal'
+}
+
+/** 行高百分比（100~200）→ xterm 倍数；xterm 要求 >=1，clamp 兜底脏值 */
+function resolveLineHeight(percent: number): number {
+  return Math.max(1, percent / 100)
+}
+
 /** xterm 主题：与项目配色（--status-ok 等设计令牌）对齐 */
 const XTERM_THEME = {
   background: '#00000000', // 透明，透出 .terminal 的背景渐变
@@ -246,9 +257,10 @@ function mountTerminal(id: string) {
   const term = new Terminal({
     cursorBlink: savedSettings.cursorBlink,
     cursorStyle: resolveCursorStyle(savedSettings.cursorStyle),
-    fontSize: 12.5,
-    fontFamily: "'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace",
-    lineHeight: 1.4,
+    fontSize: savedSettings.fontSize,
+    fontFamily: resolveTerminalFontFamily(savedSettings.fontFamily),
+    lineHeight: resolveLineHeight(savedSettings.lineHeight),
+    fontWeight: resolveFontWeight(savedSettings.fontWeight),
     // 回滚缓冲行数读设置（xterm 构造参数，仅对新建终端生效）；clamp 非负兜底
     scrollback: Math.max(0, Math.trunc(savedSettings.scrollback) || 0),
     allowTransparency: true,
@@ -341,6 +353,28 @@ watch(
       inst.term.options.cursorStyle = resolveCursorStyle(style)
       inst.term.options.cursorBlink = blink
     }
+  },
+)
+
+/** 字体设置（族/字号/行高/字重）变更 → 实时应用到全部已有终端实例。
+ *  字符尺寸变化后必须重新 fit：xterm 内部重绘沿用旧行列，fit 按容器像素
+ *  重算容量，行列变化再经 term.onResize 同步远端 PTY window-change；
+ *  隐藏 Tab 无法 fit（容器 0 高），由切回时 watch(activeSessionId) 的 safeFit 补算。
+ *  先等首选字体加载完成再写选项，避免首次测量落到回退字体造成行列误差。 */
+watch(
+  () => [savedSettings.fontFamily, savedSettings.fontSize, savedSettings.lineHeight, savedSettings.fontWeight] as const,
+  async ([family, size, lh, weight]) => {
+    const cssFamily = resolveTerminalFontFamily(family)
+    await document.fonts.load(`${size}px ${cssFamily}`).catch(() => {})
+    for (const inst of termInsts.values()) {
+      inst.term.options.fontFamily = cssFamily
+      inst.term.options.fontSize = size
+      inst.term.options.lineHeight = resolveLineHeight(lh)
+      inst.term.options.fontWeight = resolveFontWeight(weight)
+    }
+    await nextTick()
+    const id = activeSessionId.value
+    if (id) safeFit(id)
   },
 )
 

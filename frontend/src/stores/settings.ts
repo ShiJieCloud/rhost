@@ -16,7 +16,9 @@ export interface AppSettings {
   /* ---- 字体 ---- */
   fontFamily: string
   fontSize: number
+  /** 行高百分比（100~200），消费侧 /100 转倍数 */
   lineHeight: number
+  /** 字重，持久化为字符串（'300'/'400'/'500'/'700'），消费侧 Number() 转换 */
   fontWeight: string
   /* ---- 终端 ---- */
   /** 登录后为无颜色的远端 shell 注入彩色提示符（PS1 由远端生成，透传不变） */
@@ -185,4 +187,16 @@ export function saveSettings(draft: AppSettings) {
   Object.assign(savedSettings, next)
   persistSettings()
   applyAccent(savedSettings.accent)
+}
+
+/** 等宽字体回退链：首选字体未安装时逐级回退，最终落到系统通用等宽 */
+const MONO_FALLBACK = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+
+/**
+ * 设置中的字体名 → 可直接用于 CSS / xterm fontFamily 的字体栈。
+ * 'monospace' 表示系统等宽（不前置具名字体）；其余值作为首选字体加引号，
+ * 防止含空格/数字的字体名被解析成多个族名。设置面板预览与终端共用此函数。
+ */
+export function resolveTerminalFontFamily(name: string): string {
+  return name === 'monospace' ? MONO_FALLBACK : `"${name}", ${MONO_FALLBACK}`
 }

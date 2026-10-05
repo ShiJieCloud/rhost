@@ -34,3 +34,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
 libc = "0.2"
 tauri-plugin-clipboard-manager = "2.4.1"
+font-kit = "0.14"

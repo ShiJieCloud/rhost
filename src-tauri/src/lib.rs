@@ -1,3 +1,4 @@
+mod fonts;
 mod ipc;
 mod localfs;
 mod metrics;
@@ -52,6 +53,7 @@ pub fn run() {
             ipc::save_connection_password,
             ipc::get_connection_password,
             ipc::get_app_memory,
+            fonts::check_fonts,
             localfs::list_local_dir,
             localfs::mkdir,
             localfs::local_remove,

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import AppLogo from './AppLogo.vue'
 import { toast } from '../composables/useToast'
 import {
-  DEFAULT_SETTINGS, savedSettings, saveSettings, showSettings,
+  DEFAULT_SETTINGS, resolveTerminalFontFamily, savedSettings, saveSettings, showSettings,
   type AppSettings,
 } from '../stores/settings'
 
@@ -21,7 +22,8 @@ interface RowDef {
   desc?: string
   keywords?: string
   kind?: CtrlKind
-  options?: Opt[]
+  /** 选项：数组为静态；函数为动态（如字体安装态标记），渲染时调用并建立响应式依赖 */
+  options?: Opt[] | (() => Opt[])
   min?: number
   max?: number
   step?: number
@@ -51,7 +53,6 @@ interface PanelDef {
 
 const ICONS: Record<string, string> = {
   appearance: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 000 18z" fill="currentColor" stroke="none"/></svg>',
-  font: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="9" y1="20" x2="15" y2="20"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M13 14h4"/></svg>',
   keymap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>',
   advanced: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
@@ -68,6 +69,25 @@ const ACCENTS = [
   { v: '#f7768e', t: '红' },
   { v: '#4fd6e0', t: '青' },
 ]
+
+/** 可选等宽字体（monospace 之外的具名字体，安装态需检测） */
+const FONT_CHOICES = ['JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo'] as const
+
+/* ---- 字体安装态检测 ----
+ * WebView 内 canvas 测量 / document.fonts.check 对本地字体判定不可靠
+ * （实测 WKWebView 将系统自带的 Menlo 误报为未安装），改由后端经系统
+ * 字体框架（macOS CoreText）权威判定，前端仅缓存结果驱动下拉标记。 */
+/** 字体名 → 是否已安装；面板打开时刷新，期间新装字体重开面板即更新 */
+const fontAvail = reactive<Record<string, boolean>>({})
+async function refreshFontAvail() {
+  try {
+    const res = await invoke<Record<string, boolean>>('check_fonts', { names: [...FONT_CHOICES] })
+    for (const name of FONT_CHOICES) fontAvail[name] = res[name] === true
+  } catch (err) {
+    console.error('[fonts] check_fonts failed', err)
+  }
+}
+void refreshFontAvail()
 
 const PANELS: PanelDef[] = [
   {
@@ -86,14 +106,17 @@ const PANELS: PanelDef[] = [
     ],
   },
   {
-    id: 'font', label: '字体', glyph: 'font',
-    title: '字体', sub: '选择终端渲染文本所使用的字形与排版参数',
+    id: 'terminal', label: '终端', glyph: 'terminal',
+    title: '终端', sub: '配置 Shell 启动方式、字体、光标、会话行为与环境变量',
     groups: [
       {
-        label: '字形',
+        label: '字体',
         rows: [
-          { key: 'fontFamily', title: '等宽字体', desc: '需要系统已安装该字体', kind: 'select', width: 190, keywords: '字体 等宽 font family 字形',
-            options: ['JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', 'monospace'].map(v => ({ v, t: v === 'monospace' ? '系统等宽' : v })) },
+          { key: 'fontFamily', title: '等宽字体', desc: '需要系统已安装该字体，未安装时自动回退到系统等宽', kind: 'select', width: 190, keywords: '字体 等宽 font family 字形 安装',
+            options: () => [...FONT_CHOICES, 'monospace'].map(v => ({
+              v,
+              t: v === 'monospace' ? '系统等宽' : `${v}${fontAvail[v] === false ? '（未安装）' : ''}`,
+            })) },
           { key: 'fontSize', title: '字号', kind: 'range', min: 10, max: 20, unit: 'px', keywords: '字号 大小 font size' },
           { key: 'lineHeight', title: '行高', kind: 'range', min: 100, max: 200, unit: '%', keywords: '行高 行距 line height' },
           { key: 'fontWeight', title: '字重', kind: 'select', width: 120, keywords: '字重 粗细 weight',
@@ -101,15 +124,9 @@ const PANELS: PanelDef[] = [
         ],
       },
       {
-        label: '实时预览', extra: 'preview',
+        label: '字体预览', extra: 'preview',
         rows: [],
       },
-    ],
-  },
-  {
-    id: 'terminal', label: '终端', glyph: 'terminal',
-    title: '终端', sub: '配置 Shell 启动方式、光标、会话行为与环境变量',
-    groups: [
       {
         label: '启动',
         rows: [
@@ -305,6 +322,8 @@ watch(showSettings, v => {
   recordingKey.value = null
   alertUnit.value = 'MB'
   syncAlertRaw()
+  // 刷新字体安装态：面板打开期间新装/卸载字体重开面板即反映
+  void refreshFontAvail()
   nextTick(() => searchEl.value?.focus())
 })
 
@@ -553,9 +572,7 @@ function onAction(id: string) {
 
 /* ---- 字体预览 ---- */
 const previewStyle = computed(() => ({
-  fontFamily: draft.fontFamily === 'monospace'
-    ? 'ui-monospace, SFMono-Regular, Menlo, monospace'
-    : `"${draft.fontFamily}", ui-monospace, monospace`,
+  fontFamily: resolveTerminalFontFamily(draft.fontFamily),
   fontSize: draft.fontSize + 'px',
   lineHeight: (draft.lineHeight / 100).toFixed(2),
   fontWeight: draft.fontWeight,
@@ -565,6 +582,10 @@ const previewAccent = 'var(--blue)'
 /* ---- 控件辅助 ---- */
 function segActive(key: keyof AppSettings, v: string): boolean {
   return strVal(key) === v
+}
+/** 统一解析静态/动态选项（动态选项函数内读 reactive 缓存，变更驱动视图刷新） */
+function optionList(r: RowDef): Opt[] {
+  return typeof r.options === 'function' ? r.options() : r.options ?? []
 }
 </script>
 
@@ -694,7 +715,7 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                     <!-- 分段 -->
                     <div v-else-if="r.kind === 'segmented'" class="segmented">
                       <button
-                        v-for="op in r.options"
+                        v-for="op in optionList(r)"
                         :key="op.v"
                         type="button"
                         :class="{ active: segActive(r.key!, op.v) }"
@@ -711,7 +732,7 @@ function segActive(key: keyof AppSettings, v: string): boolean {
                       :disabled="!!r.disabledKey && !boolVal(r.disabledKey)"
                       @change="setVal(r.key!, r.num ? Number(($event.target as HTMLSelectElement).value) : ($event.target as HTMLSelectElement).value)"
                     >
-                      <option v-for="op in r.options" :key="op.v" :value="op.v">{{ op.t }}</option>
+                      <option v-for="op in optionList(r)" :key="op.v" :value="op.v">{{ op.t }}</option>
                     </select>
 
                     <!-- 数值 + 单位（内存告警阈值） -->
@@ -866,7 +887,7 @@ function segActive(key: keyof AppSettings, v: string): boolean {
 
               <!-- 字体实时预览 -->
               <div v-if="g.extra === 'preview' && !p.searching" class="st-preview" :style="previewStyle">
-                <div class="ln"><span class="u" :style="{ color: previewAccent }">user@dev</span>:<span class="u" :style="{ color: previewAccent }">~/projects</span>$ npm run build</div>
+                <div class="ln"><span class="u" :style="{ color: previewAccent }">root@localhost</span>:<span class="u" :style="{ color: previewAccent }">~/projects</span>$ npm run build</div>
                 <div class="ln gap"></div>
                 <div class="ln"><span class="g">✔</span> 编译完成，用时 1.24s</div>
                 <div class="ln"><span class="y">⚠</span> 2 个依赖已过时</div>
