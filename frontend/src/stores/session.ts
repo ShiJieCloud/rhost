@@ -770,6 +770,27 @@ export function setSessionState(id: string, state: SessionState) {
   if (s) s.state = state
 }
 
+/**
+ * 断开连接：仅断开后端 SSH 会话，保留标签页与会话记录（区别于 closeSession 关标签）。
+ * 主动 disconnect 后后端不会再推 EXIT 帧（取消令牌直接终止转发循环），
+ * 因此本地同步置 offline 并向终端写入关闭提示，效果与远端 exit 一致；
+ * 之后可通过重连（reconnectBackend）恢复。
+ */
+export async function disconnectSession(id: string): Promise<boolean> {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s?.backendId || !isTauri) return false
+  const backendId = s.backendId
+  s.backendId = undefined // 立即置空：断开的转发循环残留的 EXIT 帧不会重复处理
+  try {
+    await invoke('disconnect_session', { sessionId: backendId })
+  } catch (e) {
+    console.warn('disconnect_session 失败:', e)
+  }
+  setSessionState(id, 'offline')
+  deliver(id, textEncoder.encode('\r\n\x1b[2m[连接已断开]\x1b[0m\r\n'))
+  return true
+}
+
 /* ---- GPU 指标（0x06 帧 gpus[]；字段与后端 GpuItemPayload 对应，snake_case） ---- */
 /** 单卡 GPU 指标（nvidia-smi --query-gpu；无 GPU 主机 gpus 为空数组，侧栏区块自动隐藏） */
 export interface GpuMetricsData {

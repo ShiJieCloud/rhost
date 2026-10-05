@@ -3,8 +3,8 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { toast } from '../../composables/useToast'
 import {
   METRICS_HEARTBEAT_MS, activeHost, activeHostInfo, activeMetrics, activeNetHist, activeSession,
-  connected, inspectorVisible, metricsHeartbeat, openDock, reconnectTick, startMetrics,
-  stopMetrics,
+  connected, disconnectSession, inspectorVisible, metricsHeartbeat, openDock, reconnectTick,
+  startMetrics, stopMetrics,
 } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
 
@@ -325,12 +325,15 @@ function onReconnect() {
   }
   reconnectTick.value++
 }
-function onDisconnect() {
-  if (!connected.value) {
+async function onDisconnect() {
+  const s = activeSession.value
+  if (!connected.value || !s) {
     toast('当前没有活动会话', 'warn')
     return
   }
-  toast('已请求断开连接，请在终端执行 exit', 'info', 2400)
+  if (await disconnectSession(s.id)) {
+    toast('已断开连接', 'info', 1600)
+  }
 }
 </script>
 
