@@ -36,8 +36,10 @@ impl SessionManager {
         &self,
         cfg: SessionConfig,
     ) -> Result<(String, mpsc::Receiver<Vec<u8>>), SshError> {
-        let (session, frame_rx) = SshSession::connect(cfg).await?;
         let id = Uuid::new_v4().to_string();
+        // sid 取 uuid 前 6 位（日志事件会话标签，贯穿连接全生命周期）
+        let sid = id.chars().take(6).collect::<String>();
+        let (session, frame_rx) = SshSession::connect(cfg, &sid).await?;
         self.sessions
             .write()
             .await
@@ -291,5 +293,20 @@ impl SessionManager {
         } else {
             false
         }
+    }
+
+    /// 关闭全部会话（应用退出时调用），返回关闭数量
+    pub async fn shutdown_all(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let count = sessions.len();
+        for (_, s) in sessions.drain() {
+            s.shutdown();
+        }
+        count
+    }
+
+    /// 当前存活会话数（退出事件 kv 用）
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
     }
 }

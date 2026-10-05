@@ -125,6 +125,7 @@ fn fmt_owner(
 /// 读目录可能耗时（网络盘/大目录），放阻塞线程池避免卡住异步运行时。
 #[tauri::command]
 pub async fn list_local_dir(path: Option<String>) -> Result<LocalDirListing, String> {
+    crate::slow_span!("list_local_dir");
     let dir = match path {
         Some(p) if !p.is_empty() => p,
         _ => home_dir().ok_or_else(|| "无法确定用户主目录".to_string())?,
@@ -162,6 +163,7 @@ pub async fn list_local_dir(path: Option<String>) -> Result<LocalDirListing, Str
 /// 本地创建目录（单层，不递归）。
 #[tauri::command]
 pub async fn mkdir(path: String) -> Result<(), String> {
+    crate::slow_span!("mkdir");
     tokio::fs::create_dir(&path)
         .await
         .map_err(|e| format!("创建目录 {path} 失败：{e}"))
@@ -171,6 +173,7 @@ pub async fn mkdir(path: String) -> Result<(), String> {
 /// 目录 → remove_dir_all 递归删除。用 symlink_metadata 判类型，避免跟随软链。
 #[tauri::command]
 pub async fn local_remove(path: String) -> Result<(), String> {
+    crate::slow_span!("local_remove");
     let md = tokio::fs::symlink_metadata(&path)
         .await
         .map_err(|e| format!("获取 {path} 属性失败：{e}"))?;
@@ -189,6 +192,7 @@ pub async fn local_remove(path: String) -> Result<(), String> {
 /// 本地重命名/移动（同盘原子；跨卷由系统执行复制+删除）。
 #[tauri::command]
 pub async fn local_rename(old_path: String, new_path: String) -> Result<(), String> {
+    crate::slow_span!("local_rename");
     tokio::fs::rename(&old_path, &new_path)
         .await
         .map_err(|e| format!("重命名 {old_path} → {new_path} 失败：{e}"))
@@ -197,6 +201,7 @@ pub async fn local_rename(old_path: String, new_path: String) -> Result<(), Stri
 /// 本地创建零字节空文件（目标已存在时报错，不截断）。
 #[tauri::command]
 pub async fn local_create_file(path: String) -> Result<(), String> {
+    crate::slow_span!("local_create_file");
     tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -210,6 +215,7 @@ pub async fn local_create_file(path: String) -> Result<(), String> {
 /// 文件走 fs::copy。dst 的父目录需已存在（前端按目录树拼接）。
 #[tauri::command]
 pub async fn local_copy(src: String, dst: String) -> Result<(), String> {
+    crate::slow_span!("local_copy");
     async fn rec(src: &str, dst: &str) -> Result<(), String> {
         let md = tokio::fs::symlink_metadata(src)
             .await
@@ -264,6 +270,7 @@ pub async fn local_copy(src: String, dst: String) -> Result<(), String> {
 /// 传入文件时打开其所在目录。进程 spawn 放阻塞线程池。
 #[tauri::command]
 pub async fn local_open_terminal(path: String) -> Result<(), String> {
+    crate::slow_span!("local_open_terminal");
     let p = std::path::Path::new(&path);
     let dir = if p.is_dir() {
         p.to_path_buf()

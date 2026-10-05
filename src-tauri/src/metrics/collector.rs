@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+use crate::applog;
+use crate::applog::events as ev;
 use crate::metrics::{
     CpuMetricsPayload, CpuTimes, DISK_INTERVAL_ROUNDS, DiskMetrics, GpuItemPayload, MetricsPayload,
     NetCounters, NetMetricsPayload, ProcsPayload, build_procs_payload, byte_rate, cpu_util,
@@ -48,6 +50,8 @@ pub(crate) const HEARTBEAT_TTL: Duration = Duration::from_secs(9);
 pub(crate) struct CollectorHandle {
     cancel: CancellationToken,
     last_heartbeat: Arc<StdMutex<Instant>>,
+    /// 会话标签（stop 日志事件用）
+    sid: String,
 }
 
 impl CollectorHandle {
@@ -59,6 +63,14 @@ impl CollectorHandle {
     /// 主动停止采集（重复 start 时先停旧任务，或前端显式 stop）
     pub(crate) fn stop(&self) {
         self.cancel.cancel();
+        applog::emit(
+            log::Level::Debug,
+            "metrics",
+            ev::METRICS_COLLECT_STOP,
+            Some(&self.sid),
+            "指标采集停止",
+            Some(serde_json::json!({ "reason": "manual" })),
+        );
     }
 }
 
@@ -71,6 +83,18 @@ pub(crate) fn spawn(
     frame_tx: mpsc::Sender<Vec<u8>>,
     iface: Option<String>,
 ) -> CollectorHandle {
+    let sid = session.sid().to_string();
+    applog::emit(
+        log::Level::Debug,
+        "metrics",
+        ev::METRICS_COLLECT_START,
+        Some(&sid),
+        "指标采集启动",
+        Some(serde_json::json!({
+            "interval_ms": interval.as_millis() as u64,
+            "iface": iface,
+        })),
+    );
     let cancel = root.child_token();
     let last_heartbeat = Arc::new(StdMutex::new(Instant::now()));
     tokio::spawn(run(
@@ -84,6 +108,7 @@ pub(crate) fn spawn(
     CollectorHandle {
         cancel,
         last_heartbeat,
+        sid,
     }
 }
 
@@ -124,12 +149,23 @@ async fn run(
     let mut gpus_cache: Vec<GpuItemPayload> = Vec::new();
     // 连续 exec 失败计数：成功即清零；计满 FAILURE_BACKOFF_THRESHOLD 轮降为慢轮询
     let mut consecutive_failures: u32 = 0;
+    // 是否曾有过成功采集：用于区分「环境不支持」（无 procfs 的主机，首轮即失败，
+    // DEBUG）与「运行时降级」（本来采得到中途连续失败，WARN）
+    let mut ever_succeeded = false;
     let mut seq: u64 = 0;
 
     loop {
         // 心跳 TTL 检查：无人消费则静默退出（不取消会话本身）
         if last_heartbeat.lock().unwrap().elapsed() > HEARTBEAT_TTL {
             debug!("指标采集心跳超时，自动停止");
+            applog::emit(
+                log::Level::Debug,
+                "metrics",
+                ev::METRICS_COLLECT_STOP,
+                Some(session.sid()),
+                "指标采集停止",
+                Some(serde_json::json!({ "reason": "heartbeat_timeout" })),
+            );
             return;
         }
 
@@ -146,6 +182,7 @@ async fn run(
             Ok(text) => {
                 // exec 成功即解除退避（即使部分 marker 段缺失也算通道健康）
                 consecutive_failures = 0;
+                ever_succeeded = true;
                 let raw = parse_metrics_output(&text, iface.as_deref());
                 // CPU 利用率需相邻两次快照差值；首帧（或本轮缺 stat）util 为 0
                 let util = match (prev_cpu, raw.cpu) {
@@ -197,6 +234,19 @@ async fn run(
                     if gpus.is_empty() {
                         if gpu_supported.is_none() {
                             gpu_supported = Some(false);
+                            // 无 GPU 是云主机/虚拟机的常态环境事实而非故障，记 DEBUG：
+                            // 默认面板不显示，排查"为何没有 GPU 区块"时可调出
+                            applog::emit(
+                                log::Level::Debug,
+                                "metrics",
+                                ev::METRICS_COLLECT_DEGRADED,
+                                Some(session.sid()),
+                                "GPU 指标不可用，跳过",
+                                Some(serde_json::json!({
+                                    "component": "gpu",
+                                    "reason": "not_present",
+                                })),
+                            );
                         }
                     } else {
                         gpu_supported = Some(true);
@@ -236,6 +286,41 @@ async fn run(
             Err(e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 debug!("指标采集本轮失败（连续第 {consecutive_failures} 轮）: {e}");
+                // 刚达阈值记一次降级事件（边沿触发）；之后每轮不再重复，
+                // 成功清零后若再次达到阈值才会再记。
+                // 首轮从未成功过 → 目标环境不支持（无 procfs 等，常态，DEBUG）；
+                // 曾成功后再连续失败 → 真运行时降级（WARN）。
+                if consecutive_failures == FAILURE_BACKOFF_THRESHOLD {
+                    if ever_succeeded {
+                        applog::emit(
+                            log::Level::Warn,
+                            "metrics",
+                            ev::METRICS_COLLECT_DEGRADED,
+                            Some(session.sid()),
+                            "采集连续失败，指标降级为慢轮询",
+                            Some(serde_json::json!({
+                                "component": "exec",
+                                "reason": "runtime_failure",
+                                "consecutive": consecutive_failures,
+                                "backoff_ms": BACKOFF_INTERVAL.as_millis() as u64,
+                                "err": e.to_string(),
+                            })),
+                        );
+                    } else {
+                        applog::emit(
+                            log::Level::Debug,
+                            "metrics",
+                            ev::METRICS_COLLECT_DEGRADED,
+                            Some(session.sid()),
+                            "目标主机不支持指标采集，转入慢轮询",
+                            Some(serde_json::json!({
+                                "component": "exec",
+                                "reason": "unsupported",
+                                "err": e.to_string(),
+                            })),
+                        );
+                    }
+                }
             }
         }
 

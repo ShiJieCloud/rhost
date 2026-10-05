@@ -127,14 +127,17 @@ pub(super) struct SftpState {
     /// 文件管理操作（删除/重命名/复制等多请求串行操作）互斥锁，
     /// 避免递归遍历期间目录被另一个管理操作改动
     manage: Mutex<()>,
+    /// 会话标签（通道建立日志事件用）
+    sid: String,
 }
 
 impl SftpState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(sid: &str) -> Self {
         Self {
             inner: Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             manage: Mutex::new(()),
+            sid: sid.to_string(),
         }
     }
 
@@ -164,6 +167,14 @@ impl SftpState {
             return Ok(s.clone());
         }
         let s = Arc::new(open_sftp(handle).await?);
+        crate::applog::emit(
+            log::Level::Debug,
+            "ssh",
+            crate::applog::events::SSH_SFTP_CHANNEL_OPEN,
+            Some(&self.sid),
+            "SFTP 通道建立",
+            None,
+        );
         *guard = Some(s.clone());
         Ok(s)
     }

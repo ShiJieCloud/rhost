@@ -10,6 +10,7 @@ use font_kit::source::SystemSource;
 /// 判定不可靠（实测 WKWebView 将系统自带的 Menlo 误报为未安装），故统一由后端判定。
 #[tauri::command]
 pub async fn check_fonts(names: Vec<String>) -> Result<HashMap<String, bool>, String> {
+    crate::slow_span!("check_fonts");
     // 查询是对内存字体索引的匹配，很轻，但仍放阻塞线程池避免占用 async worker
     tauri::async_runtime::spawn_blocking(move || {
         let source = SystemSource::new();

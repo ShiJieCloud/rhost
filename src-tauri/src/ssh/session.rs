@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -29,6 +29,8 @@ use uuid::Uuid;
 use super::frame::{FrameType, encode_frame};
 use super::sftp::SftpState;
 use super::{AuthMethod, SessionConfig, SshError};
+use crate::applog;
+use crate::applog::events as ev;
 
 /// 小包合并阈值：攒够 4KB 立即发帧
 const MERGE_BYTES: usize = 4096;
@@ -66,6 +68,8 @@ pub(crate) struct NegotiatedAlgo {
 pub(crate) struct ClientHandler {
     /// 协商算法出口：russh 在 KEX 完成时经 `kex_done` 填入，Arc 共享给连接主流程
     algo: Arc<StdMutex<Option<NegotiatedAlgo>>>,
+    /// 会话标签（主机密钥指纹等握手期日志事件用）
+    sid: String,
 }
 
 /// 会话初始化脚本（写入远端临时文件，由前端 source）。
@@ -233,8 +237,26 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::PublicKeyOrCertificate,
+        key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        use russh::keys::PublicKeyOrCertificate as PKC;
+        let fingerprint = match key {
+            PKC::PublicKey { key, .. } => {
+                key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
+            }
+            PKC::Certificate(cert) => cert
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string(),
+        };
+        applog::emit(
+            log::Level::Debug,
+            "ssh",
+            ev::SSH_HOSTKEY_FINGERPRINT,
+            Some(&self.sid),
+            "主机密钥指纹",
+            Some(serde_json::json!({ "fingerprint": fingerprint })),
+        );
         Ok(true)
     }
 
@@ -256,14 +278,34 @@ impl client::Handler for ClientHandler {
 }
 
 /// 打开 session 通道并申请 PTY（不启动 shell：调用方需要先把 MOTD 首帧排好序）。
+/// 失败统一记 `ssh.session.failed`（stage=channel/pty），成功产出 channel_open + pty 事件。
 async fn open_pty(
     handle: &mut client::Handle<ClientHandler>,
     cfg: &SessionConfig,
+    sid: &str,
 ) -> Result<russh::Channel<client::Msg>, SshError> {
     let channel = handle
         .channel_open_session()
         .await
-        .map_err(|e| SshError::Channel(e.to_string()))?;
+        .map_err(|e| {
+            applog::emit(
+                log::Level::Error,
+                "ssh",
+                ev::SSH_SESSION_FAILED,
+                Some(sid),
+                "会话创建失败",
+                Some(serde_json::json!({ "stage": "channel", "err": e.to_string() })),
+            );
+            SshError::Channel(e.to_string())
+        })?;
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_SESSION_CHANNEL_OPEN,
+        Some(sid),
+        "会话通道已打开",
+        Some(serde_json::json!({ "channel_id": format!("{:?}", channel.id()) })),
+    );
     channel
         .request_pty(
             true,
@@ -275,7 +317,29 @@ async fn open_pty(
             &[],
         )
         .await
-        .map_err(|e| SshError::Channel(e.to_string()))?;
+        .map_err(|e| {
+            applog::emit(
+                log::Level::Error,
+                "ssh",
+                ev::SSH_SESSION_FAILED,
+                Some(sid),
+                "会话创建失败",
+                Some(serde_json::json!({ "stage": "pty", "err": e.to_string() })),
+            );
+            SshError::Channel(e.to_string())
+        })?;
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_SESSION_PTY,
+        Some(sid),
+        "PTY 已分配",
+        Some(serde_json::json!({
+            "term": TERM_TYPE,
+            "cols": cfg.cols,
+            "rows": cfg.rows,
+        })),
+    );
     Ok(channel)
 }
 
@@ -321,13 +385,19 @@ fi",
 ///   保证中间 shell 自我替换、不额外残留一层进程。
 /// - exec 请求被拒（极少）或未探测到 shell 路径时，重开 PTY 回退标准 shell 请求
 ///   （同一 session 通道在一次会话子请求失败后不能再发 shell 请求）。
+///
+/// 日志：env/shell 子步骤成功各产出一个 DEBUG 事件；最终失败记
+/// `ssh.session.failed`（stage=shell）。`init_injected` 由调用方提供
+/// （CWD hook 脚本是否已落盘，决定后续 SFTP 目录同步是否可用）。
 async fn open_interactive(
     handle: &mut client::Handle<ClientHandler>,
     cfg: &SessionConfig,
     suppress: bool,
     login_shell: Option<String>,
+    sid: &str,
+    init_injected: bool,
 ) -> Result<russh::Channel<client::Msg>, SshError> {
-    let mut channel = open_pty(handle, cfg).await?;
+    let mut channel = open_pty(handle, cfg, sid).await?;
 
     if suppress {
         if let Some(shell) = login_shell {
@@ -335,9 +405,33 @@ async fn open_interactive(
             // readline 初始化时一次性读取并缓存 locale，shell 启动后再 export
             // 无法改变当前行编辑对非 ASCII 字节的处理。
             let cmd = locale_login_cmd(&shell);
+            // locale 注入内联在 exec 命令串中，先于 shell 启动事件记录
+            applog::emit(
+                log::Level::Debug,
+                "ssh",
+                ev::SSH_SESSION_ENV,
+                Some(sid),
+                "环境变量已设置",
+                Some(serde_json::json!({
+                    "locale": "C.UTF-8",
+                    "fallback": true,
+                    "via": "exec_cmd",
+                })),
+            );
             match channel.exec(true, cmd).await {
                 Ok(()) => {
                     debug!("已以 exec(login shell -l) 启动，抑制服务端原生 MOTD: {shell}");
+                    applog::emit(
+                        log::Level::Debug,
+                        "ssh",
+                        ev::SSH_SESSION_SHELL,
+                        Some(sid),
+                        "shell 已启动",
+                        Some(serde_json::json!({
+                            "shell": shell,
+                            "init_injected": init_injected,
+                        })),
+                    );
                     return Ok(channel);
                 }
                 Err(e) => warn!("exec 登录 shell 被拒，重开 PTY 回退标准 shell: {e}"),
@@ -347,18 +441,52 @@ async fn open_interactive(
         }
         // 回退路径：丢弃当前通道，重新申请 PTY + 标准 shell
         let _ = channel.close().await;
-        channel = open_pty(handle, cfg).await?;
+        channel = open_pty(handle, cfg, sid).await?;
     }
 
     // 标准 shell 请求路径：尽力在启动前注入 UTF-8 字符集（接受与否取决于
     // sshd 的 AcceptEnv；want_reply=false 不等待回复、不会悬挂）。exec
     // 抑制路径已在命令串中解决，不会走到这里。被拒不影响后续 shell 请求。
     let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_SESSION_ENV,
+        Some(sid),
+        "环境变量已设置",
+        Some(serde_json::json!({
+            "locale": "C.UTF-8",
+            "fallback": true,
+            "via": "set_env",
+        })),
+    );
 
     channel
         .request_shell(true)
         .await
-        .map_err(|e| SshError::Channel(e.to_string()))?;
+        .map_err(|e| {
+            applog::emit(
+                log::Level::Error,
+                "ssh",
+                ev::SSH_SESSION_FAILED,
+                Some(sid),
+                "会话创建失败",
+                Some(serde_json::json!({ "stage": "shell", "err": e.to_string() })),
+            );
+            SshError::Channel(e.to_string())
+        })?;
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_SESSION_SHELL,
+        Some(sid),
+        "shell 已启动",
+        Some(serde_json::json!({
+            // 标准路径由 sshd 决定登录 shell，本地未探测
+            "shell": "default",
+            "init_injected": init_injected,
+        })),
+    );
     Ok(channel)
 }
 
@@ -376,6 +504,15 @@ enum WriteReq {
     Data(Vec<u8>),
     /// PTY 尺寸变化（SSH window-change）
     Resize { cols: u32, rows: u32 },
+}
+
+/// 会话断开日志状态：read_task（异常断开）与 shutdown（主动关闭）竞争，
+/// 原子 swap 保证仅首次产出 `ssh.disconnect` 事件。
+struct DisconnectState {
+    sid: String,
+    connected_at: Instant,
+    /// 已记录 disconnect（true=已产日志，不再重复）
+    logged: AtomicBool,
 }
 
 /// 一条存活中的 SSH PTY 会话（由 SessionManager 持有）
@@ -400,6 +537,8 @@ pub struct SshSession {
     /// Shell 当前工作目录：由 merge_task 解析 PTY 中的 OSC 6667 序列更新，
     /// sftp_list_dir 无参数时以此为默认目录，保持 Shell 与 SFTP CWD 一致。
     pub(super) cwd: Arc<Mutex<Option<String>>>,
+    /// 断开日志状态：共享给 read_task，防止主动关闭与异常断开重复记录
+    dc_state: Arc<DisconnectState>,
 }
 
 /// 展开路径开头的 ~ 为当前用户家目录（不引入 shellexpand 依赖）
@@ -417,26 +556,151 @@ fn expand_tilde(path: &str) -> String {
 /// 由「正式连接」与「测试连接」共用，保证两者认证行为完全一致：
 /// 测试通过 = 正式连接的认证阶段也必然通过。成功返回已认证的 handle，
 /// 调用方负责断开；测试连接用完即断，不注册会话池。
+///
+/// 日志按 §4.2 分阶段产出：connect.start → connect.tcp → handshake.start →
+/// handshake.complete → auth.start → auth.success；任一阶段失败产出对应
+/// ERROR 事件后返回，不再产出后续阶段事件。
 pub(crate) async fn connect_and_auth(
     cfg: &SessionConfig,
     algo: Arc<StdMutex<Option<NegotiatedAlgo>>>,
+    sid: &str,
 ) -> Result<client::Handle<ClientHandler>, SshError> {
+    let auth_method = match &cfg.auth {
+        AuthMethod::Password(_) => "password",
+        AuthMethod::Key { .. } => "publickey",
+    };
+    applog::emit(
+        log::Level::Info,
+        "ssh",
+        ev::SSH_CONNECT_START,
+        Some(sid),
+        "正在连接",
+        Some(serde_json::json!({
+            "host": cfg.host,
+            "port": cfg.port,
+            "user": cfg.username,
+            "auth": auth_method,
+        })),
+    );
+
+    // ---- TCP 阶段：自建 TcpStream 再交 connect_stream，与握手阶段精确区分 ----
+    let tcp_start = Instant::now();
+    let socket = match tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await {
+        Ok(s) => {
+            applog::emit(
+                log::Level::Debug,
+                "ssh",
+                ev::SSH_CONNECT_TCP,
+                Some(sid),
+                "TCP 已连接",
+                Some(serde_json::json!({
+                    "rtt_ms": tcp_start.elapsed().as_millis() as u64,
+                })),
+            );
+            s
+        }
+        Err(e) => {
+            applog::emit(
+                log::Level::Error,
+                "ssh",
+                ev::SSH_CONNECT_TCP_FAILED,
+                Some(sid),
+                "TCP 连接失败",
+                Some(serde_json::json!({
+                    "host": cfg.host,
+                    "port": cfg.port,
+                    "err": e.to_string(),
+                })),
+            );
+            return Err(SshError::Connect(e.to_string()));
+        }
+    };
+    let _ = socket.set_nodelay(true);
+
+    // ---- SSH 握手阶段 ----
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_HANDSHAKE_START,
+        Some(sid),
+        "SSH 握手开始",
+        None,
+    );
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
         keepalive_interval: Some(Duration::from_secs(30)),
         nodelay: true,
         ..Default::default()
     });
-    let mut handle =
-        client::connect(config, (cfg.host.as_str(), cfg.port), ClientHandler { algo })
-            .await
-            .map_err(|e| SshError::Connect(e.to_string()))?;
+    let mut handle = match client::connect_stream(
+        config,
+        socket,
+        ClientHandler {
+            algo: algo.clone(),
+            sid: sid.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(h) => {
+            // kex_done 已在握手完成时写入协商算法
+            let negotiated = algo.lock().unwrap().clone().unwrap_or_default();
+            applog::emit(
+                log::Level::Info,
+                "ssh",
+                ev::SSH_HANDSHAKE_COMPLETE,
+                Some(sid),
+                "SSH 握手完成",
+                Some(serde_json::json!({
+                    "host_key": negotiated.host_key,
+                    "cipher": negotiated.cipher,
+                })),
+            );
+            h
+        }
+        Err(e) => {
+            applog::emit(
+                log::Level::Error,
+                "ssh",
+                ev::SSH_HANDSHAKE_FAILED,
+                Some(sid),
+                "SSH 握手失败",
+                Some(serde_json::json!({ "err": e.to_string() })),
+            );
+            return Err(SshError::Connect(e.to_string()));
+        }
+    };
 
+    // ---- 认证阶段 ----
+    applog::emit(
+        log::Level::Debug,
+        "ssh",
+        ev::SSH_AUTH_START,
+        Some(sid),
+        "开始认证",
+        Some(serde_json::json!({
+            "method": auth_method,
+            "user": cfg.username,
+        })),
+    );
     let auth = match &cfg.auth {
         AuthMethod::Password(password) => handle
             .authenticate_password(cfg.username.clone(), password.clone())
             .await
-            .map_err(|e| SshError::Auth(e.to_string()))?,
+            .map_err(|e| {
+                applog::emit(
+                    log::Level::Error,
+                    "ssh",
+                    ev::SSH_AUTH_FAILED,
+                    Some(sid),
+                    "认证失败",
+                    Some(serde_json::json!({
+                        "method": auth_method,
+                        "reason": e.to_string(),
+                    })),
+                );
+                SshError::Auth(e.to_string())
+            })?,
         AuthMethod::Key { path, passphrase } => {
             let key_path = expand_tilde(path);
             let key = russh::keys::load_secret_key(
@@ -447,11 +711,30 @@ pub(crate) async fn connect_and_auth(
                     Some(passphrase.as_str())
                 },
             )
-            .map_err(|e| match e {
-                // 无口令加载加密私钥 / 口令错误都报 KeyIsEncrypted，
-                // 统一转成约定标记，前端弹口令框后带口令重试
-                russh::keys::Error::KeyIsEncrypted => SshError::KeyEncrypted,
-                other => SshError::Auth(format!("私钥加载失败（{key_path}）: {other}")),
+            .map_err(|e| {
+                let (reason, err) = match e {
+                    // 无口令加载加密私钥 / 口令错误都报 KeyIsEncrypted，
+                    // 统一转成约定标记，前端弹口令框后带口令重试
+                    russh::keys::Error::KeyIsEncrypted => {
+                        ("私钥已加密，需要口令".to_string(), SshError::KeyEncrypted)
+                    }
+                    other => (
+                        format!("私钥加载失败（{key_path}）: {other}"),
+                        SshError::Auth(format!("私钥加载失败（{key_path}）: {other}")),
+                    ),
+                };
+                applog::emit(
+                    log::Level::Error,
+                    "ssh",
+                    ev::SSH_AUTH_FAILED,
+                    Some(sid),
+                    "认证失败",
+                    Some(serde_json::json!({
+                        "method": auth_method,
+                        "reason": reason,
+                    })),
+                );
+                err
             })?;
             handle
                 .authenticate_publickey(
@@ -459,7 +742,20 @@ pub(crate) async fn connect_and_auth(
                     russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None),
                 )
                 .await
-                .map_err(|e| SshError::Auth(e.to_string()))?
+                .map_err(|e| {
+                    applog::emit(
+                        log::Level::Error,
+                        "ssh",
+                        ev::SSH_AUTH_FAILED,
+                        Some(sid),
+                        "认证失败",
+                        Some(serde_json::json!({
+                            "method": auth_method,
+                            "reason": e.to_string(),
+                        })),
+                    );
+                    SshError::Auth(e.to_string())
+                })?
         }
     };
     if !auth.success() {
@@ -470,8 +766,30 @@ pub(crate) async fn connect_and_auth(
             AuthMethod::Password(_) => "用户名或密码错误",
             AuthMethod::Key { .. } => "服务器拒绝了该密钥",
         };
+        applog::emit(
+            log::Level::Error,
+            "ssh",
+            ev::SSH_AUTH_FAILED,
+            Some(sid),
+            "认证失败",
+            Some(serde_json::json!({
+                "method": auth_method,
+                "reason": reason,
+            })),
+        );
         return Err(SshError::Auth(reason.into()));
     }
+    applog::emit(
+        log::Level::Info,
+        "ssh",
+        ev::SSH_AUTH_SUCCESS,
+        Some(sid),
+        "认证成功",
+        Some(serde_json::json!({
+            "method": auth_method,
+            "user": cfg.username,
+        })),
+    );
     Ok(handle)
 }
 
@@ -518,7 +836,10 @@ impl SshSession {
     /// PTY 开启后经写队列自动注入，merge_task 以 marker 为信号 hold 初始化输出，
     /// 前端无需参与时序编排。
     /// 后台任务（读/合并/写）均挂在 `cancel` 上，`shutdown()` 即全部取消。
-    pub async fn connect(cfg: SessionConfig) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SshError> {
+    ///
+    /// `sid` 为会话标签（uuid 前 6 位），贯穿连接全生命周期日志事件。
+    pub async fn connect(cfg: SessionConfig, sid: &str) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SshError> {
+        let connect_start = Instant::now();
         let cancel = CancellationToken::new();
 
         // 1. TCP + SSH 握手 + 认证（与测试连接共用，保证认证行为一致）。
@@ -528,7 +849,7 @@ impl SshSession {
         //    algo 是 KEX 协商算法的出口（kex_done 回调已在认证前填入）。
         let algo = Arc::new(StdMutex::new(None));
         let handle =
-            Arc::new(Mutex::new(connect_and_auth(&cfg, algo.clone()).await?));
+            Arc::new(Mutex::new(connect_and_auth(&cfg, algo.clone(), sid).await?));
 
         // 2.【阶段 A/B】PTY 尚未打开：独立 exec 子通道并行采集服务器状态，
         //    本地组装 MOTD 渲染指令数组（不碰 PTY、不经键盘、不解析 shell 输出）。
@@ -605,11 +926,24 @@ impl SshSession {
 
         // 5/6.【阶段 D】打开 PTY 并启动交互式 shell（抑制开关决定走 exec 还是 shell 请求）。
         //    MOTD 首帧已在帧队列中，PTY 输出无论多快都排在其后。
+        applog::emit(
+            log::Level::Debug,
+            "ssh",
+            ev::SSH_SESSION_CREATE,
+            Some(sid),
+            "创建会话",
+            Some(serde_json::json!({
+                "term": TERM_TYPE,
+                "cols": cfg.cols,
+                "rows": cfg.rows,
+                "enc": TERM_ENCODING,
+            })),
+        );
         let login_shell = motd_outcome.as_ref().and_then(|o| o.login_shell.clone());
         let channel = {
             let mut h = handle.lock().await;
             // motd 开启即走 exec 路径抑制 sshd 原生横幅，关闭走标准 shell
-            open_interactive(&mut h, &cfg, cfg.motd, login_shell).await?
+            open_interactive(&mut h, &cfg, cfg.motd, login_shell, sid, init_cmd.is_some()).await?
         };
 
         // 7. 拆分读写半通道，启动双向转发；PTY 输出从此刻起进入帧队列（恒在 MOTD 之后）
@@ -626,7 +960,19 @@ impl SshSession {
             (bytes, write_tx.clone())
         });
 
-        tokio::spawn(read_task(read_half, event_tx.clone(), cancel.clone()));
+        // 断开日志状态：read_task 的 EOF 分支（异常断开）与 shutdown（主动关闭）
+        // 竞争记录 `ssh.disconnect`，原子 swap 保证只记一条
+        let dc_state = Arc::new(DisconnectState {
+            sid: sid.to_string(),
+            connected_at: connect_start,
+            logged: AtomicBool::new(false),
+        });
+        tokio::spawn(read_task(
+            read_half,
+            event_tx.clone(),
+            cancel.clone(),
+            dc_state.clone(),
+        ));
         let cwd = Arc::new(Mutex::new(None));
         tokio::spawn(merge_task(
             event_rx,
@@ -647,9 +993,19 @@ impl SshSession {
 
         // 8. handle（Arc<Mutex>）随 SshSession 保留：供连接建立后的独立 exec
         //    指标采集通道使用（主机指标 0x05/0x06 帧），与 PTY 半通道共同维持连接。
-        debug!(
-            "SSH 会话已建立: {}@{}:{} ({}x{})",
-            cfg.username, cfg.host, cfg.port, cfg.cols, cfg.rows
+        applog::emit(
+            log::Level::Info,
+            "ssh",
+            ev::SSH_SESSION_READY,
+            Some(sid),
+            "会话已建立",
+            Some(serde_json::json!({
+                "term": TERM_TYPE,
+                "cols": cfg.cols,
+                "rows": cfg.rows,
+                "enc": TERM_ENCODING,
+                "elapsed_ms": connect_start.elapsed().as_millis() as u64,
+            })),
         );
 
         Ok((
@@ -659,8 +1015,9 @@ impl SshSession {
                 handle,
                 frame_tx: metrics_frame_tx,
                 metrics: StdMutex::new(None),
-                sftp: SftpState::new(),
+                sftp: SftpState::new(sid),
                 cwd,
+                dc_state,
             },
             frame_rx,
         ))
@@ -803,19 +1160,43 @@ impl SshSession {
         }
     }
 
-    /// 关闭会话：取消所有后台任务，释放 russh 连接
+    /// 关闭会话：取消所有后台任务，释放 russh 连接。
+    /// 幂等：重复调用仅首次产出 `ssh.disconnect` 日志事件。
     pub fn shutdown(&self) {
+        // 已取消说明是重复 shutdown（disconnect/shutdown_all 不重复记日志）
+        if self.cancel.is_cancelled() {
+            return;
+        }
         // 采集任务挂在会话 cancel 的 child token 上，根取消即连带停止
         if let Ok(mut guard) = self.metrics.lock() {
             *guard = None;
         }
         self.cancel.cancel();
+        // read_task 的 EOF 分支可能已先记录（异常断开）；原子 swap 保证只记一条
+        if !self.dc_state.logged.swap(true, Ordering::Relaxed) {
+            applog::emit(
+                log::Level::Info,
+                "ssh",
+                ev::SSH_DISCONNECT,
+                Some(&self.dc_state.sid),
+                "连接已断开",
+                Some(serde_json::json!({
+                    "reason": "closed",
+                    "uptime_s": self.dc_state.connected_at.elapsed().as_secs(),
+                })),
+            );
+        }
     }
 
     /// 派生会话级取消令牌：SFTP 传输等独立任务挂在其上，
     /// 会话 shutdown 时连带取消（供同 crate 的 sftp 模块使用）
     pub(super) fn child_cancel(&self) -> CancellationToken {
         self.cancel.child_token()
+    }
+
+    /// 会话标签（uuid 前 6 位）：供 metrics 采集器等跨模块组件的日志事件使用
+    pub(crate) fn sid(&self) -> &str {
+        &self.dc_state.sid
     }
 }
 
@@ -825,7 +1206,23 @@ async fn read_task(
     mut read_half: russh::ChannelReadHalf,
     event_tx: mpsc::Sender<PtyEvent>,
     cancel: CancellationToken,
+    dc_state: Arc<DisconnectState>,
 ) {
+    fn try_log_disconnect(dc_state: &DisconnectState, reason: &str) {
+        if !dc_state.logged.swap(true, Ordering::Relaxed) {
+            applog::emit(
+                log::Level::Warn,
+                "ssh",
+                ev::SSH_DISCONNECT,
+                Some(&dc_state.sid),
+                "连接已断开",
+                Some(serde_json::json!({
+                    "reason": reason,
+                    "uptime_s": dc_state.connected_at.elapsed().as_secs(),
+                })),
+            );
+        }
+    }
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -843,12 +1240,14 @@ async fn read_task(
                         }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        try_log_disconnect(&dc_state, "exit_status");
                         let _ = event_tx
                             .send(PtyEvent::Eof(Some(format!("进程退出，状态码 {exit_status}"))))
                             .await;
                         break;
                     }
                     Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
+                        try_log_disconnect(&dc_state, "exit_signal");
                         let _ = event_tx
                             .send(PtyEvent::Eof(Some(format!(
                                 "进程被信号 {signal_name:?} 终止: {error_message}"
@@ -858,6 +1257,7 @@ async fn read_task(
                     }
                     // 远端主动关闭 / 半通道结束
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        try_log_disconnect(&dc_state, "eof");
                         let _ = event_tx.send(PtyEvent::Eof(None)).await;
                         break;
                     }

@@ -15,6 +15,62 @@ use crate::store::{self, StoredHost};
 use russh::Disconnect;
 use std::time::{Duration, Instant};
 
+/* =========================================================
+ *  慢 IPC 调用统计（§4.4：ipc.slow_call，阈值 2000ms，只告警不阻断）
+ * ========================================================= */
+
+/// 慢调用阈值：超过即产出 `ipc.slow_call` WARN
+const SLOW_CALL_THRESHOLD: Duration = Duration::from_millis(2000);
+
+/// 命令计时守卫：创建即开始计时，命令返回（成功/失败）drop 时检查耗时。
+///
+/// RAII 方式对同步与 async 命令通用：async fn 中守卫随 future 存活，
+/// await 挂起期间计时继续，统计的是调用方感知的墙钟总时长（含排队等待）。
+#[allow(dead_code)] // 经宏构造，部分平台/配置下字段仅在 Drop 中读取
+pub(crate) struct SlowCallGuard {
+    cmd: &'static str,
+    start: Instant,
+}
+
+impl SlowCallGuard {
+    pub(crate) fn new(cmd: &'static str) -> Self {
+        Self {
+            cmd,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowCallGuard {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        if elapsed >= SLOW_CALL_THRESHOLD {
+            crate::applog::emit(
+                log::Level::Warn,
+                "ipc",
+                crate::applog::events::IPC_SLOW_CALL,
+                None,
+                "IPC 调用耗时过长",
+                Some(serde_json::json!({
+                    "cmd": self.cmd,
+                    "elapsed_ms": elapsed.as_millis() as u64,
+                })),
+            );
+        }
+    }
+}
+
+/// 命令体首行插入：`slow_span!("cmd_name");`
+/// 守卫绑定到当前作用域，函数返回时自动结算。
+/// `#[macro_export]`：供 fonts / localfs 等其他命令模块复用。
+#[macro_export]
+macro_rules! slow_span {
+    ($cmd:literal) => {
+        let _slow_call_guard = $crate::ipc::SlowCallGuard::new($cmd);
+    };
+}
+
+
 /// 前端新建会话时提交的连接参数
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +142,7 @@ pub async fn connect_ssh(
     channel: Channel<Vec<u8>>,
     manager: State<'_, SessionManager>,
 ) -> Result<ConnectResult, String> {
+    slow_span!("connect_ssh");
     // 先记录目标地址并取出认证方式（下面 payload 字段被 move 进 cfg）
     let target = format!("{}:{}", payload.host, payload.port);
     let auth = payload.into_auth();
@@ -128,6 +185,7 @@ pub async fn write_terminal(
     data: Vec<u8>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("write_terminal");
     manager.write(session_id, data).await.map_err(|e| {
         log::error!("write_terminal 失败 (session={session_id}): {e}");
         e.to_string()
@@ -142,6 +200,7 @@ pub async fn resize_terminal(
     rows: u32,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("resize_terminal");
     manager
         .resize(session_id, cols, rows)
         .await
@@ -154,6 +213,7 @@ pub async fn disconnect_session(
     session_id: &str,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("disconnect_session");
     manager.disconnect(session_id).await;
     Ok(())
 }
@@ -166,6 +226,7 @@ pub async fn sftp_list_dir(
     path: Option<String>,
     manager: State<'_, SessionManager>,
 ) -> Result<crate::ssh::sftp::RemoteDirListing, String> {
+    slow_span!("sftp_list_dir");
     manager
         .sftp_list_dir(session_id, path)
         .await
@@ -182,6 +243,7 @@ pub async fn sftp_mkdir(
     path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_mkdir");
     manager
         .sftp_mkdir(session_id, path)
         .await
@@ -203,6 +265,8 @@ pub async fn sftp_upload(
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    // 传输命令豁免慢调用统计：大文件传输天然长耗时，进度由 Channel 流式推送，
+    // invoke 总时长不反映卡顿（且用户主动暂停期间 invoke 挂起会误报）。
     manager
         .sftp_upload(session_id, task_id, local_path, remote_path, chunk_kb, resume, channel)
         .await
@@ -224,6 +288,7 @@ pub async fn sftp_download(
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    // 同 sftp_upload：豁免慢调用统计
     manager
         .sftp_download(session_id, task_id, remote_path, local_path, chunk_kb, resume, channel)
         .await
@@ -241,6 +306,7 @@ pub async fn sftp_sync_cwd(
     path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_sync_cwd");
     manager
         .sftp_sync_cwd(session_id, path)
         .await
@@ -255,6 +321,7 @@ pub async fn sftp_transfer_pause(
     paused: bool,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_transfer_pause");
     manager
         .sftp_transfer_pause(session_id, task_id, paused)
         .await
@@ -268,6 +335,7 @@ pub async fn sftp_transfer_cancel(
     task_id: u64,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_transfer_cancel");
     manager
         .sftp_transfer_cancel(session_id, task_id)
         .await
@@ -281,6 +349,7 @@ pub async fn sftp_remove(
     path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_remove");
     manager
         .sftp_remove(session_id, path)
         .await
@@ -298,6 +367,7 @@ pub async fn sftp_rename(
     new_path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_rename");
     manager
         .sftp_rename(session_id, old_path, new_path)
         .await
@@ -314,6 +384,7 @@ pub async fn sftp_create_file(
     path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_create_file");
     manager
         .sftp_create_file(session_id, path)
         .await
@@ -331,6 +402,7 @@ pub async fn sftp_copy(
     dst: String,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("sftp_copy");
     manager
         .sftp_copy(session_id, src, dst)
         .await
@@ -347,6 +419,7 @@ pub async fn sftp_readlink(
     path: String,
     manager: State<'_, SessionManager>,
 ) -> Result<String, String> {
+    slow_span!("sftp_readlink");
     manager
         .sftp_readlink(session_id, path)
         .await
@@ -366,6 +439,7 @@ pub async fn start_metrics(
     iface: Option<String>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("start_metrics");
     let interval = interval_ms.unwrap_or(DEFAULT_METRICS_INTERVAL_MS);
     manager
         .start_metrics(session_id, interval, iface)
@@ -379,6 +453,7 @@ pub async fn stop_metrics(
     session_id: &str,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("stop_metrics");
     manager
         .stop_metrics(session_id)
         .await
@@ -391,6 +466,7 @@ pub async fn metrics_heartbeat(
     session_id: &str,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
+    slow_span!("metrics_heartbeat");
     manager
         .metrics_heartbeat(session_id)
         .await
@@ -411,6 +487,7 @@ pub struct TestResult {
 /// 私钥加密时错误以 KEY_ENCRYPTED 前缀返回，前端据此弹口令框重试。
 #[tauri::command]
 pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, String> {
+    slow_span!("test_ssh_connection");
     let auth = payload.into_auth();
     let cfg = SessionConfig {
         host: payload.host,
@@ -427,11 +504,12 @@ pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, 
     };
 
     let start = Instant::now();
-    // 测试连接不需要协商算法出口，给个一次性空槽即可（kex_done 仍会写入）
+    // 测试连接不需要协商算法出口，给个一次性空槽即可（kex_done 仍会写入）；
+    // sid 用固定值便于排障时过滤测试连接日志
     let algo = std::sync::Arc::new(std::sync::Mutex::new(None));
     let handle = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_and_auth(&cfg, algo),
+        connect_and_auth(&cfg, algo, "test"),
     )
     .await
     .map_err(|_| "连接超时（10 秒内未响应）".to_string())?
@@ -452,6 +530,7 @@ pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, 
 /// 加载全部主机配置（不含密码，密码需单独调用 `get_connection_password`）。
 #[tauri::command]
 pub async fn load_connections(app: AppHandle) -> Result<Vec<StoredHost>, String> {
+    slow_span!("load_connections");
     store::load_hosts(&app)
 }
 
@@ -459,12 +538,14 @@ pub async fn load_connections(app: AppHandle) -> Result<Vec<StoredHost>, String>
 /// 需前端在保存后另行调用 `save_connection_password`。
 #[tauri::command]
 pub async fn save_connection(app: AppHandle, host: StoredHost) -> Result<(), String> {
+    slow_span!("save_connection");
     store::upsert_host(&app, host)
 }
 
 /// 删除主机配置，同时清理钥匙串中对应的密码条目。
 #[tauri::command]
 pub async fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+    slow_span!("delete_connection");
     store::delete_host(&app, &id)?;
     store::delete_password(&app, &id)
 }
@@ -476,17 +557,116 @@ pub async fn save_connection_password(
     id: String,
     password: String,
 ) -> Result<(), String> {
+    slow_span!("save_connection_password");
     store::save_password(&app, &id, &password)
 }
 
 /// 从系统钥匙串读取指定主机的密码（失败时从加密文件读取）；未设置时返回 None。
 #[tauri::command]
 pub async fn get_connection_password(app: AppHandle, id: String) -> Result<Option<String>, String> {
+    slow_span!("get_connection_password");
     store::get_password(&app, &id)
 }
 
 /// 状态栏：终端工具自身内存占用（Rhost 主进程 RSS / 系统总内存，字节）
 #[tauri::command]
 pub fn get_app_memory() -> crate::sysmon::AppMemory {
+    slow_span!("get_app_memory");
     crate::sysmon::app_memory()
+}
+
+/* =========================================================
+ *  应用日志（App Log）：订阅 / 上报 / 缓冲管理 / 目录 / 配置
+ * ========================================================= */
+
+use crate::applog::{self, HubConfig, LogBatch, LogConfigPayload, ReportAppLogInput};
+
+/// 订阅应用日志：先推 replay（seq > sinceId；越界推全量并附 lost_because 元信息），
+/// 再持续推增量。多订阅者广播，前端释放 Channel 后后端 send 失败自动摘除订阅。
+#[tauri::command]
+pub fn subscribe_app_logs(
+    channel: Channel<LogBatch>,
+    since_id: Option<u64>,
+) -> Result<(), String> {
+    slow_span!("subscribe_app_logs");
+    let Some(hub) = applog::try_hub() else {
+        return Err("日志系统未初始化".to_string());
+    };
+    hub.subscribe(channel, since_id);
+    Ok(())
+}
+
+/// 前端日志上报入口：白名单校验（仅 level/eventId/msg/kv，web.* 域）
+#[tauri::command]
+pub fn report_app_log(input: ReportAppLogInput) -> Result<(), String> {
+    slow_span!("report_app_log");
+    if let Some(hub) = applog::try_hub() {
+        hub.report(input);
+    }
+    Ok(())
+}
+
+/// 清空内存缓冲（面板「清空日志」按钮；只清内存，不删磁盘文件）
+#[tauri::command]
+pub fn clear_app_log_buffer() -> Result<(), String> {
+    slow_span!("clear_app_log_buffer");
+    if let Some(hub) = applog::try_hub() {
+        hub.clear_buffer();
+    }
+    Ok(())
+}
+
+/// 系统文件管理器打开日志目录（当前运行实例实际写入目录）
+#[tauri::command]
+pub fn reveal_log_dir() -> Result<(), String> {
+    slow_span!("reveal_log_dir");
+    let Some(hub) = applog::try_hub() else {
+        return Err("日志系统未初始化".to_string());
+    };
+    tauri_plugin_opener::open_path(hub.log_dir(), None::<&str>).map_err(|e| e.to_string())
+}
+
+/// 系统文件管理器打开设置面板中配置的日志存储路径，返回实际打开的绝对路径。
+///
+/// 与 `reveal_log_dir` 的区别：设置面板允许查看「已填写但尚未重启生效」的目标目录。
+/// 处理：空串回退当前生效目录；展开 `~`；目录不存在则创建（重启后 Hub 同样会建，
+/// 此处提前建好便于用户确认落点）；路径指向普通文件等无法创建的情况返回错误。
+#[tauri::command]
+pub fn reveal_log_storage_dir(path: String) -> Result<String, String> {
+    slow_span!("reveal_log_storage_dir");
+    let Some(hub) = applog::try_hub() else {
+        return Err("日志系统未初始化".to_string());
+    };
+    let dir = hub.resolve_storage_dir(&path);
+    if !dir.is_absolute() {
+        return Err(format!("请填写绝对路径或以 ~ 开头：{}", dir.display()));
+    }
+
+    let metadata = std::fs::metadata(&dir);
+    match metadata {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => {
+            return Err(format!("路径已存在但不是目录：{}", dir.display()));
+        }
+        Err(_) => {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("创建目录失败 {}：{e}", dir.display()))?;
+        }
+    }
+
+    tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(dir.display().to_string())
+}
+
+/// 热更新日志配置（前端 saveSettings 后调用）。
+/// storage_path 仅重启生效（此处忽略，不做热切换）；日志相关键逐字段发 app.settings.change。
+#[tauri::command]
+pub fn set_log_config(config: LogConfigPayload) -> Result<(), String> {
+    slow_span!("set_log_config");
+    let Some(hub) = applog::try_hub() else {
+        return Ok(()); // 日志系统未初始化时静默丢弃
+    };
+    let new_cfg = HubConfig::from_payload(&config);
+    hub.set_config_with_audit(new_cfg);
+    Ok(())
 }

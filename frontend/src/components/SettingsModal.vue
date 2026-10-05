@@ -7,6 +7,7 @@ import {
   DEFAULT_SETTINGS, resolveTerminalFontFamily, savedSettings, saveSettings, showSettings,
   type AppSettings,
 } from '../stores/settings'
+import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 
 /* =========================================================
    面板定义（数据驱动）
@@ -31,6 +32,8 @@ interface RowDef {
   num?: boolean
   /** 依赖的开关设置项：任一开关为 false 时本控件置灰禁用（支持单个或数组） */
   disabledKey?: keyof AppSettings | (keyof AppSettings)[]
+  /** 静态禁用：恒定置灰不可编辑（优先于 disabledKey） */
+  disabled?: boolean
   /** 行内附带开关的设置项：开关渲染在标题行内（如 MOTD 自定义 LOGO 开关+文本域同 row） */
   switchKey?: keyof AppSettings
   unit?: string
@@ -38,7 +41,7 @@ interface RowDef {
   placeholder?: string
   /** textarea 行数（默认 4） */
   rows?: number
-  actions?: { id: 'export' | 'import' | 'reset' | 'changelog' | 'checkUpdate'; label: string; danger?: boolean }[]
+  actions?: { id: 'export' | 'import' | 'reset' | 'changelog' | 'checkUpdate' | 'openLogDir'; label: string; danger?: boolean }[]
 }
 interface GroupDef {
   label: string
@@ -58,6 +61,7 @@ interface PanelDef {
 const ICONS: Record<string, string> = {
   appearance: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 000 18z" fill="currentColor" stroke="none"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M13 14h4"/></svg>',
+  logs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>',
   keymap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>',
   advanced: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
   monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>',
@@ -223,6 +227,36 @@ const PANELS: PanelDef[] = [
         label: '浏览',
         rows: [
           { key: 'sftpShowHidden', title: '显示隐藏文件', desc: '在本地与远端文件树中显示以 . 开头的文件', kind: 'switch', keywords: 'sftp 隐藏文件 点文件 hidden dotfile 显示' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'logs', label: '日志', glyph: 'logs',
+    title: '日志', sub: '配置日志采集、级别、内存上限与落盘策略',
+    groups: [
+      {
+        label: '基本',
+        rows: [
+          { key: 'logCollect', title: '日志采集', desc: '开启后采集会话日志并显示在日志面板；关闭后不再采集和显示日志', kind: 'switch', keywords: '日志 采集 面板 启用 关闭 显示 log' },
+          { key: 'logLevel', title: '日志级别', desc: '低于该级别的日志不会被采集', kind: 'select', width: 140, keywords: '日志 级别 记录 采集 debug info warn error 过滤',
+            options: [{ v: 'debug', t: 'Debug' }, { v: 'info', t: 'Info' }, { v: 'warn', t: 'Warn' }, { v: 'error', t: 'Error' }] },
+          { key: 'logMaxLines', title: '最大保留行数', desc: '内存中保留的日志行数上限，超出后丢弃最旧的行', kind: 'number', width: 130, min: 100, step: 500, unit: ' 行', keywords: '日志 行数 内存 上限 保留 缓冲 丢弃' },
+        ],
+      },
+      {
+        label: '持久化',
+        rows: [
+          { key: 'logPersist', title: '开启持久化', desc: '关闭后日志仅存在于内存，退出即丢失', kind: 'switch', keywords: '日志 磁盘 写入 落盘 持久化 开启 文件' },
+          { key: 'logStoragePath', title: '存储路径', desc: '应用日志文件的存放目录，留空使用默认目录；修改后需重启应用生效', kind: 'text', width: 260, placeholder: '留空使用默认目录', disabledKey: 'logPersist', keywords: '日志 存储 路径 目录 位置 文件' },
+          { key: 'logNaming', title: '文件命名模板', desc: '日志文件名固定使用该模板，${date} 按切割策略格式化为日期（如 rhost_app_20260102.log），暂不支持自定义', kind: 'text', width: 260, placeholder: 'rhost_app_${date}.log', disabled: true, keywords: '日志 命名 文件名 模板 策略 日期' },
+          { key: 'logRotate', title: '切割策略', desc: '按时间切割日志文件，各自独立成文件；不切割则所有日志写入单个文件', kind: 'select', width: 160, disabledKey: 'logPersist', keywords: '日志 切割 轮转 滚动 按天 按周 按月 rotate',
+            options: [{ v: 'daily', t: '按天' }, { v: 'weekly', t: '按周' }, { v: 'monthly', t: '按月' }, { v: 'none', t: '不切割' }] },
+          { key: 'logMaxFiles', title: '最大文件数量', desc: '保留的日志文件数上限，超出后删除最旧的文件；0 表示不限制', kind: 'number', width: 130, min: 0, step: 10, unit: ' 个', disabledKey: 'logPersist', keywords: '日志 文件 数量 上限 保留 删除 最旧' },
+          { key: 'logRetentionDays', title: '保留天数', desc: '超过后按时间清理旧文件', kind: 'select', width: 140, num: true, disabledKey: 'logPersist', keywords: '日志 保留 天数 清理 过期 删除',
+            options: [{ v: '7', t: '7 天' }, { v: '30', t: '30 天' }, { v: '90', t: '90 天' }, { v: '365', t: '1 年' }] },
+          { title: '打开目录', desc: '在系统文件管理器中打开日志存储路径', kind: 'buttons', disabledKey: 'logPersist', keywords: '日志 打开 目录 访达 finder 浏览 查看',
+            actions: [{ id: 'openLogDir', label: '打开...' }] },
         ],
       },
     ],
@@ -404,9 +438,10 @@ function numVal(key: keyof AppSettings): number {
 function boolVal(key: keyof AppSettings): boolean {
   return draft[key] as boolean
 }
-/** 行控件是否置灰：disabledKey（单个或数组）中任一开关为 false；
+/** 行控件是否置灰：静态 disabled 优先；否则 disabledKey（单个或数组）中任一开关为 false；
  *  excludeKey 用于行内开关排除自身依赖（switchKey 本身不参与自身置灰判断） */
 function rowDisabled(r: RowDef, excludeKey?: keyof AppSettings): boolean {
+  if (r.disabled) return true
   if (!r.disabledKey) return false
   const keys = (Array.isArray(r.disabledKey) ? r.disabledKey : [r.disabledKey])
     .filter(k => k !== excludeKey)
@@ -554,8 +589,15 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 
 /* ---- 保存 / 放弃 / 恢复默认 ---- */
 function save() {
+  // 日志存储路径仅重启生效：变更时醒目提醒
+  const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
   saveSettings(draft)
-  toast('设置已保存', 'ok', 1800)
+  syncLogConfig()
+  if (storagePathChanged) {
+    toast('日志存储路径已变更，重启应用后生效', 'warn', 3200)
+  } else {
+    toast('设置已保存', 'ok', 1800)
+  }
 }
 function discard() {
   Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
@@ -586,6 +628,22 @@ function onAction(id: string) {
   else if (id === 'reset') resetAll()
   else if (id === 'checkUpdate') toast('当前已是最新版本', 'ok', 1800)
   else if (id === 'changelog') toast('更新日志开发中', 'info')
+  else if (id === 'openLogDir') void openLogDir()
+}
+
+/**
+ * 在系统文件管理器中打开日志存储路径：
+ * - 路径留空 → 打开当前生效的默认目录；
+ * - 自定义路径未重启生效 / 目录尚不存在 → 后端自动创建后打开（便于确认落点）；
+ * - ~ 前缀展开、错误提示由后端统一处理。
+ */
+async function openLogDir() {
+  try {
+    const opened = await revealLogStorageDir(draft.logStoragePath.trim())
+    toast(`已打开：${opened}`, 'ok', 2600)
+  } catch (e) {
+    toast(`打开目录失败：${e}`, 'err', 2600)
+  }
 }
 
 /* ---- 字体预览 ---- */
@@ -811,6 +869,7 @@ function optionList(r: RowDef): Opt[] {
                       :style="{ width: (r.width ?? 200) + 'px' }"
                       :value="strVal(r.key)"
                       :placeholder="r.placeholder"
+                      :disabled="rowDisabled(r)"
                       spellcheck="false"
                       autocomplete="off"
                       @input="setVal(r.key!, ($event.target as HTMLInputElement).value)"

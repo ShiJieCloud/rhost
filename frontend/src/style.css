@@ -9,6 +9,8 @@
     --muted:#5f6d82;
     --muted-2:#42505f;
     --green:#3ddc84;
+    /* 强调色 RGB triplet（settings.ts applyAccent 动态注入），供 rgba() 派生半透明色 */
+    --accent-rgb:61,220,132;
     --cyan:#4fd6e0;
     --blue:#7aa2f7;
     --yellow:#e5b567;
@@ -2077,6 +2079,15 @@ body{
     min-width:0;color:#9fadbf;
     overflow-wrap:break-word;word-break:break-word;
 }
+/* 关闭自动换行：每条日志单行展示，长内容由容器横向滚动；
+   行宽随内容撑开（min-width:100% 保证短行 hover/背景仍铺满） */
+.log-list.nowrap{overflow-x:auto}
+.log-list.nowrap .log-row{width:max-content;min-width:100%}
+.log-list.nowrap .log-msg{
+    flex-shrink:0;
+    white-space:pre;
+    overflow-wrap:normal;word-break:normal;
+}
 .log-row.INFO .log-level{color:var(--blue)}
 .log-row.WARN .log-level{color:var(--yellow)}
 .log-row.WARN .log-msg{color:#cdbd97}
@@ -2119,20 +2130,23 @@ body{
 .ls-btn:hover{background:var(--hover);color:var(--text)}
 .ls-btn.on{color:var(--green);background:rgba(61,220,132,.1);border-color:rgba(61,220,132,.22)}
 .ls-btn svg{width:12px;height:12px}
-/* 搜索高亮：负 margin 抵消 padding，保证净占位与原文一致，高亮出现/消失不引起宽度跳动 */
+/* 搜索高亮：负 margin 抵消 padding，保证净占位与原文一致，高亮出现/消失不引起宽度跳动。
+   颜色跟随项目主题强调色（设置 → 外观 → 强调色，默认绿）。 */
 .log-hit{
-    background:rgba(229,181,103,.26);
-    color:var(--yellow);
+    background:rgba(var(--accent-rgb),.26);
+    color:var(--accent,var(--green));
     border-radius:2px;padding:0 1px;margin:0 -1px;
 }
 .log-hit.current{
-    background:var(--yellow);color:#1a1407;
+    background:var(--accent,var(--green));color:var(--bg);
 }
 .log-row.match-current{
-    background:rgba(229,181,103,.09);
-    box-shadow:inset 2px 0 0 var(--yellow);
+    background:rgba(var(--accent-rgb),.09);
+    box-shadow:inset 2px 0 0 var(--accent,var(--green));
 }
-.log-row.match-current:hover{background:rgba(229,181,103,.14)}
+.log-row.match-current:hover{
+    background:rgba(var(--accent-rgb),.14);
+}
 
 /* ---- 右侧检查器 ---- */
 .inspector{

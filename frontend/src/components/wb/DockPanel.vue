@@ -7,6 +7,14 @@ import { toast } from '../../composables/useToast'
 import { isTauri } from '../../lib/tauri'
 import ContextMenu from './ContextMenu.vue'
 import type { MenuItem } from './ContextMenu.vue'
+import {
+  logs, subscribe as subscribeAppLogs, clear as clearAppLogs, revealLogDir,
+  report as reportLog,
+  SFTP_TRANSFER_ENQUEUE, SFTP_TRANSFER_START, SFTP_TRANSFER_COMPLETE,
+  SFTP_TRANSFER_FAILED, SFTP_TRANSFER_CANCEL, SFTP_TRANSFER_PAUSE,
+  SFTP_TRANSFER_RESUME, SFTP_MANAGE_REMOVE,
+} from '../../stores/applog'
+import type { LogLevel } from '../../stores/applog'
 
 type Side = 'local' | 'remote'
 
@@ -299,6 +307,8 @@ interface Transfer {
   id: number; name: string; dir: 'up' | 'down'
   size: number; pct: number; status: TransferStatus
   speed: number // 展示速率 B/s（真实传输由后端进度事件提供）
+  /** 首次开始传输的墙钟时间戳（ms），用于完成事件 elapsed_ms；暂停时间计入 */
+  startAt: number
   error?: string // 失败详情（查看错误弹窗展示）
   localPath?: string   // 本地绝对路径
   remotePath?: string  // 远端绝对路径
@@ -307,7 +317,6 @@ interface Transfer {
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
-let timers: ReturnType<typeof setInterval>[] = []
 
 /** 后端 SFTP 进度事件载荷 */
 interface TransferProgress {
@@ -317,7 +326,6 @@ interface TransferProgress {
   speed: number
   done: boolean
 }
-onUnmounted(() => {})
 
 const runningCount = computed(() => transfers.value.filter(t => t.status === 'running').length)
 const pendingCount = computed(() => transfers.value.filter(t => t.status === 'pending').length)
@@ -424,13 +432,15 @@ function startTask(
   extra: { localPath: string; remotePath: string; cutSrc?: string },
 ) {
   transfers.value.push({
-    id: ++seq, name, dir, size, pct: 0, status: 'pending', speed: 0,
+    id: ++seq, name, dir, size, pct: 0, status: 'pending', speed: 0, startAt: 0,
     localPath: extra.localPath,
     remotePath: extra.remotePath,
     cutSrc: extra.cutSrc,
   })
   queueCollapsed.value = false
-  pushLog('INFO', `SFTP ${dir === 'up' ? '上传' : '下载'}加入队列：${name}`)
+  reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dir === 'up' ? '上传' : '下载'}加入队列`, {
+    name, size, dir, from: extra.localPath, to: extra.remotePath,
+  })
   pumpQueue()
 }
 
@@ -441,11 +451,16 @@ async function pumpQueue() {
   const t = transfers.value.find(x => x.status === 'pending')
   if (!t) return
   t.status = 'running'
+  if (t.startAt === 0) t.startAt = Date.now() // 仅首次开始计时；暂停后续传不重置
   // pct > 0 为暂停/重试后的恢复，不再重复"开始"提示
   if (t.pct > 0) {
-    pushLog('INFO', `SFTP ${t.dir === 'up' ? '上传' : '下载'}继续：${t.name}（${Math.floor(t.pct)}%）`)
+    reportLog('debug', SFTP_TRANSFER_RESUME, `${t.dir === 'up' ? '上传' : '下载'}继续`, {
+      name: t.name, pct: Math.floor(t.pct),
+    })
   } else {
-    pushLog('INFO', `SFTP ${t.dir === 'up' ? '上传' : '下载'}开始：${t.name}`)
+    reportLog('info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}开始`, {
+      name: t.name, size: t.size, resume_from: 0,
+    })
     toast(`开始${t.dir === 'up' ? '上传' : '下载'}：${taskName(t)}`, 'info', 1700)
   }
 
@@ -453,24 +468,32 @@ async function pumpQueue() {
     t.status = 'error'
     t.speed = 0
     t.error = msg
-    pushLog('ERROR', `SFTP ${t.dir === 'up' ? '上传' : '下载'}失败：${t.name} · ${msg}`)
+    reportLog('error', SFTP_TRANSFER_FAILED, `${t.dir === 'up' ? '上传' : '下载'}失败`, {
+      name: t.name, err: msg, transferred: Math.round(t.size * t.pct / 100), total: t.size,
+    })
     toast(`${t.dir === 'up' ? '上传' : '下载'}失败：${taskName(t)}`, 'warn', 2200)
     void pumpQueue()
   }
   const finishTask = () => {
     t.pct = 100
     t.status = 'success'
+    // 清零前捕获最后一帧速率（后端按滑动窗口计算的瞬时速率）
+    const finalSpeedBps = t.speed
     t.speed = 0
-    pushLog('INFO', `SFTP ${t.dir === 'up' ? '上传' : '下载'}完成：${t.name} · 校验通过`)
+    reportLog('info', SFTP_TRANSFER_COMPLETE, `${t.dir === 'up' ? '上传' : '下载'}完成`, {
+      name: t.name, size: t.size,
+      elapsed_ms: t.startAt ? Date.now() - t.startAt : 0,
+      speed_bps: finalSpeedBps, verify: 'pass',
+    })
     toast(`${t.dir === 'up' ? '上传' : '下载'}完成：${taskName(t)}`, 'ok', 2000)
     // 跨侧剪切粘贴：传输成功后删除源文件（失败仅记日志，目标已完整）
     if (t.cutSrc) {
       if (t.dir === 'up') {
         void invoke('local_remove', { path: t.cutSrc })
-          .catch(e => pushLog('WARN', `剪切源删除失败：${t.cutSrc} · ${e}`))
+          .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: t.cutSrc, err: String(e) }))
       } else {
         void invoke('sftp_remove', { sessionId: backendId, path: t.cutSrc })
-          .catch(e => pushLog('WARN', `剪切源删除失败：${t.cutSrc} · ${e}`))
+          .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: t.cutSrc, err: String(e) }))
       }
     }
     // 传输完成自动刷新对侧目录，免去手动点刷新：上传→远端，下载→本地
@@ -504,7 +527,9 @@ async function pumpQueue() {
       t.speed = 0
       t.error = '已取消'
       transfers.value = transfers.value.filter(x => x.id !== t.id)
-      pushLog('WARN', `SFTP ${t.dir === 'up' ? '上传' : '下载'}已取消：${t.name}`)
+      reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
+        name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
+      })
       void pumpQueue()
     } else {
       failTask(msg)
@@ -521,7 +546,9 @@ function removeTask(t: Transfer) {
     }
   }
   transfers.value = transfers.value.filter(x => x.id !== t.id)
-  pushLog('WARN', `SFTP ${t.dir === 'up' ? '上传' : '下载'}${t.status === 'success' ? '记录移除' : '已取消'}：${t.name}`)
+  reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}${t.status === 'success' ? '记录移除' : '已取消'}`, {
+    name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
+  })
   if (t.status === 'running') void pumpQueue()
 }
 
@@ -534,10 +561,10 @@ function pauseTask(t: Transfer) {
     }
     t.status = 'paused'
     t.speed = 0
-    pushLog('WARN', `SFTP ${t.dir === 'up' ? '上传' : '下载'}已暂停：${t.name}（${Math.floor(t.pct)}%）`)
+    reportLog('warn', SFTP_TRANSFER_PAUSE, '已暂停', { name: t.name, pct: Math.floor(t.pct) })
   } else if (t.status === 'pending') {
     t.status = 'paused'
-    pushLog('WARN', `SFTP 排队任务已挂起：${t.name}`)
+    reportLog('warn', SFTP_TRANSFER_PAUSE, '排队任务已挂起', { name: t.name, pct: 0 })
   }
 }
 /** 继续任务：通知后端恢复并直接回到 running（invoke 仍在） */
@@ -548,6 +575,10 @@ function resumeTask(t: Transfer) {
     void invoke('sftp_transfer_pause', { sessionId: backendId, taskId: t.id, paused: false }).catch(() => {})
   }
   t.status = 'running'
+  // 与暂停（WARN）配对的显式用户动作，INFO 保证默认级别下可见
+  reportLog('info', SFTP_TRANSFER_RESUME, `${t.dir === 'up' ? '上传' : '下载'}继续`, {
+    name: t.name, pct: Math.floor(t.pct),
+  })
 }
 /** 失败任务重试：进度归零、清错误后重新入队 */
 function retryTask(t: Transfer) {
@@ -556,14 +587,15 @@ function retryTask(t: Transfer) {
   t.speed = 0
   t.error = undefined
   t.status = 'pending'
-  pushLog('INFO', `SFTP ${t.dir === 'up' ? '上传' : '下载'}重新加入队列：${t.name}`)
+  reportLog('info', SFTP_TRANSFER_ENQUEUE, `${t.dir === 'up' ? '上传' : '下载'}重新加入队列`, {
+    name: t.name, size: t.size, dir: t.dir, from: t.localPath, to: t.remotePath,
+  })
   void pumpQueue()
 }
-/** 打开目录：上传完成 → 远程目录；下载完成 → 本地目录（mock 仅提示） */
+/** 打开目录：上传完成 → 远程目录；下载完成 → 本地目录 */
 function openTaskDir(t: Transfer) {
   if (t.status !== 'success') return
   const side = t.dir === 'up' ? '远程' : '本地'
-  pushLog('INFO', `打开${side}所在目录：${t.name}`)
   toast(`打开${side}目录：${t.name}`, 'info', 2000)
 }
 /** 头部批量操作：全部暂停 / 全部继续（独立按钮） */
@@ -628,7 +660,9 @@ async function deleteTargets(side: Side, targets: FsEntry[]) {
       await invokeSide(side, 'remove', { path: joinPath(sidePath(side), t.name) })
     }
     sideSel(side).value = new Set()
-    pushLog('WARN', `SFTP 删除 ${targets.length} 项（${side === 'local' ? '本地' : '远程'}）`)
+    reportLog('info', SFTP_MANAGE_REMOVE, `删除 ${targets.length} 项`, {
+      side: side === 'local' ? '本地' : '远程', count: targets.length,
+    })
     toast(`已删除 ${targets.length} 项`, 'ok', 1800)
     void refreshSide(side)
   } catch (e) {
@@ -958,44 +992,9 @@ function switchTab(tab: 'sftp' | 'log') {
   expandDock() // 折叠状态下点击 tab 时一并展开
 }
 
-/* ---- SSH 运行日志（纯界面 Mock；接入后端后替换为 SSH 事件监听） ---- */
-type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG'
-interface LogEntry { id: number; time: string; level: LogLevel; msg: string }
-
-let logSeq = 0
-function nowTime() {
-  return new Date().toLocaleTimeString('zh-CN', { hour12: false })
-}
-function pushLog(level: LogLevel, msg: string) {
-  logs.value.push({ id: ++logSeq, time: nowTime(), level, msg })
-  // 限制最大条数，避免长时间运行后无限增长
-  if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
-}
-
-const LOG_SEED: LogEntry[] = [
-  { id: 1, time: '2023-09-30 09:41:02', level: 'INFO', msg: 'SSH 客户端初始化：russh 0.46 · 加密算法集 default' },
-  { id: 2, time: '2023-09-30 09:41:02', level: 'INFO', msg: '正在连接 192.168.1.10:22（超时 10s）…' },
-  { id: 3, time: '2023-09-30 09:41:02', level: 'INFO', msg: 'TCP 连接已建立，RTT 23ms' },
-  { id: 4, time: '2023-09-30 09:41:02', level: 'INFO', msg: '远程 Banner：SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13' },
-  { id: 5, time: '2023-09-30 09:41:02', level: 'DEBUG', msg: '本地 Banner：SSH-2.0-rhost_0.1.0' },
-  { id: 6, time: '2023-09-30 09:41:03', level: 'INFO', msg: '密钥交换完成：curve25519-sha256 · ssh-ed25519 · chacha20-poly1305' },
-  { id: 7, time: '2023-09-30 09:41:03', level: 'DEBUG', msg: '主机密钥指纹 SHA256:k2X9…Q7nE 与 known_hosts 记录匹配' },
-  { id: 8, time: '2023-09-30 09:41:03', level: 'INFO', msg: '公钥认证成功：~/.ssh/id_ed25519（用户 deploy）' },
-  { id: 9, time: '2023-09-30 09:41:03', level: 'INFO', msg: 'SSH 会话已建立 · 通道 #0（session）' },
-  { id: 10, time: '2023-09-30 09:41:04', level: 'INFO', msg: '请求伪终端：xterm-256color 120×30 · LANG=zh_CN.UTF-8' },
-  { id: 11, time: '2023-09-30 09:41:04', level: 'INFO', msg: 'SFTP 子系统已启动 · 通道 #1（subsystem: sftp）' },
-  { id: 12, time: '2023-09-30 09:41:05', level: 'DEBUG', msg: 'keepalive@openssh.com 心跳间隔 30s' },
-  { id: 13, time: '2023-09-30 09:41:35', level: 'DEBUG', msg: '发送 keepalive 心跳包 seq=1，RTT 21ms' },
-  { id: 14, time: '2023-09-30 09:42:02', level: 'INFO', msg: 'SFTP 上传开始：deploy.sh → /var/www/deploy.sh（2.0 KB）' },
-  { id: 15, time: '2023-09-30 09:42:03', level: 'WARN', msg: '远程文件已存在，执行覆盖并保留权限 0755' },
-  { id: 16, time: '2023-09-30 09:42:03', level: 'INFO', msg: 'SFTP 上传完成：deploy.sh · 780 KB/s · 耗时 0.8s' },
-  { id: 17, time: '2023-09-30 09:43:10', level: 'WARN', msg: 'keepalive 响应延迟 1840ms，疑似网络抖动' },
-  { id: 18, time: '2023-09-30 09:43:41', level: 'ERROR', msg: '端口转发建立失败：L :3306 → 127.0.0.1:3306 · Connection refused' },
-  { id: 19, time: '2023-09-30 09:43:41', level: 'INFO', msg: '转发规则已回滚，10s 后自动重试' },
-  { id: 20, time: '2023-09-30 09:43:51', level: 'INFO', msg: '端口转发已建立：L :3306 → 127.0.0.1:3306 · 通道 #2' },
-]
-logSeq = LOG_SEED.length
-const logs = ref<LogEntry[]>([...LOG_SEED])
+/* ---- 应用日志（数据源：stores/applog，后端 Hub 订阅推送；面板显示 = 磁盘文件内容） ----
+   日志行模型 PanelLogEntry 由 store 提供（id=seq 全局唯一、time 已格式化、msg 含 kv 文本）。
+   SFTP 队列事件经 report() 上报后端统一打 seq/ts，再由订阅回推显示，不经本地直插。 */
 
 const LEVEL_FILTERS: Array<{ key: LogLevel | 'ALL'; label: string }> = [
   { key: 'ALL', label: '全部' },
@@ -1018,6 +1017,9 @@ const levelCounts = computed(() => {
 })
 
 const autoScroll = ref(true)
+// 日志自动换行（纯视图偏好，默认开启，本地持久化）；关闭时长行单行横向滚动
+const logWrap = ref(localStorage.getItem('rhost.logWrap') !== '0')
+watch(logWrap, v => localStorage.setItem('rhost.logWrap', v ? '1' : '0'))
 const logListEl = ref<HTMLElement | null>(null)
 
 const STICK_GAP = 24 // 距底部小于该值视为"贴底"
@@ -1057,7 +1059,8 @@ watch(activeTab, async (tab) => {
   }
 })
 function clearLogs() {
-  logs.value = []
+  // 清空后端内存缓冲 + 前端显示（磁盘文件不受影响）
+  void clearAppLogs()
 }
 
 /* ---- 日志搜索（关键字高亮 + 上/下匹配跳转，可与级别筛选叠加） ---- */
@@ -1144,21 +1147,6 @@ function highlightParts(msg: string): Array<{ text: string; hit: boolean }> {
   if (i < msg.length) parts.push({ text: msg.slice(i), hit: false })
   return parts
 }
-
-/* Mock：模拟 SSH 通道运行期事件（接入后端后删除） */
-let mockEventIdx = 0
-let heartbeatSeq = 1
-const MOCK_EVENTS: Array<() => [LogLevel, string]> = [
-  () => ['DEBUG', `发送 keepalive 心跳包 seq=${++heartbeatSeq}，RTT ${18 + Math.floor(Math.random() * 26)}ms`],
-  () => ['DEBUG', `通道流量窗口调整：+2097152 字节（通道 #0）`],
-  () => ['INFO', `SFTP 读取目录 /var/www/logs（14 项，耗时 ${12 + Math.floor(Math.random() * 36)}ms）`],
-  () => ['DEBUG', `加密通道吞吐 ↑ ${(4 + Math.random() * 18).toFixed(1)} KB/s ↓ ${(10 + Math.random() * 52).toFixed(1)} KB/s`],
-  () => ['INFO', `端口转发 :3306 当前活动连接 ${1 + Math.floor(Math.random() * 3)} 条`],
-]
-timers.push(setInterval(() => {
-  const [level, msg] = MOCK_EVENTS[mockEventIdx++ % MOCK_EVENTS.length]()
-  pushLog(level, msg)
-}, 4000))
 
 /* resizer 拖拽 */
 const dockEl = ref<HTMLElement | null>(null)
@@ -1349,6 +1337,8 @@ function onSftpShortcut(e: KeyboardEvent) {
 }
 
 onMounted(() => {
+  // 订阅后端应用日志流（replay + 增量；幂等，多订阅者广播）
+  subscribeAppLogs()
   // 首次打开加载本地目录（不传路径 → 后端解析为用户主目录）
   void loadLocal()
   // 组件重挂时活动会话可能早已在线（watch 不会补发），主动加载一次远端默认目录
@@ -1861,7 +1851,24 @@ onUnmounted(() => {
               <polyline points="7 6 12 11 17 6"></polyline>
             </svg>
           </button>
-          <button class="mini-ico" title="清空日志" @click="clearLogs">
+          <button class="mini-ico" :class="{ active: logWrap }"
+                  :title="logWrap ? '自动换行（点击关闭，长行横向滚动）' : '自动换行已关闭（点击开启）'"
+                  @click="logWrap = !logWrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <line x1="3" y1="7" x2="21" y2="7"></line>
+              <path d="M3 12h12.5a2.5 2.5 0 0 1 0 5H11"></path>
+              <polyline points="8.5 14 6 17 8.5 20"></polyline>
+              <line x1="3" y1="21" x2="14" y2="21"></line>
+            </svg>
+          </button>
+          <button class="mini-ico" title="打开日志目录" @click="revealLogDir">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+          </button>
+          <button class="mini-ico" title="清空日志（仅清内存缓冲，磁盘文件保留）" @click="clearLogs">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                  stroke-linecap="round" stroke-linejoin="round">
               <polyline points="3 6 5 6 21 6"></polyline>
@@ -1917,8 +1924,10 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <div ref="logListEl" class="log-list" @scroll="onLogScroll">
-          <div v-if="!filteredLogs.length" class="log-empty">暂无日志</div>
+        <div ref="logListEl" class="log-list" :class="{ nowrap: !logWrap }" @scroll="onLogScroll">
+          <div v-if="!savedSettings.logCollect" class="log-empty">日志采集已关闭（设置 → 日志 → 日志采集）</div>
+          <div v-else-if="!filteredLogs.length" class="log-empty">暂无日志</div>
+          <template v-else>
           <div
             v-for="l in filteredLogs"
             :key="l.id"
@@ -1937,6 +1946,7 @@ onUnmounted(() => {
               </template>
             </span>
           </div>
+          </template>
         </div>
       </div>
     </div>

@@ -32,7 +32,7 @@ fn test_cfg() -> SessionConfig {
 /// 连接 → 写命令 → 收到回显数据帧 → 主动断开（验证任务取消无泄漏）
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_pty_echo_roundtrip() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -91,7 +91,7 @@ async fn ssh_pty_echo_roundtrip() {
 /// 断言：注入回显与清行序列、marker 在同一帧（前端单帧绘制最终画面，无中间态闪烁）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_color_prompt_inject_selferase() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -156,7 +156,7 @@ async fn ssh_color_prompt_inject_selferase() {
 /// 验证 russh global-request ping 在真实 sshd 上工作。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_rtt_frame_received() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -199,7 +199,7 @@ async fn ssh_rtt_frame_received() {
 async fn ssh_motd_panel_injected() {
     let mut cfg = test_cfg();
     cfg.motd = true;
-    let (session, mut frame_rx) = match SshSession::connect(cfg).await {
+    let (session, mut frame_rx) = match SshSession::connect(cfg, "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -290,7 +290,7 @@ async fn ssh_motd_panel_injected() {
 async fn ssh_host_info_frame_order_and_content() {
     let mut cfg = test_cfg();
     cfg.motd = true;
-    let (session, mut frame_rx) = match SshSession::connect(cfg).await {
+    let (session, mut frame_rx) = match SshSession::connect(cfg, "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -348,7 +348,7 @@ async fn ssh_host_info_frame_order_and_content() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_no_host_info_when_motd_disabled() {
     let cfg = test_cfg(); // motd: false
-    let (session, mut frame_rx) = match SshSession::connect(cfg).await {
+    let (session, mut frame_rx) = match SshSession::connect(cfg, "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -381,7 +381,7 @@ async fn ssh_no_host_info_when_motd_disabled() {
 /// 正常返回输出；超时返回 Err 且远端命令被丢弃；之后 PTY 交互不受影响。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_exec_collect_after_connect() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -443,7 +443,7 @@ struct MotdCmd {
 async fn ssh_auth_failure() {
     let mut cfg = test_cfg();
     cfg.auth = AuthMethod::Password("wrong-password".into());
-    match SshSession::connect(cfg).await {
+    match SshSession::connect(cfg, "e2e001").await {
         Err(e) => assert!(e.to_string().contains("认证失败"), "错误类型不符: {e}"),
         Ok(_) => {
             eprintln!("跳过：测试容器不可用");
@@ -547,7 +547,7 @@ async fn recv_metrics(
 /// 动态指标采集：start 后按间隔收到 0x06 帧，stop 后停止，重复 start 可恢复
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_metrics_collector_lifecycle() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -776,7 +776,7 @@ async fn wait_inflight_drain(window: Duration) -> bool {
 /// 不再产生帧、在飞 exec 排空，无残留任务。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_metrics_cancelled_on_shutdown() {
-    let (session, mut frame_rx) = match SshSession::connect(test_cfg()).await {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("跳过：测试容器不可用（{e}）");
@@ -831,7 +831,7 @@ async fn ssh_metrics_100_sessions_gated() {
     for batch_start in (0..N).step_by(BATCH) {
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..BATCH.min(N - batch_start) {
-            set.spawn(SshSession::connect(test_cfg()));
+            set.spawn(SshSession::connect(test_cfg(), "e2e001"));
         }
         while let Some(res) = set.join_next().await {
             match res.unwrap() {

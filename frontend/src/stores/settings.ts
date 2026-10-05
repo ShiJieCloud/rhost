@@ -81,6 +81,25 @@ export interface AppSettings {
   sftpGlobalRateKb: number
   /** 单任务带宽限速 KB/s，0 不限速 */
   sftpTaskRateKb: number
+  /* ---- 日志 ---- */
+  /** 日志采集：关闭后不再采集和显示日志 */
+  logCollect: boolean
+  /** 日志级别：低于该级别的日志不会被采集（debug/info/warn/error） */
+  logLevel: string
+  /** 内存中保留的日志行数上限，超出后丢弃最旧的行 */
+  logMaxLines: number
+  /** 持久化到磁盘：关闭后日志仅存在于内存，退出即丢失 */
+  logPersist: boolean
+  /** 日志存储路径：会话日志文件的存放目录 */
+  logStoragePath: string
+  /** 日志文件名模板：${date} 为按切割策略格式化的日期，如 rhost_app_20260102.log */
+  logNaming: string
+  /** 日志切割策略：daily 按天 / weekly 按周 / monthly 按月 / none 不切割 */
+  logRotate: string
+  /** 保留的日志文件数上限，超出后删除最旧的文件；0 表示不限制 */
+  logMaxFiles: number
+  /** 日志文件保留天数，超过后按时间清理旧文件 */
+  logRetentionDays: number
   /** 可恢复错误的自动重试最大次数 */
   sftpRetryCount: number
   /** 重试前等待毫秒 */
@@ -151,6 +170,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sftpHostConcurrency: 1,
   sftpGlobalRateKb: 0,
   sftpTaskRateKb: 0,
+
+  logCollect: true,
+  logLevel: 'info',
+  logMaxLines: 5000,
+  logPersist: true,
+  logStoragePath: '',
+  logNaming: 'rhost_app_${date}.log',
+  logRotate: 'daily',
+  logMaxFiles: 100,
+  logRetentionDays: 30,
   sftpRetryCount: 3,
   sftpRetryIntervalMs: 1000,
   sftpIdleTimeoutSec: 300,
@@ -182,9 +211,24 @@ export function persistSettings() {
   } catch { /* 隐私模式等场景忽略 */ }
 }
 
-/** 强调色应用到全局（view-card 等处 var(--accent) 生效） */
+/** 强调色应用到全局（view-card 等处 var(--accent) 生效）。
+ *  同时注入 --accent-rgb（"r,g,b"）供 rgba() 派生半透明色（如日志搜索高亮），
+ *  避免依赖 color-mix（老版本 WKWebView 不支持）。 */
 export function applyAccent(color: string) {
-  document.documentElement.style.setProperty('--accent', color)
+  const root = document.documentElement.style
+  root.setProperty('--accent', color)
+  const rgb = hexToRgbTriplet(color)
+  if (rgb) root.setProperty('--accent-rgb', rgb)
+}
+
+/** #rgb / #rrggbb → "r,g,b"；非法输入返回 null */
+function hexToRgbTriplet(hex: string): string | null {
+  const m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(hex.trim())
+  if (!m) return null
+  let h = m[1]
+  if (h.length === 3) h = h.split('').map(c => c + c).join('')
+  const n = parseInt(h, 16)
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`
 }
 applyAccent(savedSettings.accent)
 
