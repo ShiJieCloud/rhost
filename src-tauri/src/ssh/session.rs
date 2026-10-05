@@ -94,7 +94,9 @@ fn env_export_lines(env: &[(String, String)]) -> String {
 /// - 脚本经 exec 通道写临时文件后 source，绝不作为键盘输入发送——长命令经
 ///   PTY 回显既难看又会把 ESC 字节喂给 readline/终端导致命令被毁；
 /// - 提示符仍完全由远端 shell 的 PS1/PROMPT 生成（透传架构不变）；
-/// - 远端 PS1/PROMPT 已含颜色标记时跳过，不覆盖用户配置；
+/// - 远端 PS1/PROMPT 已含颜色标记或用户名（`\\u`/`%n`）时跳过，不覆盖用户配置；
+/// - 否则注入含用户名（`\\u@\\h`/`%n@%m`）的 PS1：`color_prompt=true` 时带颜色，
+///   `color_prompt=false` 时为纯文本，避免远端默认提示符（如 `\\h:\\w\\$`）缺用户名；
 /// - PS1 内嵌 ESC 字节（远端 printf 现场生成），\[ \] 标记非打印区间，
 ///   保证 readline 行宽计算正确；
 /// - printf 清行必须在脚本**第一行**：回显行在 readline 接受命令（\r）的瞬间
@@ -105,19 +107,26 @@ fn init_script(path: &str, color_prompt: bool, env: &[(String, String)]) -> Stri
     let color_block = if color_prompt {
         "\
 _rh_e=$(printf '\\033')
-case \"$PS1$PROMPT\" in *'\\\\e['*|*'\\\\033['*|*\"$_rh_e\"*|*'%F'*|*'fg['*) ;; *)
-  if [ -n \"$ZSH_VERSION\" ]; then PROMPT='%F{{green}}%n@%m%f:%F{{blue}}%~%f%# '
-  else PS1=\"\\[${{_rh_e}}[1;32m\\]\\u@\\h\\[${{_rh_e}}[0m\\]:\\[${{_rh_e}}[1;34m\\]\\w\\[${{_rh_e}}[0m\\]\\\\\\$ \"
+case \"$PS1$PROMPT\" in *'\\\\e['*|*'\\\\033['*|*\"$_rh_e\"*|*'%F'*|*'fg['*|*'\\\\u'*|*'%n'*) ;; *)
+  if [ -n \"$ZSH_VERSION\" ]; then PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%# '
+  else PS1=\"\\[${_rh_e}[1;32m\\]\\u@\\h\\[${_rh_e}[0m\\]:\\[${_rh_e}[1;34m\\]\\w\\[${_rh_e}[0m\\]\\\\\\$ \"
   fi ;;
 esac
 unset _rh_e
 export CLICOLOR=1
 # 用户已定义同名 alias 时绝不覆盖（保留其自定义参数）
-alias ls >/dev/null 2>&1 || {{ ls --color=auto -d . >/dev/null 2>&1 && alias ls='ls --color=auto'; }}
-alias grep >/dev/null 2>&1 || {{ echo . | grep --color=auto . >/dev/null 2>&1 && alias grep='grep --color=auto'; }}
+alias ls >/dev/null 2>&1 || { ls --color=auto -d . >/dev/null 2>&1 && alias ls='ls --color=auto'; }
+alias grep >/dev/null 2>&1 || { echo . | grep --color=auto . >/dev/null 2>&1 && alias grep='grep --color=auto'; }
 "
     } else {
-        ""
+        // 无色模式：仍注入含用户名的纯文本 PS1，避免远端默认提示符缺用户名
+        "\
+case \"$PS1$PROMPT\" in *'\\\\e['*|*'\\\\033['*|*'%F'*|*'fg['*|*'\\\\u'*|*'%n'*) ;; *)
+  if [ -n \"$ZSH_VERSION\" ]; then PROMPT='%n@%m:%~%# '
+  else PS1='\\u@\\h:\\w\\$ '
+  fi ;;
+esac
+"
     };
 
     let env_block = env_export_lines(env);

@@ -24,6 +24,7 @@ fn test_cfg() -> SessionConfig {
         rows: 32,
         motd: false,
         color_prompt: true,
+        env: vec![],
     }
 }
 
