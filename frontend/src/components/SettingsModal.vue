@@ -29,11 +29,15 @@ interface RowDef {
   step?: number
   /** select 值以 Number 转换后写入 draft（默认字符串） */
   num?: boolean
-  /** 依赖的开关设置项：该开关为 false 时本控件置灰禁用 */
-  disabledKey?: keyof AppSettings
+  /** 依赖的开关设置项：任一开关为 false 时本控件置灰禁用（支持单个或数组） */
+  disabledKey?: keyof AppSettings | (keyof AppSettings)[]
+  /** 行内附带开关的设置项：开关渲染在标题行内（如 MOTD 自定义 LOGO 开关+文本域同 row） */
+  switchKey?: keyof AppSettings
   unit?: string
   width?: number
   placeholder?: string
+  /** textarea 行数（默认 4） */
+  rows?: number
   actions?: { id: 'export' | 'import' | 'reset' | 'changelog' | 'checkUpdate'; label: string; danger?: boolean }[]
 }
 interface GroupDef {
@@ -107,7 +111,7 @@ const PANELS: PanelDef[] = [
   },
   {
     id: 'terminal', label: '终端', glyph: 'terminal',
-    title: '终端', sub: '配置 Shell 启动方式、字体、光标、会话行为与环境变量',
+    title: '终端', sub: '配置 Shell 启动、MOTD 横幅、字体、光标、会话行为与环境变量',
     groups: [
       {
         label: '字体',
@@ -131,7 +135,13 @@ const PANELS: PanelDef[] = [
         label: '启动',
         rows: [
           { key: 'colorPrompt', title: '彩色提示符', desc: '登录后为无颜色的远端 shell 配置彩色 PS1 与 ls/grep 颜色；远端已有彩色配置（oh-my-zsh 等）时自动跳过，不覆盖用户设置', kind: 'switch', keywords: '彩色 提示符 颜色 prompt ps1 注入 高亮' },
+        ],
+      },
+      {
+        label: 'MOTD横幅',
+        rows: [
           { key: 'motd', title: '登录欢迎面板', desc: '连接成功后采集服务器负载、内存、磁盘、IP 等状态，在终端绘制 Rhost MOTD 欢迎横幅；开启时自动屏蔽 sshd 原生 MOTD 与 Last login 避免重复', kind: 'switch', keywords: 'motd 欢迎 面板 横幅 banner 登录 系统状态 负载 内存 磁盘 屏蔽 抑制 原生 last login' },
+          { key: 'motdLogo', title: '自定义 LOGO', switchKey: 'motdLogoOn', desc: '开启开关后用下方文本域中的 ASCII art 替换内置 Rhost LOGO；关闭恢复显示内置 LOGO，已粘贴的内容保留。复用终端字体与配色，最多 30 行、每行 200 字符（超出自动截断）', kind: 'textarea', rows: 10, placeholder: '在此粘贴 ASCII art', disabledKey: ['motdLogoOn', 'motd'], keywords: 'motd logo ascii 横幅 自定义 开关 字符画 art 粘贴' },
         ],
       },
       {
@@ -393,6 +403,14 @@ function numVal(key: keyof AppSettings): number {
 }
 function boolVal(key: keyof AppSettings): boolean {
   return draft[key] as boolean
+}
+/** 行控件是否置灰：disabledKey（单个或数组）中任一开关为 false；
+ *  excludeKey 用于行内开关排除自身依赖（switchKey 本身不参与自身置灰判断） */
+function rowDisabled(r: RowDef, excludeKey?: keyof AppSettings): boolean {
+  if (!r.disabledKey) return false
+  const keys = (Array.isArray(r.disabledKey) ? r.disabledKey : [r.disabledKey])
+    .filter(k => k !== excludeKey)
+  return keys.some(k => !boolVal(k))
 }
 function resetOne(key: keyof AppSettings) {
   setVal(key, JSON.parse(JSON.stringify(savedSettings[key])))
@@ -690,7 +708,7 @@ function optionList(r: RowDef): Opt[] {
                   :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' }"
                 >
                   <div class="st-row-main">
-                    <div class="st-row-title">
+                    <div class="st-row-title" :class="{ 'has-tail-switch': !!r.switchKey }">
                       {{ r.title }}
                       <button
                         v-if="r.key"
@@ -698,6 +716,15 @@ function optionList(r: RowDef): Opt[] {
                         title="重置此项"
                         @click="resetOne(r.key)"
                       >↺</button>
+                      <!-- switchKey：标题行尾附带开关，与其他 switch 行“开关靠右”布局统一 -->
+                      <label v-if="r.switchKey" class="st-switch st-tail-switch">
+                        <input
+                          type="checkbox"
+                          :checked="boolVal(r.switchKey)"
+                          :disabled="rowDisabled(r, r.switchKey)"
+                          @change="setVal(r.switchKey, ($event.target as HTMLInputElement).checked)"
+                        >
+                      </label>
                     </div>
                     <div v-if="r.desc" class="st-row-desc">{{ r.desc }}</div>
                   </div>
@@ -708,6 +735,7 @@ function optionList(r: RowDef): Opt[] {
                       <input
                         type="checkbox"
                         :checked="boolVal(r.key!)"
+                        :disabled="rowDisabled(r)"
                         @change="setVal(r.key!, ($event.target as HTMLInputElement).checked)"
                       >
                     </label>
@@ -729,7 +757,7 @@ function optionList(r: RowDef): Opt[] {
                       class="st-select"
                       :style="{ width: (r.width ?? 150) + 'px' }"
                       :value="strVal(r.key)"
-                      :disabled="!!r.disabledKey && !boolVal(r.disabledKey)"
+                      :disabled="rowDisabled(r)"
                       @change="setVal(r.key!, r.num ? Number(($event.target as HTMLSelectElement).value) : ($event.target as HTMLSelectElement).value)"
                     >
                       <option v-for="op in optionList(r)" :key="op.v" :value="op.v">{{ op.t }}</option>
@@ -807,14 +835,15 @@ function optionList(r: RowDef): Opt[] {
                       <span v-if="r.unit" class="st-unit-label">{{ r.unit.trim() }}</span>
                     </div>
 
-                    <!-- 多行文本（glob 列表等，一行一条） -->
+                    <!-- 多行文本（glob 列表、ASCII LOGO 等） -->
                     <textarea
                       v-else-if="r.kind === 'textarea'"
                       class="st-input st-textarea"
                       :style="{ width: '100%' }"
-                      rows="4"
+                      :rows="r.rows ?? 4"
                       :value="strVal(r.key)"
                       :placeholder="r.placeholder"
+                      :disabled="rowDisabled(r)"
                       spellcheck="false"
                       autocomplete="off"
                       @input="setVal(r.key!, ($event.target as HTMLTextAreaElement).value)"

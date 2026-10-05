@@ -25,6 +25,7 @@ fn test_cfg() -> SessionConfig {
         motd: false,
         color_prompt: true,
         env: vec![],
+        motd_logo: String::new(),
     }
 }
 

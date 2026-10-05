@@ -25,6 +25,10 @@ export interface AppSettings {
   colorPrompt: boolean
   /** 连接成功后采集服务器状态绘制 Rhost MOTD；开启同时抑制 sshd 原生 MOTD/Last login */
   motd: boolean
+  /** 启用自定义 MOTD LOGO：开启用 motdLogo 文本替换内置 LOGO，关闭显示内置（内容保留） */
+  motdLogoOn: boolean
+  /** 自定义 MOTD ASCII LOGO（多行文本）；仅 motdLogoOn 开启时生效 */
+  motdLogo: string
   scrollback: number
   trimOnCopy: boolean
   pasteGuard: boolean
@@ -106,6 +110,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   colorPrompt: true,
   motd: true,
+  motdLogoOn: false,
+  motdLogo: '',
   scrollback: 10000,
   trimOnCopy: true,
   pasteGuard: false,

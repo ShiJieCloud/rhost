@@ -555,6 +555,8 @@ async function connectBackend(s: Session, cols: number, rows: number) {
         // 连接成功后由后端采集服务器状态并绘制 Rhost MOTD 欢迎面板；
         // 开启时后端同时走 exec 路径抑制 sshd 原生 MOTD/Last login
         motd: savedSettings.motd,
+        // 自定义 MOTD ASCII LOGO：开关关闭（或文本为空）传空串，后端显示内置 LOGO
+        motdLogo: savedSettings.motdLogoOn ? savedSettings.motdLogo : '',
         // 彩色提示符：后端在 PTY 开启后自动注入并 hold 初始化输出至脚本完成，
         // 前端首帧即着色 PS1 的最终画面，无需任何时序编排
         colorPrompt: savedSettings.colorPrompt,

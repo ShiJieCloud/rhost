@@ -2563,6 +2563,10 @@ body{
     font-family:var(--mono);font-size:11.5px;text-align:left;
     padding:7px 10px;
 }
+.st-input:disabled,.st-select:disabled,.st-textarea:disabled{opacity:.4;cursor:not-allowed}
+.st-switch:has(input:disabled){opacity:.4;cursor:not-allowed}
+.st-row-title.has-tail-switch{display:flex;align-items:center}
+.st-row-title .st-tail-switch{margin-left:auto;flex:none}
 .st-input.invalid{border-color:rgba(247,118,142,.65);box-shadow:0 0 0 3px rgba(247,118,142,.1)}
 .st-ctl-err{
     flex-basis:100%;

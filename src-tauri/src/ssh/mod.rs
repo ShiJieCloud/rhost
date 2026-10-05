@@ -43,6 +43,8 @@ pub struct SessionConfig {
     /// source 在当前 shell 执行，export 直接生效，且不受 sshd AcceptEnv
     /// 默认限制（AcceptEnv 只放行 LANG/LC_*，SSH env 请求方式会被静默拒绝）。
     pub env: Vec<(String, String)>,
+    /// 用户自定义 MOTD ASCII LOGO（多行文本）；空串使用内置 LOGO
+    pub motd_logo: String,
 }
 
 /// SSH 模块统一错误类型（ipc 层转字符串返回前端）

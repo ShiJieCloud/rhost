@@ -45,6 +45,9 @@ pub struct ConnectPayload {
     /// 登录后经 init 脚本 export 注入远端 shell 的环境变量（非法键值由后端过滤）
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// 自定义 MOTD ASCII LOGO（多行文本）；空串使用内置 LOGO
+    #[serde(default)]
+    pub motd_logo: String,
 }
 
 /// serde 默认值：布尔开关缺省为 true
@@ -98,6 +101,7 @@ pub async fn connect_ssh(
         motd,
         color_prompt,
         env: payload.env,
+        motd_logo: payload.motd_logo,
     };
     let (session_id, mut frame_rx) = manager.create(cfg).await.map_err(|e| {
         // 落盘日志（带目标地址），方便在 ~/Library/Logs/com.rhost.app/rhost.log 排查
@@ -419,6 +423,7 @@ pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, 
         motd: false,
         color_prompt: false,
         env: Vec::new(),
+        motd_logo: String::new(),
     };
 
     let start = Instant::now();

@@ -144,10 +144,13 @@ pub(crate) struct CollectOutcome {
 }
 
 /// 入口：并行采集 → 解析 → 模板替换 → 返回渲染指令数组。
+/// `custom_logo` 为用户自定义 ASCII LOGO（多行文本）；非空时替换模板内置
+/// LOGO 段（`logo: true` 标记的行），空串保留内置，任何情况下不影响状态区。
 /// 任何阶段失败（超时/会话取消/采集无输出）均返回 None（静默降级）。
 pub(crate) async fn collect_and_build(
     handle: &mut client::Handle<ClientHandler>,
     cancel: &CancellationToken,
+    custom_logo: &str,
 ) -> Option<CollectOutcome> {
     let gather = async { collect_parallel(handle).await };
 
@@ -179,7 +182,7 @@ pub(crate) async fn collect_and_build(
 
     let values = build_values(&raw);
     Some(CollectOutcome {
-        cmds: build_cmds(&values),
+        cmds: build_cmds(&values, custom_logo),
         login_shell,
         raw,
     })
@@ -452,18 +455,55 @@ fn substitute(text: &str, values: &HashMap<String, String>) -> String {
     out
 }
 
-/// 读取编译期模板，替换占位符，输出渲染指令数组
-fn build_cmds(values: &HashMap<String, String>) -> Vec<TermCmd> {
+/// 自定义 LOGO 防御性上限：最多 30 行、单行 200 字符（防粘贴超大文本拖垮渲染）
+const LOGO_MAX_LINES: usize = 30;
+const LOGO_MAX_COLS: usize = 200;
+
+/// 把用户自定义 ASCII LOGO 文本规整为渲染指令行：去掉首尾空行，
+/// 最多取 [`LOGO_MAX_LINES`] 行、单行最多 [`LOGO_MAX_COLS`] 字符；
+/// cls 统一 "brand" 复用内置 LOGO 配色。空文本返回空数组。
+fn custom_logo_cmds(custom_logo: &str) -> Vec<TermCmd> {
+    custom_logo
+        .trim_matches(['\n', '\r'])
+        .lines()
+        .take(LOGO_MAX_LINES)
+        .map(|line| TermCmd {
+            t: "print".to_string(),
+            text: line.chars().take(LOGO_MAX_COLS).collect(),
+            cls: "brand".to_string(),
+        })
+        .collect()
+}
+
+/// 读取编译期模板，替换占位符，输出渲染指令数组。
+/// `custom_logo` 非空时替换模板中 `logo: true` 标记的内置 LOGO 段：
+/// 自定义行插在段首位置（其余段落顺序不变）；空串保留内置 LOGO。
+fn build_cmds(values: &HashMap<String, String>, custom_logo: &str) -> Vec<TermCmd> {
+    let custom = custom_logo_cmds(custom_logo);
     match serde_json::from_str::<Vec<RawLine>>(TEMPLATE_JSON) {
-        Ok(lines) => lines
-            .into_iter()
-            .filter(|l| l.t == "print")
-            .map(|l| TermCmd {
-                t: l.t,
-                text: substitute(&l.text, values),
-                cls: l.cls,
-            })
-            .collect(),
+        Ok(lines) => {
+            let mut cmds = Vec::with_capacity(lines.len() + custom.len());
+            let mut inserted = false;
+            for l in lines {
+                // 仅在传入自定义 LOGO 时跳过内置 LOGO 行：首个位置插入自定义段
+                if l.logo && !custom.is_empty() {
+                    if !inserted {
+                        cmds.extend(custom.iter().cloned());
+                        inserted = true;
+                    }
+                    continue;
+                }
+                cmds.push(TermCmd {
+                    t: l.t,
+                    text: substitute(&l.text, values),
+                    cls: l.cls,
+                });
+            }
+            if !inserted {
+                cmds.extend(custom); // 防御：模板无 LOGO 段时追加（当前模板不会走到）
+            }
+            cmds
+        }
         Err(e) => {
             debug!("MOTD 模板解析失败（不应发生，模板随编译期嵌入）: {e}");
             Vec::new()
@@ -479,6 +519,9 @@ struct RawLine {
     text: String,
     #[serde(default)]
     cls: String,
+    /// 内置 LOGO 段标记：传入自定义 LOGO 时整段被替换
+    #[serde(default)]
+    logo: bool,
 }
 
 #[cfg(test)]
@@ -504,7 +547,7 @@ mod tests {
             "Wed Oct 1 14:23:01 +0000 2025".into(),
         );
 
-        let cmds = build_cmds(&v);
+        let cmds = build_cmds(&v, "");
         assert!(cmds.len() > 10);
         let text_all = cmds
             .iter()
@@ -514,6 +557,48 @@ mod tests {
         assert!(text_all.contains("Rhost 0.1.0"));
         assert!(text_all.contains("(Linux 6.8.0 x86_64)"));
         assert!(text_all.contains("23% of 7.8Gi"));
+    }
+
+    #[test]
+    fn custom_logo_replaces_builtin_and_keeps_layout() {
+        let v: HashMap<String, String> = build_values(&HashMap::new());
+
+        // 空自定义：内置 LOGO 原样保留
+        let builtin = build_cmds(&v, "");
+        assert!(builtin.iter().any(|c| c.text.contains("____")));
+
+        // 非空自定义：内置 5 行 LOGO 整段消失，自定义行插在 LOGO 段位置
+        let cmds = build_cmds(&v, "MY LOGO\nLINE2");
+        assert!(!cmds.iter().any(|c| c.text.contains("____")));
+        let idx = cmds
+            .iter()
+            .position(|c| c.text == "MY LOGO")
+            .expect("自定义 LOGO 首行应存在");
+        assert_eq!(cmds[idx].cls, "brand");
+        assert_eq!(cmds[idx + 1].text, "LINE2");
+        // LOGO 段后紧跟空行 + Welcome 行，其余布局不受影响
+        assert_eq!(cmds[idx + 2].text, "");
+        assert!(cmds[idx + 3].text.contains("Welcome to Rhost"));
+    }
+
+    #[test]
+    fn custom_logo_caps_lines_and_width() {
+        let v = HashMap::new();
+        // 超行数截断到 30 行，且后续布局完整（空行 + Welcome）
+        let long = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let cmds = build_cmds(&v, &long);
+        let pos = cmds
+            .iter()
+            .position(|c| c.text == "L0")
+            .expect("自定义首行应存在");
+        assert_eq!(cmds[pos + 29].text, "L29");
+        assert_eq!(cmds[pos + 30].text, "");
+        assert!(cmds[pos + 31].text.contains("Welcome to Rhost"));
+
+        // 超宽单行截断到 200 字符
+        let wide = "X".repeat(300);
+        let cmds = build_cmds(&v, &wide);
+        assert_eq!(cmds[0].text.chars().count(), 200);
     }
 
     #[test]

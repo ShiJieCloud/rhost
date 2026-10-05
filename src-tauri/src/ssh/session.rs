@@ -535,7 +535,7 @@ impl SshSession {
         //    3s 超时/失败/取消均静默降级为 None，绝不阻塞主连接。
         let motd_outcome = if cfg.motd {
             let mut h = handle.lock().await;
-            crate::motd::collect_and_build(&mut h, &cancel).await
+            crate::motd::collect_and_build(&mut h, &cancel, &cfg.motd_logo).await
         } else {
             None
         };
