@@ -24,10 +24,6 @@ export const filtered = computed(() => {
   )
 })
 
-export const onlineCount = computed(
-  () => hosts.value.filter(h => h.status === 'online').length,
-)
-
 export const styleLabel = computed(() => STYLE_LABELS[viewStyle.value])
 
 export const filterInfo = computed(() =>

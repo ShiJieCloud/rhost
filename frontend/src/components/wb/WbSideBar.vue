@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { hosts, onlineCount } from '../../stores/hosts'
+import { hosts } from '../../stores/hosts'
 import { activeSession, openSession } from '../../stores/session'
 
 const q = ref('')
@@ -46,11 +46,6 @@ const groups = computed(() => {
           </div>
         </div>
       </template>
-    </div>
-
-    <div class="sidebar-foot">
-      <span class="dot online" style="animation:none"></span>
-      <span>{{ hosts.length }} 台主机 · {{ onlineCount }} 台在线</span>
     </div>
   </aside>
 </template>
