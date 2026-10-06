@@ -2,7 +2,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { toast } from '../../composables/useToast'
 import {
-  METRICS_HEARTBEAT_MS, activeHost, activeHostInfo, activeMetrics, activeNetHist, activeSession,
+  METRICS_HEARTBEAT_MS, activeHost, activeHostInfo, activeMetrics, activeNetHist,
+  activeReconnectAttempt, activeSession,
   connected, disconnectSession, inspectorVisible, metricsHeartbeat, openDock, reconnectTick,
   startMetrics, stopMetrics,
 } from '../../stores/session'
@@ -41,7 +42,11 @@ const stateLabel = computed(() => {
   if (!s) return '未连接'
   if (s.state === 'online') return '已连接'
   if (s.state === 'connecting') return '连接中…'
-  if (s.state === 'reconnecting') return '重连中…'
+  if (s.state === 'reconnecting') {
+    return activeReconnectAttempt.value > 0
+      ? `重连中 · 第 ${activeReconnectAttempt.value} 次`
+      : '重连中…'
+  }
   if (s.state === 'idle') return '未连接'
   return '已断开'
 })
@@ -327,12 +332,14 @@ function onReconnect() {
 }
 async function onDisconnect() {
   const s = activeSession.value
-  if (!connected.value || !s) {
+  // 在线断开 SSH；重连等待中则取消自动重连（同一入口）
+  if (!s || (s.state !== 'online' && s.state !== 'reconnecting')) {
     toast('当前没有活动会话', 'warn')
     return
   }
+  const wasWaiting = s.state === 'reconnecting'
   if (await disconnectSession(s.id)) {
-    toast('已断开连接', 'info', 1600)
+    toast(wasWaiting ? '已取消自动重连并断开' : '已断开连接', 'info', 1600)
   }
 }
 </script>

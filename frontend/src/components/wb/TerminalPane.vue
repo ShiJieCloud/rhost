@@ -12,8 +12,9 @@ import { toast } from '../../composables/useToast'
 import { hosts, showNewConn } from '../../stores/hosts'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
 import {
-  activeSessionId, attachTerminal, detachTerminal, openSession, reconnectBackend, reconnectTick, resizeTerminal,
-  sendInput, sessions,
+  activeReconnectAttempt, activeSession, activeSessionId, attachTerminal,
+  autoReconnectDelayMs, detachTerminal, disconnectSession, openSession, reconnectBackend,
+  reconnectTick, resizeTerminal, sendInput, sessions,
 } from '../../stores/session'
 import type { Session, SessionState } from '../../stores/session'
 import type { HostStatus } from '../../types'
@@ -264,6 +265,7 @@ function mountTerminal(id: string) {
     // 回滚缓冲行数读设置（xterm 构造参数，仅对新建终端生效）；clamp 非负兜底
     scrollback: Math.max(0, Math.trunc(savedSettings.scrollback) || 0),
     allowTransparency: true,
+    macOptionIsMeta: false,
     theme: XTERM_THEME,
   })
   const fit = new FitAddon()
@@ -406,13 +408,163 @@ watch(activeSessionId, async id => {
 
 watch(reconnectTick, () => {
   const id = activeSessionId.value
-  if (!id) return
-  const inst = termInsts.get(id)
-  if (inst) inst.term.reset()
-  const s = sessions.value.find(x => x.id === id)
-  toast(`正在重新连接 ${s?.host.id ?? ''} …`, 'info')
-  void reconnectBackend(id)
+  if (id) void reconnectBackend(id)
 })
+
+/* ============================================================
+ * 断线快照 / 顶部状态条
+ *
+ * 断线瞬间不向终端写任何字节，屏幕停留在最后一帧（含 Vim alt buffer 静态
+ * 快照），键盘输入由 sendInput 在 store 层按 state 冻结。
+ *
+ * 连接中/退避/尝试/离线终态/成功闪现统一用终端顶部 28px 状态条承载：
+ * 真实占位但不遮罩，终端始终清晰可见、可滚轮回看、可框选复制。
+ *
+ * 建连成功时 store 自增该会话 resetSeq，这里收到变化才 term.reset()——
+ * 旧快照在此刻被清掉，随后到达的全新 PTY 首帧构成干净 shell 提示符。
+ * ============================================================ */
+type RcPhase = 'connecting' | 'waiting' | 'trying' | 'offline'
+
+interface RcVm {
+  phase: RcPhase
+  title: string
+  /** offline 时的断线原因（状态条上以弱化文本显示，过长省略） */
+  reason?: string
+  attempt: number
+  /** 进度条形态：shrink=退避倒计时收缩；slide=尝试中不定滑动；none=离线无进度 */
+  bar: 'shrink' | 'slide' | 'none'
+}
+
+const rc = computed<RcVm | null>(() => {
+  const s = activeSession.value
+  if (!s) return null
+  const attempt = activeReconnectAttempt.value
+  if (s.state === 'connecting') {
+    return {
+      phase: 'connecting',
+      title: `正在与 ${s.host.user}@${s.host.ip} 建立安全会话…`,
+      attempt: 0,
+      bar: 'slide',
+    }
+  }
+  if (s.state === 'reconnecting') {
+    // retryAt 有值=退避等待；无值=重连请求已发出、等待建连结果
+    if (s.retryAt != null) {
+      return { phase: 'waiting', title: '连接已断开，正在尝试重新连接', attempt, bar: 'shrink' }
+    }
+    return { phase: 'trying', title: `正在重新连接（第 ${attempt} 次尝试）…`, attempt, bar: 'slide' }
+  }
+  if (s.state === 'offline') {
+    return {
+      phase: 'offline',
+      title: '连接已断开',
+      reason: s.disconnectReason || '终端输入已冻结，可重新连接',
+      attempt,
+      bar: 'none',
+    }
+  }
+  return null
+})
+
+/** 顶部状态条：连接/等待/尝试/离线终态/成功闪现——全程不遮挡终端，可滚动可复制 */
+const bannerOn = computed(() => flashOn.value || !!rc.value)
+
+/** 设置中的最大尝试次数（0=不限），状态条显示"第 N / M 次" */
+const rcMaxAttempts = computed(() =>
+  Math.max(0, Math.round(savedSettings.autoReconnectMaxAttempts) || 0),
+)
+
+/** 当前退避窗口总时长（进度条收缩动画时长） */
+const rcDelayMs = computed(() => {
+  const n = rc.value?.attempt ?? 0
+  return n > 0 ? autoReconnectDelayMs(n) : 0
+})
+
+/** 倒计时本地时钟（epoch ms）：仅退避等待期间以 250ms 节拍刷新，避免秒数跳动 */
+const nowTs = ref(Date.now())
+let nowTimer: ReturnType<typeof setInterval> | null = null
+watch(
+  () => rc.value?.phase === 'waiting',
+  active => {
+    if (active && !nowTimer) {
+      nowTs.value = Date.now()
+      nowTimer = setInterval(() => { nowTs.value = Date.now() }, 250)
+    } else if (!active && nowTimer) {
+      clearInterval(nowTimer)
+      nowTimer = null
+    }
+  },
+  { immediate: true },
+)
+onUnmounted(() => {
+  if (nowTimer) clearInterval(nowTimer)
+  if (flashTimer) clearTimeout(flashTimer)
+})
+
+/** 距离下次自动重连的整秒数（1s 起） */
+const countdownSec = computed(() => {
+  const s = activeSession.value
+  if (!s?.retryAt) return 0
+  return Math.max(0, Math.ceil((s.retryAt - nowTs.value) / 1000))
+})
+
+/* ---- 重连成功闪现：reconnecting→online 时顶部绿条停留 1.5s 后自动消失。
+   初次 connecting→online 不闪（那本来就是预期内的首连） ---- */
+const flashOn = ref(false)
+let flashTimer: ReturnType<typeof setTimeout> | null = null
+watch(
+  () => ({ id: activeSessionId.value, state: activeSession.value?.state ?? null }),
+  (cur, prev) => {
+    if (!prev || cur.id !== prev.id) return
+    if (prev.state === 'reconnecting' && cur.state === 'online') {
+      flashOn.value = true
+      if (flashTimer) clearTimeout(flashTimer)
+      flashTimer = setTimeout(() => { flashOn.value = false }, 1500)
+    }
+    if (cur.state !== 'online') flashOn.value = false
+  },
+)
+
+/* ---- 状态条占位：出现/消失后终端可视高度变化，nextTick 重新 fit。
+   断线期间 backendId 为空不发 window-change，但最新行列已存入 termSizes，
+   重连建连按新尺寸申请 PTY；banner 消失后 fit 回全高再补发 resize ---- */
+watch(bannerOn, async () => {
+  await nextTick()
+  const id = activeSessionId.value
+  if (id) safeFit(id)
+})
+
+/** 状态条按钮：立即手动重连（退避等待中也可，会接管取消定时器） */
+function overlayReconnect() {
+  const s = activeSession.value
+  if (s) void reconnectBackend(s.id)
+}
+
+/** 状态条/卡片按钮：取消连接/取消自动重连（=断开，进入离线冻结态） */
+function overlayCancel() {
+  const s = activeSession.value
+  if (s) void disconnectSession(s.id)
+}
+
+/**
+ * resetSeq 按 id 对比（不用数组 join——会话顺序变化/关中间标签会错位误清屏）：
+ * 仅当同一会话序号真实增长时 reset；新会话首次出现不 reset（终端本就是空的）。
+ * watch 在状态变更的 microtask 执行，远早于新 PTY 首帧（至少一个网络 RTT）到达，
+ * 不会清掉新连接的 MOTD/提示符输出。
+ */
+watch(
+  () => new Map(sessions.value.map(s => [s.id, s.resetSeq])),
+  (cur, prev) => {
+    for (const [id, seq] of cur) {
+      const old = prev?.get(id)
+      if (old !== undefined && old !== seq) {
+        const inst = termInsts.get(id)
+        inst?.term.reset()
+        if (id === activeSessionId.value) inst?.term.focus()
+      }
+    }
+  },
+)
 
 /* ---- 工具栏 ---- */
 function activeTerm(): Terminal | null {
@@ -634,7 +786,7 @@ function dotClass(status: HostStatus) {
 </script>
 
 <template>
-  <div ref="wrapEl" class="terminal-wrap">
+  <div ref="wrapEl" class="terminal-wrap" :class="{ 'rc-banner-on': bannerOn && hasSessions }">
     <!-- 工具栏：广播开启且高度不足以垂直共存时让位隐藏（Esc 关广播后恢复） -->
     <div v-show="hasSessions && termSpaceEnough && (!bcastOpen || floatCoexistEnough)"
          class="term-tools" :class="{ pinned: bcastOpen }">
@@ -681,6 +833,65 @@ function dotClass(status: HostStatus) {
         :ref="el => setTermEl(s.id, el as Element | null)"
         class="term-instance"
       ></div>
+    </div>
+
+    <!-- ============ 连接/断线/重连/终态：统一用顶部状态条，全程不遮挡快照 ============ -->
+    <div
+      v-if="bannerOn && hasSessions"
+      class="rc-banner"
+      :class="flashOn ? 'ok' : rc ? `p-${rc.phase}` : ''"
+      role="status"
+    >
+      <span class="rcb-dot" aria-hidden="true"></span>
+
+      <template v-if="flashOn">
+        <span class="rcb-text">连接已恢复 · 会话已重新建立</span>
+      </template>
+      <template v-else-if="rc">
+        <span class="rcb-text">
+          <template v-if="rc.phase === 'waiting'">
+            连接已断开，正在尝试重新连接 · <b>{{ countdownSec }}</b> 秒后重试
+          </template>
+          <template v-else>{{ rc.title }}</template>
+        </span>
+
+        <!-- offline：原因弱化跟在标题后，空间不足时省略 -->
+        <span v-if="rc.phase === 'offline'" class="rcb-reason" :title="rc.reason">{{ rc.reason }}</span>
+
+        <span v-if="rc.phase === 'waiting'" class="rcb-att">
+          第 <b>{{ rc.attempt }}</b>{{ rcMaxAttempts > 0 ? ` / ${rcMaxAttempts}` : '' }} 次
+        </span>
+
+        <!-- 右侧操作区 -->
+        <span class="rcb-actions">
+          <template v-if="rc.phase === 'waiting'">
+            <button class="rcb-btn primary" @click="overlayReconnect">立即重连</button>
+            <button class="rcb-btn ghost" @click="overlayCancel">取消重连</button>
+          </template>
+          <template v-else-if="rc.phase === 'connecting'">
+            <button class="rcb-btn ghost" @click="overlayCancel">取消连接</button>
+          </template>
+          <template v-else-if="rc.phase === 'offline'">
+            <button class="rcb-btn primary" @click="overlayReconnect">重新连接</button>
+          </template>
+          <template v-else>
+            <span class="rcb-spin"></span>
+            <span class="rcb-att">建立新会话中…</span>
+          </template>
+        </span>
+      </template>
+
+      <!-- 底边进度线：退避按真实窗口收缩；尝试/连接中不定滑动；离线不显示 -->
+      <span v-if="!flashOn && rc?.bar !== 'none'" class="rcb-bar">
+        <i
+          v-if="rc?.bar === 'shrink'"
+          :key="rc.attempt"
+          class="shrink"
+          :style="{ animationDuration: `${rcDelayMs}ms` }"
+        ></i>
+        <i v-else class="slide"></i>
+      </span>
+      <span v-else-if="flashOn" class="rcb-bar"><i class="full"></i></span>
     </div>
 
     <!-- 广播命令条：一次发送命令到多个会话（空间不足时随 Dock 拖拽自动隐藏） -->
@@ -839,6 +1050,140 @@ function dotClass(status: HostStatus) {
 </template>
 
 <style scoped>
+/* ============================================================
+ * 连接/断线/重连状态条（VS Code Remote 范式，色值映射项目设计令牌）
+ *
+ * 唯一形态：终端最上沿 28px 细状态条，连接中/退避/尝试/离线终态/成功
+ * 全程显示。真实占位（term-instance 下移避让），不遮罩、不模糊：
+ * 断线快照始终清晰，可滚轮回看、可框选复制，输入仍由 store 冻结。
+ * ============================================================ */
+.rc-banner{
+  position:absolute;top:0;left:0;right:0;z-index:7;
+  height:28px;
+  display:flex;align-items:center;gap:7px;
+  padding:0 8px 0 10px;
+  background:var(--panel-2);
+  border-bottom:1px solid var(--border);
+  font-size:11px;color:var(--muted);
+  animation:rcb-slide .22s cubic-bezier(.16,1,.3,1);
+}
+@keyframes rcb-slide{from{transform:translateY(-100%)}to{transform:none}}
+
+/* 状态点 */
+.rcb-dot{
+  flex:none;width:7px;height:7px;border-radius:50%;
+  background:var(--orange);
+  box-shadow:0 0 0 2px rgba(255,158,100,.15);
+  animation:rcb-pulse 1.6s ease-in-out infinite;
+}
+@keyframes rcb-pulse{
+  0%,100%{box-shadow:0 0 0 2px rgba(255,158,100,.15)}
+  50%{box-shadow:0 0 0 5px rgba(255,158,100,0)}
+}
+.p-connecting .rcb-dot{
+  background:var(--blue);
+  animation:rcb-pulse-blue 1.6s ease-in-out infinite;
+}
+@keyframes rcb-pulse-blue{
+  0%,100%{box-shadow:0 0 0 2px rgba(122,162,247,.15)}
+  50%{box-shadow:0 0 0 5px rgba(122,162,247,0)}
+}
+/* 离线终态：红色常亮，不再脉冲（自动流程已停止） */
+.p-offline .rcb-dot{
+  background:var(--red);
+  box-shadow:0 0 0 2px rgba(247,118,142,.14);
+  animation:none;
+}
+.rc-banner.ok .rcb-dot{
+  background:var(--green);
+  box-shadow:0 0 0 2px rgba(61,220,132,.15);
+  animation:none;
+}
+
+.rcb-text{flex:none;white-space:nowrap}
+.rcb-text b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+/* offline 原因：吃掉剩余空间，过长省略；title 悬停看全量 */
+.rcb-reason{
+  flex:1;min-width:0;
+  color:var(--muted-2);font-size:10.5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.p-offline .rcb-text{color:var(--red)}
+.rcb-att{
+  flex:none;font-size:10.5px;color:var(--muted-2);white-space:nowrap;
+}
+.rcb-att b{color:var(--muted);font-weight:600;font-variant-numeric:tabular-nums}
+.rc-banner.ok .rcb-text{color:var(--green)}
+
+/* 右侧操作区 */
+.rcb-actions{
+  margin-left:auto;flex:none;
+  display:flex;align-items:center;gap:7px;
+}
+.rcb-btn{
+  height:20px;padding:0 9px;
+  border-radius:5px;font:inherit;font-size:10.5px;font-weight:600;
+  cursor:pointer;white-space:nowrap;
+  transition:background .15s,border-color .15s,box-shadow .15s;
+}
+.rcb-btn.primary{
+  background:linear-gradient(180deg,rgba(61,220,132,.17),rgba(61,220,132,.07));
+  border:1px solid rgba(61,220,132,.32);
+  color:var(--green);
+}
+.rcb-btn.primary:hover{
+  background:linear-gradient(180deg,rgba(61,220,132,.26),rgba(61,220,132,.11));
+  border-color:rgba(61,220,132,.52);
+  box-shadow:0 0 12px rgba(61,220,132,.12);
+}
+.rcb-btn.ghost{
+  background:transparent;border:1px solid var(--border);color:var(--muted);
+}
+.rcb-btn.ghost:hover{background:var(--hover);color:var(--text)}
+.rcb-spin{
+  width:10px;height:10px;border-radius:50%;
+  border:2px solid rgba(255,158,100,.25);
+  border-top-color:var(--orange);
+  animation:rcb-rot .7s linear infinite;
+}
+.p-connecting .rcb-spin{
+  border-color:rgba(122,162,247,.25);border-top-color:var(--blue);
+}
+@keyframes rcb-rot{to{transform:rotate(360deg)}}
+
+/* 底边进度线：贴状态条下沿 2px（offline 无此元素） */
+.rcb-bar{
+  position:absolute;left:0;right:0;bottom:-1px;height:2px;
+  background:var(--border-soft);overflow:hidden;pointer-events:none;
+}
+.rcb-bar i{display:block;height:100%}
+/* 退避倒计时：满→空线性收缩，时长=真实退避窗口（内联 animationDuration） */
+.rcb-bar .shrink{
+  width:100%;
+  background:linear-gradient(90deg,var(--orange),var(--yellow));
+  animation-name:rcb-shrink;animation-timing-function:linear;animation-fill-mode:forwards;
+}
+@keyframes rcb-shrink{from{width:100%}to{width:0%}}
+/* 尝试/连接中：不定宽条左右滑动 */
+.rcb-bar .slide{
+  position:relative;width:34%;
+  background:linear-gradient(90deg,transparent,var(--orange),transparent);
+  animation:rcb-slide 1.1s ease-in-out infinite;
+}
+.p-connecting .rcb-bar .slide{
+  background:linear-gradient(90deg,transparent,var(--blue),transparent);
+}
+@keyframes rcb-slide{
+  0%{margin-left:-36%}
+  100%{margin-left:102%}
+}
+.rcb-bar .full{width:100%;background:var(--green)}
+
+/* 状态条真实占位：xterm 容器与悬浮工具栏下移避让（特异性高于全局规则）；
+   banner 出现/消失后由 watch(bannerOn) 触发 safeFit 重算行列 */
+.rc-banner-on .term-instance{top:32px}
+.rc-banner-on .term-tools{top:36px}
+
 /* 粘贴保护弹窗：复用全局 .mask/.modal/.btn，仅补本组件专属尺寸与预览样式。
    height:auto 覆盖全局 .modal 的固定 640px——本弹窗内容自适应，避免大片空白；
    head/body/foot 间距统一压缩，区域间不留大空隙 */

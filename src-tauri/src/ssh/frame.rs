@@ -9,7 +9,9 @@
 pub enum FrameType {
     /// PTY 原始输出（stdout/stderr 合并流）
     Data = 0x01,
-    /// 会话结束（payload 为可选原因文本，UTF-8）
+    /// 会话结束。payload 为 JSON `{"reason": <展示文本>, "lost": <bool>}`：
+    /// lost=true 表示未收到远端退出状态连接即关闭（网络中断等），前端可自动重连；
+    /// lost=false 表示远端进程正常退出/被信号终止（用户主动 exit 等），不重连。
     Exit = 0x02,
     /// 会话内部错误（payload 为错误描述文本，UTF-8）。
     /// 协议预留：当前连接错误走 invoke 返回值，运行期错误并入 Exit 帧。

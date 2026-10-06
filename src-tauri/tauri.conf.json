@@ -16,6 +16,7 @@
     }
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Rhost",
@@ -25,6 +26,7 @@
         "minHeight": 600,
         "resizable": true,
         "decorations": false,
+        "transparent": true,
         "fullscreen": false
       }
     ],

@@ -111,11 +111,18 @@ const PANELS: PanelDef[] = [
           { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur' },
         ],
       },
+      {
+        label: '启动动画',
+        rows: [
+          { key: 'splashDurationMs', title: '动画时长', desc: '动画最短展示时间，需等待主界面就绪，重启生效。', kind: 'range', min: 200, max: 5000, step: 100, unit: 'ms', keywords: '启动 画面 动画 splash 时长 呼吸 logo' },
+          { key: 'splashTransparent', title: '透明背景', desc: '开启后，LOGO 悬浮在桌面之上，使用原生窗口透明效果（MacOS 依赖私有 API）；关闭时使用深色背景展示 LOGO。重启生效。', kind: 'switch', keywords: '启动 画面 动画 splash 透明 背景 桌面 深色 logo' },
+        ],
+      },
     ],
   },
   {
     id: 'terminal', label: '终端', glyph: 'terminal',
-    title: '终端', sub: '配置 Shell 启动、MOTD 横幅、字体、光标、会话行为与环境变量',
+    title: '终端', sub: '配置 MOTD 横幅、字体、光标、会话行为与环境变量',
     groups: [
       {
         label: '字体',
@@ -136,12 +143,6 @@ const PANELS: PanelDef[] = [
         rows: [],
       },
       {
-        label: '启动',
-        rows: [
-          { key: 'colorPrompt', title: '彩色提示符', desc: '登录后为无颜色的远端 shell 配置彩色 PS1 与 ls/grep 颜色；远端已有彩色配置（oh-my-zsh 等）时自动跳过，不覆盖用户设置', kind: 'switch', keywords: '彩色 提示符 颜色 prompt ps1 注入 高亮' },
-        ],
-      },
-      {
         label: 'MOTD横幅',
         rows: [
           { key: 'motd', title: '登录欢迎面板', desc: '连接成功后采集服务器负载、内存、磁盘、IP 等状态，在终端绘制 Rhost MOTD 欢迎横幅；开启时自动屏蔽 sshd 原生 MOTD 与 Last login 避免重复', kind: 'switch', keywords: 'motd 欢迎 面板 横幅 banner 登录 系统状态 负载 内存 磁盘 屏蔽 抑制 原生 last login' },
@@ -151,9 +152,12 @@ const PANELS: PanelDef[] = [
       {
         label: '行为',
         rows: [
+          { key: 'colorPrompt', title: '彩色提示符', desc: '登录后为无颜色的远端 shell 配置彩色 PS1 与 ls/grep 颜色；远端已有彩色配置（oh-my-zsh 等）时自动跳过，不覆盖用户设置', kind: 'switch', keywords: '彩色 提示符 颜色 prompt ps1 注入 高亮' },
           { key: 'scrollback', title: '回滚缓冲区', desc: '可向上滚动的历史行数', kind: 'range', min: 1000, max: 100000, step: 1000, unit: ' 行', keywords: '回滚 缓冲 历史 行数 scrollback' },
           { key: 'trimOnCopy', title: '复制时去除行尾空格', kind: 'switch', keywords: '复制 行尾空格 修剪 trim copy' },
           { key: 'pasteGuard', title: '粘贴保护', desc: '多行粘贴时弹窗确认，避免误执行', kind: 'switch', keywords: '粘贴 保护 确认 paste 安全' },
+          { key: 'autoReconnect', title: '断线自动重连', desc: '网络异常导致连接中断时自动重连（等待 1s 起逐次翻倍，最长 30s）；远端主动 exit、手动断开不会触发，等待期间可随时取消', kind: 'switch', keywords: '断线 自动重连 重连 网络 中断 掉线 退避 reconnect 断开' },
+          { key: 'autoReconnectMaxAttempts', title: '自动重连次数上限', desc: '自动重连的最大尝试次数，达到上限后停止并保留标签等待手动重连；填 0 表示不限次数，持续退避重试', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', disabledKey: 'autoReconnect', keywords: '自动重连 次数 上限 最大 尝试 重试 失败 reconnect' },
           { key: 'rightClick', title: '右键行为', desc: '终端内右键：弹出操作菜单，或直接粘贴剪贴板', kind: 'segmented', keywords: '右键 粘贴 菜单 right click 鼠标',
             options: [{ v: 'menu', t: '菜单' }, { v: 'paste', t: '粘贴' }] },
         ],

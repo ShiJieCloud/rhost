@@ -438,6 +438,121 @@ struct MotdCmd {
     text: String,
 }
 
+/// 在 frame_rx 上等到 0x02 Exit 帧，返回解析后的 JSON payload。
+/// 其它帧（PTY Data/Metrics 等）丢弃。
+async fn recv_exit(
+    frame_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    window: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < deadline {
+        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remain, frame_rx.recv()).await {
+            Ok(Some(frame)) => {
+                if let Some((0x02, payload)) = decode_frame(&frame) {
+                    return Some(serde_json::from_slice(payload).expect("Exit JSON 解析"));
+                }
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+/// 写标记命令并在 PTY Data 帧流中等到该标记回显（确认 shell 已可交互，
+/// 避开连接初期的彩色提示符注入窗口）。
+async fn wait_shell_echo(
+    session: &SshSession,
+    frame_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    marker: &str,
+) {
+    session
+        .write(format!("echo {marker}\r").into_bytes())
+        .await
+        .expect("写入同步命令");
+    let mut pty = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(1000), frame_rx.recv()).await {
+            Ok(Some(frame)) => {
+                if let Some((0x01, payload)) = decode_frame(&frame) {
+                    pty.extend_from_slice(payload);
+                }
+            }
+            _ => break,
+        }
+        if String::from_utf8_lossy(&pty).contains(marker) {
+            return;
+        }
+    }
+    panic!("未等到 shell 回显 {marker}，帧流: {:?}", String::from_utf8_lossy(&pty));
+}
+
+/// 正常退出（PTY 执行 exit）：sshd 先发送 ExitStatus，Exit 帧必须标记 lost=false，
+/// 前端据此判定"用户主动退出"而不触发断线自动重连。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_exit_frame_clean_exit_not_lost() {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+
+    wait_shell_echo(&session, &mut frame_rx, "RHOST_EXIT_SYNC").await;
+    session.write(b"exit\r".to_vec()).await.expect("写入 exit");
+
+    let exit = recv_exit(&mut frame_rx, Duration::from_secs(10))
+        .await
+        .expect("正常 exit 后未收到 Exit 帧");
+    assert_eq!(
+        exit["lost"], false,
+        "远端正常退出（ExitStatus）不应标记为连接丢失: {exit}"
+    );
+    assert!(
+        exit["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("状态码 0"),
+        "reason 应含退出状态码: {exit}"
+    );
+
+    // 连接已由远端关闭，shutdown 仅做本地任务清理（幂等安全）
+    session.shutdown();
+}
+
+/// 连接意外丢失（SIGKILL 当前会话的 per-connection sshd，无 ExitStatus 通道）：
+/// russh 只能收到 Eof/Close，Exit 帧必须标记 lost=true，前端据此触发自动重连。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_exit_frame_killed_connection_is_lost() {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+
+    wait_shell_echo(&session, &mut frame_rx, "RHOST_KILL_SYNC").await;
+    // 交互 shell 的父进程即 per-connection sshd（已降权为 test，可被自身 SIGKILL）；
+    // sshd 被瞬间杀死，来不及发送 ExitStatus/ExitSignal，TCP 直接关闭
+    session
+        .write(b"kill -9 $PPID\r".to_vec())
+        .await
+        .expect("写入 kill");
+
+    let exit = recv_exit(&mut frame_rx, Duration::from_secs(10))
+        .await
+        .expect("连接被杀死后未收到 Exit 帧");
+    assert_eq!(
+        exit["lost"], true,
+        "无 ExitStatus 的连接中断必须标记为连接丢失（lost=true）: {exit}"
+    );
+
+    session.shutdown();
+}
+
 /// 密码错误时应返回认证失败
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_auth_failure() {

@@ -1,13 +1,81 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="splash-active">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Rhost</title>
+    <script>
+      // 启动画面背景模式：首帧前同步读取设置（rhost.settings，splashTransparent 默认开启）。
+      // 关闭透明时给 html 加 splash-solid（深色底），置于 head 保证零闪烁
+      try {
+        if (JSON.parse(localStorage.getItem('rhost.settings') || '{}').splashTransparent === false) {
+          document.documentElement.classList.add('splash-solid')
+        }
+      } catch (e) {}
+    </script>
+    <style>
+      html,body{margin:0;height:100%;background:transparent}
+      /* splash 存活期：页面全透明（透出桌面），主界面隐藏；
+         撤除后 splash-active 移除，style.css 的 body 深色底随之恢复 */
+      .splash-active body{background:transparent}
+      .splash-active #app{visibility:hidden}
+      /* 深色底模式（设置关闭透明）：html.splash-solid 特异度 (0,1,2) 覆盖 .splash-active body */
+      html.splash-solid,html.splash-solid body{background:#06090d}
+      /* LOGO 悬浮层自身无任何背景 */
+      #splash{position:fixed;inset:0;z-index:99999;pointer-events:none;
+        display:flex;align-items:center;justify-content:center;
+        font-family:'JetBrains Mono','Cascadia Code','SF Mono',ui-monospace,
+        Menlo,Consolas,'Courier New',monospace;
+        transition:opacity .25s ease-out}
+      #splash.splash--done{opacity:0;pointer-events:none}
+      /* 上移偏移放在 LOGO 自身（keyframes 两帧都要带，缺帧会导致位移渐变丢失），
+         不能放在 #splash 容器上 —— 容器上移会使 inset:0 底部露缝（状态栏穿透） */
+      .splash-mark{position:relative;width:96px;height:96px;color:#3ddc84;
+        transform:translateY(-4vh);
+        animation:splash-breathe 2s ease-in-out infinite alternate}
+      .splash-glow{position:absolute;inset:-70%;border-radius:50%;opacity:.35;
+        background:radial-gradient(circle,rgba(61,220,132,.28),transparent 70%);
+        animation:splash-glow 2s ease-in-out infinite alternate}
+      .splash-logo{position:relative;width:100%;height:100%;display:block}
+      @keyframes splash-breathe{
+        from{transform:translateY(-4vh) scale(1)}
+        to{transform:translateY(-4vh) scale(1.035)}
+      }
+      @keyframes splash-glow{to{opacity:.75}}
+      @media (prefers-reduced-motion:reduce){
+        .splash-mark,.splash-glow{animation:none}
+        .splash-glow{opacity:.5}
+      }
+    </style>
   </head>
   <body>
+    <div id="splash">
+      <div class="splash-mark">
+        <i class="splash-glow"></i>
+        <!-- 内联自 frontend/src/components/AppLogo.vue：线框 LOGO，currentColor 着色 -->
+        <svg class="splash-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2.5" y="4" width="19" height="16" rx="3" />
+          <path d="M7 9.5L9.5 12L7 14.5" />
+          <path d="M13 14.5h4" />
+        </svg>
+      </div>
+    </div>
     <div id="app"></div>
+    <script>
+      // 撤除 splash：幂等，恢复主界面可见 + 淡出后移除 DOM（docs/splash-design.md §5）
+      window.__hideSplash = function () {
+        document.documentElement.classList.remove('splash-active')
+        document.documentElement.classList.remove('splash-solid')
+        var el = document.getElementById('splash')
+        if (!el || el.classList.contains('splash--done')) return
+        el.classList.add('splash--done')
+        setTimeout(function () { el && el.remove() }, 300)
+      }
+      // 硬超时兜底：即使 bundle 完全失败也不让 splash 卡死窗口（docs/splash-design.md §6）
+      setTimeout(window.__hideSplash, 8000)
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

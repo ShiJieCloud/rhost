@@ -161,7 +161,7 @@ rhost/
 | type | 名称 | payload | 时机 |
 |---|---|---|---|
 | 0x01 | Data | PTY 原始字节（stdout/stderr 合并） | 流式 |
-| 0x02 | Exit | 可选关闭原因（UTF-8） | 会话结束 |
+| 0x02 | Exit | JSON `{"reason","lost"}`（lost=true=网络意外中断，前端可自动重连） | 会话结束 |
 | 0x03 | Error | 错误文本（协议预留，当前运行期错误并入 Exit） | — |
 | 0x04 | Motd | JSON 指令数组 `[{t,text,cls}]` | **首帧**，先于一切 PTY 数据 |
 | 0x05 | HostInfo | JSON 主机静态信息 | 建连一次 |
@@ -193,7 +193,7 @@ rhost/
 3. `connectBackend` 解析密码（会话缓存 → 系统钥匙串 → 专用密码弹窗 → 回写钥匙串），新建 Channel，invoke `connect_ssh`；
 4. 后端 `manager.create` 完成 russh 连接认证，注册会话池，spawn 帧转发；PTY 开启前/初期按设置完成 MOTD、彩色提示符注入（输出被 hold 到不可见 marker 再放行，首帧即最终画面）；
 5. 后续：键盘 `term.onData → sendInput → write_terminal`；远端输出 `Data 帧 → sink → xterm.write`；
-6. Exit 帧 → 状态置 offline 并在终端打印关闭提示；网络层异常由重连逻辑（`reconnectTick`/`reconnectBackend`）处理，重连途中的旧 Exit 静默收尾。
+6. Exit 帧 → 状态置 offline 并在终端打印关闭提示；`lost=true`（无远端退出状态的连接中断）触发前端指数退避自动重连（1s 起翻倍、封顶 30s，次数可在设置中限制，手动断开/远端 exit/初次连失败不重连）；网络层异常的手动重连走 `reconnectTick`/`reconnectBackend`，重连途中的旧 Exit 静默收尾。
 
 ### 8.2 PTY resize
 

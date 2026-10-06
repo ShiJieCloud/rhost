@@ -45,6 +45,7 @@ pub const SSH_SESSION_ENV: &str = "ssh.session.env";
 pub const SSH_SESSION_SHELL: &str = "ssh.session.shell";
 pub const SSH_SESSION_FAILED: &str = "ssh.session.failed";
 pub const SSH_SESSION_READY: &str = "ssh.session.ready";
+pub const SSH_SESSION_INIT_SCRIPT_FAILED: &str = "ssh.session.init_script_failed";
 pub const SSH_DISCONNECT: &str = "ssh.disconnect";
 pub const SSH_RECONNECT: &str = "ssh.reconnect";
 pub const SSH_SFTP_CHANNEL_OPEN: &str = "ssh.sftp.channel.open";
@@ -114,7 +115,8 @@ mod tests {
             SSH_HANDSHAKE_START, SSH_HANDSHAKE_COMPLETE, SSH_HANDSHAKE_FAILED,
             SSH_HOSTKEY_FINGERPRINT, SSH_AUTH_START, SSH_AUTH_SUCCESS, SSH_AUTH_FAILED,
             SSH_SESSION_CREATE, SSH_SESSION_CHANNEL_OPEN, SSH_SESSION_PTY, SSH_SESSION_ENV,
-            SSH_SESSION_SHELL, SSH_SESSION_FAILED, SSH_SESSION_READY, SSH_DISCONNECT,
+            SSH_SESSION_SHELL, SSH_SESSION_FAILED, SSH_SESSION_READY,
+            SSH_SESSION_INIT_SCRIPT_FAILED, SSH_DISCONNECT,
             SSH_RECONNECT, SSH_SFTP_CHANNEL_OPEN, SSH_SFTP_CHANNEL_CLOSE,
             SFTP_TRANSFER_ENQUEUE, SFTP_TRANSFER_START, SFTP_TRANSFER_COMPLETE,
             SFTP_TRANSFER_FAILED, SFTP_TRANSFER_CANCEL, SFTP_TRANSFER_PAUSE,

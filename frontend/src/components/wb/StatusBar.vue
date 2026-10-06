@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { activeAlgo, activeMetrics, activeSession, activeTermSize, connected } from '../../stores/session'
+import { activeAlgo, activeMetrics, activeReconnectAttempt, activeSession, activeTermSize, connected } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
 
 // 五态：ok 已连接 / info 连接中 / warn 重连中 / err 已断开 / idle 未连接（新建会话，从未连接）
@@ -10,7 +10,11 @@ const statusText = () => {
   if (!s) return { cls: 'idle', label: '未连接' }
   if (s.state === 'online') return { cls: 'ok', label: '已连接' }
   if (s.state === 'connecting') return { cls: 'info', label: '连接中…' }
-  if (s.state === 'reconnecting') return { cls: 'warn', label: '重连中…' }
+  if (s.state === 'reconnecting') {
+    return activeReconnectAttempt.value > 0
+      ? { cls: 'warn', label: `重连中 · 第 ${activeReconnectAttempt.value} 次` }
+      : { cls: 'warn', label: '重连中…' }
+  }
   if (s.state === 'idle') return { cls: 'idle', label: '未连接' }
   return { cls: 'err', label: '已断开' }
 }

@@ -13,6 +13,10 @@ export interface AppSettings {
   uiTheme: string
   accent: string
   opacity: number
+  /** 启动动画最短展示时长（ms，200~5000，消费侧夹取）；呼吸动画不受影响，重启生效 */
+  splashDurationMs: number
+  /** 启动动画背景：true 透明悬浮桌面（需 macOSPrivateApi）/ false 深色底 + LOGO；重启生效 */
+  splashTransparent: boolean
   /* ---- 字体 ---- */
   fontFamily: string
   fontSize: number
@@ -37,6 +41,10 @@ export interface AppSettings {
   cursorStyle: string
   /** 终端光标空闲 1 秒后闪烁 */
   cursorBlink: boolean
+  /** 网络异常断开时自动重连（远端主动 exit、手动断开不触发；退避 1s 起指数增长，封顶 30s） */
+  autoReconnect: boolean
+  /** 自动重连最大尝试次数，0 表示不限次数 */
+  autoReconnectMaxAttempts: number
   env: EnvVar[]
   /* ---- 快捷键 ---- */
   'key.newTab': string
@@ -121,6 +129,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiTheme: 'dark',
   accent: '#3ddc84',
   opacity: 96,
+  splashDurationMs: 400,
+  splashTransparent: true,
 
   fontFamily: 'JetBrains Mono',
   fontSize: 13,
@@ -137,6 +147,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rightClick: 'menu',
   cursorStyle: 'bar',
   cursorBlink: true,
+  autoReconnect: true,
+  autoReconnectMaxAttempts: 5,
   env: [
     { key: 'EDITOR', value: 'nvim' },
     { key: 'LANG', value: 'zh_CN.UTF-8' },

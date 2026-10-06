@@ -94,6 +94,44 @@ fn env_export_lines(env: &[(String, String)]) -> String {
     out
 }
 
+/// POSIX sh 片段：为「远端非 UTF-8」挑选一个**实测可用**的 UTF-8 locale 名。
+/// bash/dash/ash/busybox sh 通用。候选名在片段内按
+/// `C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8` 顺序探测：
+/// `C.UTF-8`/`C.utf8` 为 glibc≥2.35 与 musl 内置、不绑定语言，优先；
+/// `en_US.UTF-8` 兜底 CentOS 7 / RHEL 7-8 / Amazon Linux 2（glibc 较旧、
+/// 没有 C.UTF-8，但最小安装通常生成 en_US）；两种拼写都试（Debian 是 C.utf8）。
+/// 运行后结果在 `_rh_l`：空串表示当前已是 UTF-8（无需改动，尊重用户
+/// locale 偏好），或有 locale 命令且 charmap 正常但候选皆不可用（典型
+/// CentOS 极瘦镜像，此时不设以免无效 LC_ALL 触发 glibc 警告）；非空则
+/// 可直接 `export LC_ALL="$_rh_l"` 或作为 `LC_ALL="$_rh_l" exec …` 前缀。
+/// 调用方负责 `unset _rh_l _rh_c`（exec 路径进程被替换可省略）。
+///
+/// 为什么必须运行时探测、不能写死 `UTF-8` 或单个 `C.UTF-8`：
+/// 1. `UTF-8` 是字符集名，不是 locale 名——`LC_ALL=UTF-8` 系统查无此项，
+///    直接报 `No such file or directory` 并退回 C，vim 仍 latin1（实测）；
+/// 2. 没有全平台通用的 locale 名：`C.UTF-8` 在 glibc<2.35（CentOS/RHEL/AL2）
+///    不存在，写死它会在这些系统静默落空；
+/// 3. 判据是 `locale charmap` 实测输出，而非 LANG 字符串含不含 UTF-8
+///    （LANG=zh_CN.UTF-8 但未 locale-gen 时变量好看、实际是 ASCII）。
+///
+/// 另外两点兼容：charmap 匹配放宽 `UTF-?8`（忽略连字符，兼容个别实现输出
+/// `UTF8`）；有 `locale` 命令但 `locale charmap` 无输出（busybox 残损 applet）
+/// 或根本无该命令（极简 musl）时直接保底 C.UTF-8——musl 按 codeset 宽松
+/// 接受并按 UTF-8 工作，glibc 真不支持也只是静默回退 C，不会更差。
+const UTF8_LOCALE_PICK_SH: &str = "\
+_rh_l=''
+if ! printf '%s' \"$(locale charmap 2>/dev/null)\" | grep -qiE '^UTF-?8$'; then
+  for _rh_c in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    if LC_ALL=\"$_rh_c\" locale charmap 2>/dev/null | grep -qiE '^UTF-?8$'; then
+      _rh_l=$_rh_c
+      break
+    fi
+  done
+  if [ -z \"$_rh_l\" ] && { ! command -v locale >/dev/null 2>&1 || [ -z \"$(locale charmap 2>/dev/null)\" ]; }; then
+    _rh_l=C.UTF-8
+  fi
+fi";
+
 /// 生成远端 init 脚本内容。整体设计约束见下：
 /// - 脚本经 exec 通道写临时文件后 source，绝不作为键盘输入发送——长命令经
 ///   PTY 回显既难看又会把 ESC 字节喂给 readline/终端导致命令被毁；
@@ -135,10 +173,30 @@ esac
 
     let env_block = env_export_lines(env);
 
+    // UTF-8 字符集保底（init 脚本通道，不依赖 sshd AcceptEnv——任何启动
+    // 路径都会 source 本脚本）。容器/精简系统常无 LANG 或 LANG 指向未生成
+    // 的 locale（如前端默认注入 zh_CN.UTF-8 但服务器未 locale-gen），此时
+    // vim 的 setlocale(LC_ALL,"") 因非 CTYPE 类别回退到无效 LANG 而整体
+    // 失败，默认 encoding=latin1，UTF-8 中文显示为 `~x` 乱码；用最高优先级
+    // 的 LC_ALL 统一压制（LC_CTYPE 压不住无效 LANG，实测）。探测逻辑与
+    // 候选列表见 UTF8_LOCALE_PICK_SH。位于 env_block 之前：LC_ALL 优先级恒
+    // 高于其后注入的 LANG，且仅在当前 locale 已失效时 `_rh_l` 才非空，
+    // 有效系统零改动、保留用户语言/地区偏好。
+    let locale_block = format!(
+        "\
+{pick}
+if [ -n \"$_rh_l\" ]; then
+  export LC_ALL=\"$_rh_l\"
+fi
+unset _rh_l _rh_c
+",
+        pick = UTF8_LOCALE_PICK_SH,
+    );
+
     format!(
         "\
 printf '\\033[1A\\r\\033[2K'
-{env_block}{color_block}# CWD 上报钩子：每次提示符刷新前输出不可见 OSC 6667 序列（内含 $PWD），
+{locale_block}{env_block}{color_block}# CWD 上报钩子：每次提示符刷新前输出不可见 OSC 6667 序列（内含 $PWD），
 # 后端 merge_task 解析后同步 SFTP 文件树到同一目录。
 # bash 用 PROMPT_COMMAND，zsh 用 precmd_functions；前置注入不覆盖用户已有钩子。
 _rh_cwd_hook() {{ printf '\\033]6667;%s\\007' \"$PWD\"; }}
@@ -157,45 +215,41 @@ printf '\\033]6666;rhinit\\007'
 
 /// 经独立 exec 通道把初始化脚本写入远端 `path`（尽力而为，失败不影响连接）。
 /// 以远端退出状态确认落盘成功（cat 写失败/chmod 失败都会反映为非零），
-/// 保证前端 source 时文件已完整。
+/// 保证前端 source 时文件已完整。成功返回 `Ok(())`，失败返回带原因的 `Err`，
+/// 由调用方决定如何记录（失败会连带跳过 CWD 同步、彩色提示符、UTF-8 locale
+/// 自动配置，值得在会话日志里以 warn 暴露，而非静默）。
 async fn try_upload_script(
     handle: &mut client::Handle<ClientHandler>,
     path: &str,
     color_prompt: bool,
     env: &[(String, String)],
-) -> bool {
-    let result = async {
-        let mut ch = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| e.to_string())?;
-        ch.exec(true, format!("cat > {path} && chmod 600 {path}"))
-            .await
-            .map_err(|e| e.to_string())?;
-        let script = init_script(path, color_prompt, env);
-        ch.data(script.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        ch.eof().await.map_err(|e| e.to_string())?;
-        // 等 cat 收尾并读取退出状态（ExitStatus 通常先于 Close 到达）
-        let mut ok = true;
-        while let Some(msg) = ch.wait().await {
-            match msg {
-                ChannelMsg::ExitStatus { exit_status } => ok = exit_status == 0,
-                ChannelMsg::Close => break,
-                _ => {}
-            }
+) -> Result<(), String> {
+    let mut ch = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("打开 exec 通道失败: {e}"))?;
+    ch.exec(true, format!("cat > {path} && chmod 600 {path}"))
+        .await
+        .map_err(|e| format!("exec 上传命令被拒: {e}"))?;
+    let script = init_script(path, color_prompt, env);
+    ch.data(script.as_bytes())
+        .await
+        .map_err(|e| format!("写入脚本数据失败: {e}"))?;
+    ch.eof().await.map_err(|e| format!("发送 EOF 失败: {e}"))?;
+    // 等 cat 收尾并读取退出状态（ExitStatus 通常先于 Close 到达）
+    let mut status: Option<u32> = None;
+    while let Some(msg) = ch.wait().await {
+        match msg {
+            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {}
         }
-        let _ = ch.close().await;
-        Ok::<bool, String>(ok)
     }
-    .await;
-    match result {
-        Ok(ok) => ok,
-        Err(e) => {
-            debug!("初始化脚本写入失败 {path}（忽略，不影响连接）: {e}");
-            false
-        }
+    let _ = ch.close().await;
+    match status {
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("远端写入命令退出码 {code}（{path}，可能 /tmp 不可写或磁盘满）")),
+        None => Err(format!("未收到远端退出状态（{path}）")),
     }
 }
 
@@ -346,29 +400,35 @@ async fn open_pty(
 /// 构造以登录 shell 替换自身的启动命令；远端 UTF-8 locale 缺失/失效时
 /// （容器内常见两种：无 LANG 等同 C locale；或 LANG 指向未生成的 locale，
 /// 如 `zh_CN.UTF-8` 但未 locale-gen——两种情况下 readline 都把粘贴的
-/// UTF-8 字节转义成 `\nnn` 八进制文本，中文路径无法 cd）保底注入
-/// `LC_CTYPE=C.UTF-8`。
+/// UTF-8 字节转义成 `\nnn` 八进制文本，vim 默认 encoding=latin1 把
+/// UTF-8 中文渲染成 `~x` 乱码）保底注入 `LC_ALL=<实测可用的 UTF-8 locale>`。
 ///
 /// 为什么写在命令串而非启动后脚本：readline 仅在初始化时读取一次 locale
 /// （环境变量 LC_ALL/LC_CTYPE/LANG）并缓存；变量赋值前缀 + `exec`（POSIX
-/// 特殊内建）会把 LC_CTYPE 带进替换后进程的环境，新 shell 启动时
+/// 特殊内建）会把 LC_ALL 带进替换后进程的环境，新 shell 启动时
 /// `setlocale(LC_ALL, "")` 即读到 UTF-8。
 ///
-/// 判断依据是 `locale charmap` **实测**当前字符集，而不是环境变量字符串：
-/// LANG=zh_CN.UTF-8 但 locale 数据未生成时变量含 UTF-8、实际却是 ASCII。
-/// 真正可用 UTF-8 时零改动；C.UTF-8 为 glibc 2.13+ / musl 内置，无需
-/// locale-gen，实测可用才切换，否则静默回退普通启动（与改动前一致）。
+/// 具体探测 / 候选顺序 / busybox 兜底见 [`UTF8_LOCALE_PICK_SH`]（与 init
+/// 脚本同一份逻辑）。要点：判据是 `locale charmap` **实测**而非 LANG 字符串；
+/// 已是 UTF-8 时零改动（尊重用户 LANG/LC_* 偏好）；用 LC_ALL 而非 LC_CTYPE
+/// （init 脚本随后可能 export 指向未生成 locale 的 LANG，实测该无效 LANG
+/// 会令 vim 的 setlocale(LC_ALL,"") 整体失败回退 latin1，LC_CTYPE 压不住，
+/// 只有最高优先级的 LC_ALL 能让 vim encoding=utf-8）；候选含 en_US.UTF-8
+/// 以覆盖无 C.UTF-8 的 CentOS/RHEL/Amazon Linux 旧版。
 fn locale_login_cmd(shell: &str) -> String {
     let q = shell.replace('\'', "'\\''");
+    // 复用 init 脚本同一套候选探测（UTF8_LOCALE_PICK_SH）：命中则带
+    // LC_ALL=<实测可用名> exec；`_rh_l` 为空（已是 UTF-8，或无可用候选的
+    // 极瘦镜像）则裸 exec，保持与改动前一致、绝不塞无效 locale。
     format!(
         "\
-if [ \"$(locale charmap 2>/dev/null)\" = 'UTF-8' ]; then
-  exec '{q}' -l
-elif LC_CTYPE=C.UTF-8 locale charmap 2>/dev/null | grep -qi '^UTF-8$'; then
-  LC_CTYPE=C.UTF-8 exec '{q}' -l
+{pick}
+if [ -n \"$_rh_l\" ]; then
+  LC_ALL=\"$_rh_l\" exec '{q}' -l
 else
   exec '{q}' -l
 fi",
+        pick = UTF8_LOCALE_PICK_SH,
         q = q,
     )
 }
@@ -447,6 +507,12 @@ async fn open_interactive(
     // 标准 shell 请求路径：尽力在启动前注入 UTF-8 字符集（接受与否取决于
     // sshd 的 AcceptEnv；want_reply=false 不等待回复、不会悬挂）。exec
     // 抑制路径已在命令串中解决，不会走到这里。被拒不影响后续 shell 请求。
+    //
+    // 这里用 LC_CTYPE 而非 LC_ALL：此为 shell 启动前的「盲发」（无法先探测
+    // 远端 locale），LC_ALL 会无条件覆盖有效系统上用户 LANG 的界面语言/地区
+    // 格式；此刻前端 env 的 LANG 尚未注入，LC_CTYPE 足以覆盖 shell/readline
+    // 的早期窗口。针对「无效 LANG 拖垮 vim」的决定性兜底在 init 脚本里
+    // （有条件、实测后用 LC_ALL），所有路径 shell 启动后都会 source。
     let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
     applog::emit(
         log::Level::Debug,
@@ -494,8 +560,12 @@ async fn open_interactive(
 enum PtyEvent {
     /// PTY 原始输出字节（stdout 与 stderr 合并）
     Data(Vec<u8>),
-    /// 会话结束（远端 EOF/Close/退出状态）；payload 为可选原因
-    Eof(Option<String>),
+    /// 会话结束。
+    /// - `reason`：可选展示文本（退出状态码/信号描述）；
+    /// - `lost=true`：未收到远端退出状态连接即关闭（网络中断/sshd 断连），
+    ///   前端据此触发断线自动重连；
+    /// - `lost=false`：远端进程正常退出或被信号终止（用户主动 exit 等），不重连。
+    Eof { reason: Option<String>, lost: bool },
 }
 
 /// 前端 → 写任务的请求：输入数据与窗口尺寸复用同一通道，保持单写者
@@ -861,17 +931,28 @@ impl SshSession {
             None
         };
 
-        // 初始化脚本（CWD 钩子 + 可选彩色提示符）在 PTY 开启前经 exec 通道静默落盘，
-        // 终端无感知。CWD 钩子始终注入以保证 Shell→SFTP 目录同步；彩色部分仅在
-        // cfg.color_prompt 开启时生效。/tmp 不可写时静默降级，init_cmd 为 None。
+        // 初始化脚本（CWD 钩子 + 可选彩色提示符 + UTF-8 locale 保底）在 PTY
+        // 开启前经 exec 通道静默落盘，终端无感知。CWD 钩子始终注入以保证
+        // Shell→SFTP 目录同步；locale 保底覆盖 vim 等子进程；彩色部分仅在
+        // cfg.color_prompt 开启时生效。落盘失败（/tmp 不可写、exec 受限等）
+        // 以 warn 记录后降级——init_cmd 为 None，这些自动配置将缺席。
         let tag = &Uuid::new_v4().simple().to_string()[..8];
         let tmp_path = format!("/tmp/.ri-{tag}");
         let init_cmd = {
             let mut h = handle.lock().await;
-            if try_upload_script(&mut h, &tmp_path, cfg.color_prompt, &cfg.env).await {
-                Some(source_cmd(&tmp_path))
-            } else {
-                None
+            match try_upload_script(&mut h, &tmp_path, cfg.color_prompt, &cfg.env).await {
+                Ok(()) => Some(source_cmd(&tmp_path)),
+                Err(e) => {
+                    applog::emit(
+                        log::Level::Warn,
+                        "ssh",
+                        ev::SSH_SESSION_INIT_SCRIPT_FAILED,
+                        Some(sid),
+                        format!("会话初始化脚本上传失败，CWD 同步/提示符/UTF-8 locale 自动配置跳过: {e}"),
+                        None,
+                    );
+                    None
+                }
             }
         };
 
@@ -1223,6 +1304,12 @@ async fn read_task(
             );
         }
     }
+    // 远端退出信息（exit-status/exit-signal）。必须以「是否收到过退出状态」判定
+    // 正常退出 vs 连接丢失：部分 sshd/时序下 Eof/Close 会先于 ExitStatus 投递，
+    // 见 Eof 即收尾会把正常 exit 误判为掉线（触发前端无谓自动重连）。
+    // 因此退出状态只记录、不收尾，统一在通道关闭处按记录是否存在决定 lost。
+    let mut exit_reason: Option<String> = None;
+    let mut exit_log_reason = "eof";
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -1239,26 +1326,36 @@ async fn read_task(
                             break;
                         }
                     }
+                    // 记录退出状态，继续排空到 Eof/Close/None（消息可能乱序先至）
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        try_log_disconnect(&dc_state, "exit_status");
-                        let _ = event_tx
-                            .send(PtyEvent::Eof(Some(format!("进程退出，状态码 {exit_status}"))))
-                            .await;
-                        break;
+                        exit_log_reason = "exit_status";
+                        exit_reason = Some(format!("进程退出，状态码 {exit_status}"));
                     }
                     Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
-                        try_log_disconnect(&dc_state, "exit_signal");
+                        exit_log_reason = "exit_signal";
+                        exit_reason =
+                            Some(format!("进程被信号 {signal_name:?} 终止: {error_message}"));
+                    }
+                    // 半关闭：已拿到退出状态即可收尾（正常路径 ExitStatus→Eof）；
+                    // 无退出状态时继续等 Close/None——异常断开紧接着就会到，
+                    // 若退出状态在乱序队列后面也在此兜住
+                    Some(ChannelMsg::Eof) if exit_reason.is_some() => {
+                        try_log_disconnect(&dc_state, exit_log_reason);
                         let _ = event_tx
-                            .send(PtyEvent::Eof(Some(format!(
-                                "进程被信号 {signal_name:?} 终止: {error_message}"
-                            ))))
+                            .send(PtyEvent::Eof { reason: exit_reason, lost: false })
                             .await;
                         break;
                     }
-                    // 远端主动关闭 / 半通道结束
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                        try_log_disconnect(&dc_state, "eof");
-                        let _ = event_tx.send(PtyEvent::Eof(None)).await;
+                    Some(ChannelMsg::Eof) => {}
+                    // 通道完全关闭：有退出状态=正常退出；无=连接意外丢失（自动重连依据）
+                    Some(ChannelMsg::Close) | None => {
+                        try_log_disconnect(&dc_state, exit_log_reason);
+                        let _ = event_tx
+                            .send(PtyEvent::Eof {
+                                reason: exit_reason,
+                                lost: exit_log_reason == "eof",
+                            })
+                            .await;
                         break;
                     }
                     // Success / Failure / WindowAdjusted 等控制消息暂不处理
@@ -1370,12 +1467,17 @@ async fn merge_task(
                             window_open = false;
                         }
                     }
-                    Some(PtyEvent::Eof(reason)) => {
+                    Some(PtyEvent::Eof { reason, lost }) => {
                         if let Some(h) = hold.take() {
                             buf.extend_from_slice(&h.buf[..]);
                         }
                         flush(&mut buf, &frame_tx).await;
-                        let payload = reason.unwrap_or_default();
+                        // 结构化 payload：reason 展示用，lost 指示前端是否可自动重连
+                        let payload = serde_json::json!({
+                            "reason": reason.unwrap_or_default(),
+                            "lost": lost,
+                        })
+                        .to_string();
                         let _ = frame_tx
                             .send(encode_frame(FrameType::Exit, payload.as_bytes()))
                             .await;
@@ -1530,7 +1632,7 @@ mod gate_tests {
 
 #[cfg(test)]
 mod env_export_tests {
-    use super::{env_export_lines, init_script};
+    use super::{env_export_lines, init_script, locale_login_cmd};
 
     #[test]
     fn normal_pairs_get_quoted_exports() {
@@ -1577,5 +1679,76 @@ mod env_export_tests {
         assert!(clear < env_line && env_line < hook, "顺序应为 清行 → export → 钩子");
         // color_prompt=false 时 export 之后不应有颜色块
         assert!(!script.contains("_rh_e"), "未开启提示符着色时不应有颜色块");
+    }
+
+    #[test]
+    fn utf8_locale_fallback_block_present_before_user_env() {
+        // vim 乱码回归守卫：init 脚本必须带 UTF-8 locale 候选探测 + LC_ALL
+        // 保底，且整段位于用户自定义 env 之前（LC_ALL 优先级恒压其后注入的 LANG）
+        let script = init_script(
+            "/tmp/.ri-test",
+            false,
+            &[("EDITOR".into(), "nvim".into())],
+        );
+
+        // 候选列表：C.UTF-8 系列优先（内置/语言中性），en_US 兜底旧版
+        // CentOS/RHEL/Amazon Linux；两种拼写都试。顺序必须固定。
+        let c_utf8 = script.find("C.UTF-8").expect("应有 C.UTF-8 候选");
+        let c_utf8_lower = script.find("C.utf8").expect("应有 C.utf8 候选");
+        let en_us = script.find("en_US.UTF-8").expect("应有 en_US.UTF-8 候选（CentOS 兜底）");
+        let en_us_lower = script.find("en_US.utf8").expect("应有 en_US.utf8 候选");
+        assert!(
+            c_utf8 < c_utf8_lower && c_utf8_lower < en_us && en_us < en_us_lower,
+            "候选探测顺序应为 C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8"
+        );
+
+        // charmap 判定放宽 UTF-?8（兼容输出 UTF8 的实现），且为实测 grep
+        assert!(script.contains("grep -qiE '^UTF-?8$'"), "charmap 应按 UTF-?8 实测匹配");
+
+        // 无 locale 命令 / 残损 busybox locale（charmap 无输出）两路兜底
+        assert!(script.contains("command -v locale"), "应覆盖无 locale 命令的系统");
+        assert!(
+            script.contains("[ -z \"$(locale charmap 2>/dev/null)\" ]"),
+            "应覆盖有 locale 命令但 charmap 无输出的 busybox 残损实现"
+        );
+
+        // 保底经 _rh_l 变量 export LC_ALL，而非写死某个名字（候选可能落空）
+        let export_lc = script.find("export LC_ALL=\"$_rh_l\"")
+            .expect("应只在探测到可用 locale 后按 _rh_l export LC_ALL");
+        let env_line = script.find("export EDITOR='nvim'").unwrap();
+        assert!(export_lc < env_line, "locale 保底必须在用户 env 之前");
+
+        // 探测整段只在「当前不是 UTF-8」时执行（外层 if ! ... grep UTF-?8）
+        assert!(
+            script.contains("if ! printf '%s' \"$(locale charmap 2>/dev/null)\" | grep -qiE '^UTF-?8$'"),
+            "外层必须是「当前非 UTF-8 才探测」，已是 UTF-8 时零改动"
+        );
+        // 绝不硬写 LANG（只统一字符类别，语言/地区偏好留给用户）
+        assert!(!script.contains("export LANG="), "不应硬编码 LANG");
+        // 不能出现把字符集名当 locale 名的错误用法
+        assert!(!script.contains("LC_ALL=UTF-8 "), "UTF-8 不是合法 locale 名，不能直接设");
+        // 临时变量用完即清
+        assert!(script.contains("unset _rh_l _rh_c"), "应清理临时变量");
+    }
+
+    #[test]
+    fn locale_login_cmd_uses_candidate_pick_and_safe_fallback() {
+        let cmd = locale_login_cmd("/bin/bash");
+        // exec 路径复用同一候选探测（含 CentOS 兜底候选与放宽匹配）
+        assert!(cmd.contains("en_US.UTF-8"), "exec 路径也应探测 en_US.UTF-8");
+        assert!(cmd.contains("grep -qiE '^UTF-?8$'"), "exec 路径应实测 charmap");
+        // 命中：带 LC_ALL 前缀 exec；未命中：else 分支行首裸 exec（不塞无效 locale）
+        assert!(
+            cmd.contains("LC_ALL=\"$_rh_l\" exec '/bin/bash' -l"),
+            "命中候选时应带 LC_ALL 前缀 exec"
+        );
+        assert!(
+            cmd.contains("\n  exec '/bin/bash' -l"),
+            "无候选时 else 分支应行首裸 exec"
+        );
+        // shell 路径经单引号转义后安全内插
+        let evil = locale_login_cmd("/tmp/x'bash");
+        assert!(evil.contains("'/tmp/x'\\''bash' -l"), "shell 单引号应被转义");
+        assert!(!evil.contains("LC_ALL=UTF-8 "), "不得把 UTF-8 当 locale 名");
     }
 }

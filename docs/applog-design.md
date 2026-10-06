@@ -153,6 +153,7 @@
 | shell 启动 | `ssh.session.shell` | DEBUG | `shell 已启动` shell（bash/zsh/sh）、init_injected（CWD hook 是否注入） |
 | 会话创建失败 | `ssh.session.failed` | ERROR | `会话创建失败` stage（channel/pty/env/shell）、err |
 | 会话建立 | `ssh.session.ready` | INFO | `会话已建立` term、cols、rows、enc、elapsed_ms（create→ready 耗时） |
+| 初始化脚本上传失败 | `ssh.session.init_script_failed` | WARN | `会话初始化脚本上传失败…` err（打开 exec 通道被拒、远端退出码非零、无退出状态；常见 /tmp 不可写或磁盘满）；CWD 同步、彩色提示符、UTF-8 locale 自动配置随之跳过 |
 | 断开（主动/异常） | `ssh.disconnect` | INFO/WARN | `连接已断开` reason、uptime_s |
 | 重连中 | `ssh.reconnect` | WARN | `连接中断，准备重连` attempt、max、delay_ms |
 | SFTP 通道建立 | `ssh.sftp.channel.open` | DEBUG | `SFTP 通道建立` |

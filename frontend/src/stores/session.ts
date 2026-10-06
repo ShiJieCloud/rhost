@@ -17,6 +17,13 @@ export interface Session {
   startedAt: number
   /** 后端 SSH 会话 id（connect_ssh 返回的 uuid）；未连接/已断开为 undefined */
   backendId?: string
+  /** 断线/失败原因（仅离线/重连浮层展示，绝不写入终端缓冲以保留断线前画面）；在线为 '' */
+  disconnectReason: string
+  /** 下次自动重连尝试的 epoch 毫秒（浮层倒计时用）；无等待为 null */
+  retryAt: number | null
+  /** 建连成功序号：每次成功自增，TerminalPane 监听后 term.reset() 清空旧画面，
+   *  让全新 PTY 从干净 shell 提示符开始 */
+  resetSeq: number
 }
 
 export const appView = ref<AppView>('home')
@@ -136,6 +143,30 @@ const FRAME_METRICS = 0x06 // 主机动态指标（JSON Metrics，周期推送�
 const FRAME_RTT = 0x07     // 链路 RTT（JSON {"ms": 23}，建连即测 + 30s 周期）
 const FRAME_CWD = 0x08     // Shell 当前工作目录（绝对路径文本，PTY cd 后后端上报）
 const FRAME_ALGO = 0x09    // SSH 协商算法（JSON AlgoInfo，建连时一次，先于 PTY 数据）
+
+/** Exit 帧 payload 解析结果：reason 为展示文本，lost=true 表示连接意外丢失（可自动重连） */
+interface ExitInfo {
+  reason: string
+  lost: boolean
+}
+
+/** 解析 0x02 Exit 帧。新后端 payload 为 JSON {"reason","lost"}；
+ *  兼容旧版纯文本协议：空文本（Eof/Close）视为连接丢失，非空文本（退出状态/信号）视为正常退出 */
+function parseExit(payload: Uint8Array): ExitInfo {
+  const text = textDecoder.decode(payload)
+  if (text.startsWith('{')) {
+    try {
+      const o = JSON.parse(text) as { reason?: unknown; lost?: unknown }
+      return {
+        reason: typeof o.reason === 'string' ? o.reason : '',
+        lost: o.lost === true,
+      }
+    } catch {
+      // 损坏 JSON 按文本规则回退
+    }
+  }
+  return { reason: text, lost: text === '' }
+}
 
 /** 主机静态信息（与后端 metrics::HostInfo 字段对应，snake_case 保紧凑） */
 export interface HostInfoData {
@@ -460,17 +491,31 @@ function handleFrame(id: string, frame: Uint8Array) {
     if (s) s.backendId = undefined
     // 重连途中旧会话的 EXIT：静默收尾，不写关闭提示、不覆盖 reconnecting 状态
     if (s?.state === 'reconnecting') return
+    // 用户手动断开后在途残留的 EXIT：忽略，避免重复提示与误触发自动重连
+    if (manualClosed.has(id)) return
+    const { reason, lost } = parseExit(payload)
+    // 不向终端写任何字节：保留断线瞬间的屏幕快照（含 Vim alt buffer 画面），
+    // 断线信息只进浮层字段
+    if (s) s.retryAt = null
     setSessionState(id, 'offline')
-    const reason = textDecoder.decode(payload)
-    deliver(
-      id,
-      textEncoder.encode(`\r\n\x1b[2m[连接已关闭${reason ? ` · ${reason}` : ''}]\x1b[0m\r\n`),
-    )
+    if (s) {
+      s.disconnectReason = lost
+        ? '连接已中断（远端无响应）'
+        : (reason || '远端会话已结束')
+    }
+    // 仅连接意外丢失（无远端退出状态）时自动重连；用户主动 exit 不重连
+    if (lost) scheduleAutoReconnect(id)
     return
   }
   if (type === FRAME_ERROR) {
+    const msg = textDecoder.decode(payload)
     setSessionState(id, 'offline')
-    deliver(id, textEncoder.encode(`\r\n\x1b[31m[错误] ${textDecoder.decode(payload)}\x1b[0m\r\n`))
+    const s = sessions.value.find(x => x.id === id)
+    if (s) {
+      s.retryAt = null
+      s.disconnectReason = `连接错误：${msg}`
+    }
+    if (!manualClosed.has(id)) scheduleAutoReconnect(id)
   }
 }
 
@@ -534,10 +579,19 @@ async function connectBackend(s: Session, cols: number, rows: number) {
     return
   }
   setSessionState(s.id, s.state === 'reconnecting' ? 'reconnecting' : 'connecting')
+  // 连接代次 +1：本次 invoke 在途期间若用户断开/再次重连，代次会失配
+  const gen = (connectGen.get(s.id) ?? 0) + 1
+  connectGen.set(s.id, gen)
 
-  // 每会话独立 Channel：二进制帧直推，不经过 Emitter/JSON
+  // 每会话独立 Channel：二进制帧直推，不经过 Emitter/JSON。
+  // 代次门：旧连接的 Channel 不会被自动关闭，快速连续重连/取消后旧通道帧
+  // 仍可能到达——非当前代次一律丢弃，防止两条 PTY 流混写同一终端、
+  // 或孤儿输出污染断线快照
   const channel = new Channel<number[] | ArrayBuffer | Uint8Array>()
-  channel.onmessage = raw => handleFrame(s.id, toU8(raw))
+  channel.onmessage = raw => {
+    if (gen !== connectGen.get(s.id)) return
+    handleFrame(s.id, toU8(raw))
+  }
 
   try {
     // 密钥认证：keyPath 存在时跳过密码询问，凭据由一键连接门禁阶段收集并暂存在 host 上
@@ -565,11 +619,33 @@ async function connectBackend(s: Session, cols: number, rows: number) {
       },
       channel,
     })
+    // 代次失配：等待期间用户已断开或发起了更新的连接，本次结果作废。
+    // 后端会话已建立但前端不再需要——主动断开这个孤儿，避免后台泄漏连接
+    if (gen !== connectGen.get(s.id)) {
+      void invoke('disconnect_session', { sessionId: res.sessionId }).catch(() => {})
+      return
+    }
     s.backendId = res.sessionId
+    // 建连成功：清除自动重连计数与手动断开标记（首次连接时本就为空，幂等）
+    reconnectAttemptMap.delete(s.id)
+    manualClosed.delete(s.id)
+    // 全新 PTY：丢弃旧连接残帧、清断线信息，并通知 TerminalPane reset 终端——
+    // 断线前的屏幕快照（含 Vim alt buffer）在此刻才被清掉，进入干净 shell 提示符
+    pendingFrames.delete(s.id)
+    s.disconnectReason = ''
+    s.retryAt = null
+    s.resetSeq++
     setSessionState(s.id, 'online')
   } catch (e) {
-    deliver(s.id, textEncoder.encode(`\r\n\x1b[31m✖ ${String(e)}\x1b[0m\r\n`))
+    // 代次失配：失败已无关当前状态（用户已断开或更新的连接在进行），静默丢弃
+    if (gen !== connectGen.get(s.id)) return
+    // 错误信息只进浮层字段，不写入终端缓冲（保留断线前画面）
+    s.disconnectReason = `连接失败：${String(e)}`
+    s.retryAt = null
     setSessionState(s.id, 'offline')
+    // 处于自动重连流程中（attemptMap 有记录）：失败后按退避策略续试；
+    // 初次连接/手动重连失败不自动续试，等待用户操作
+    if (reconnectAttemptMap.has(s.id)) scheduleAutoReconnect(s.id)
   }
 }
 
@@ -595,10 +671,12 @@ export function detachTerminal(id: string) {
   termSinks.delete(id)
 }
 
-/** 前端键盘原始字节写入 PTY（低频控制消息走 invoke/JSON 无妨） */
+/** 前端键盘原始字节写入 PTY（低频控制消息走 invoke/JSON 无妨）。
+ *  非 online（断线/重连等待/连接中）一律静默丢弃——输入冻结，
+ *  既不下发也不本地回显，终端停留在断线瞬间的静态快照 */
 export function sendInput(id: string, data: string | Uint8Array) {
   const s = sessions.value.find(x => x.id === id)
-  if (!s?.backendId || !isTauri) return
+  if (!s?.backendId || !isTauri || s.state !== 'online') return
   const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
   // Tauri 序列化 Vec<u8> 需要普通数组（Uint8Array 会被 JSON 序列化成对象）
   void invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
@@ -630,8 +708,11 @@ function doResize(id: string, backendId: string, cols: number, rows: number) {
 
 export function resizeTerminal(id: string, cols: number, rows: number) {
   if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return
-  // 先更新响应式尺寸：状态栏显示与是否连上后端无关，xterm fit 了就是这个尺寸
+  // 先更新响应式尺寸：状态栏显示与是否连上后端无关，xterm fit 了就是这个尺寸。
+  // termSizes 同步更新——断线期间顶部状态条占位会触发 fit 缩小行数，
+  // 重连建连必须按最新尺寸申请 PTY，不能沿用挂载时的旧尺寸
   termSizeMap.set(id, { cols, rows })
+  termSizes.set(id, { cols, rows })
 
   const s = sessions.value.find(x => x.id === id)
   // 后端未连上（backendId 缺失）时无需发送：建连本身就会带上当前尺寸
@@ -660,12 +741,125 @@ export function resizeTerminal(id: string, cols: number, rows: number) {
   resizeTimers.set(id, timer)
 }
 
-/** 重连：先断开后端会话，再按已记录的 PTY 尺寸重新连接 */
+/* ============================================================
+ * 断线自动重连（指数退避状态机）
+ *
+ * 单一闸门原则：只有「已建立连接后意外断开」（Exit 帧 lost=true / Error 帧，
+ * 或自动重连尝试本身失败）才会调度。用户手动断开、关闭标签、远端主动 exit、
+ * 初次连接失败、手动重连失败均不触发。
+ *
+ * 互斥：每会话最多一个等待定时器（reconnectTimers），重复入口直接忽略；
+ * reconnectAttemptMap 的存在同时表示「该会话处于自动重连流程」，
+ * connectBackend 失败时据此判断是否续试。
+ * ============================================================ */
+/** 首次重连等待 1s，逐次翻倍，封顶 30s */
+const RECONNECT_BASE_MS = 1000
+const RECONNECT_MAX_MS = 30_000
+
+/** 等待中的重连定时器（存在即互斥，拒绝重复调度） */
+const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+/** 每会话自动重连尝试次数（响应式，供状态栏/侧栏显示"第 N 次"） */
+const reconnectAttemptMap = reactive(new Map<string, number>())
+/** 用户手动断开的会话集合：抑制断开指令发出后在途残留的 EXIT 帧重新触发重连 */
+const manualClosed = new Set<string>()
+/** 连接代次令牌：每次发起/断开连接 +1。在途 invoke 返回后比对代次，
+ *  不匹配说明等待期间用户已断开或发起了更新的连接——成功则关掉孤儿后端会话，
+ *  失败则不碰状态，防止"已取消的连接延迟返回把状态打回 online"竞态 */
+const connectGen = new Map<string, number>()
+
+/** 活动会话当前自动重连尝试次数（0 = 未在自动重连） */
+export const activeReconnectAttempt = computed(
+  () => (activeSessionId.value && reconnectAttemptMap.get(activeSessionId.value)) || 0,
+)
+
+function clearReconnectTimer(id: string) {
+  const t = reconnectTimers.get(id)
+  if (t) {
+    clearTimeout(t)
+    reconnectTimers.delete(id)
+  }
+}
+
+/** 放弃自动重连并清理全部痕迹；markManual 同时登记手动旗标（手动断开场景） */
+function cancelAutoReconnect(id: string, markManual = false) {
+  clearReconnectTimer(id)
+  reconnectAttemptMap.delete(id)
+  if (markManual) manualClosed.add(id)
+}
+
+/** 指数退避：1s、2s、4s…封顶 30s */
+function reconnectDelayMs(attempt: number) {
+  return Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (attempt - 1))
+}
+/** 对外暴露退避时长：重连弹窗的倒计时进度条按该时长做一次收缩动画 */
+export function autoReconnectDelayMs(attempt: number) {
+  return reconnectDelayMs(attempt)
+}
+
+/** 意外断线统一入口：按设置与退避策略调度下一次重连。可安全重复调用（互斥去重） */
+function scheduleAutoReconnect(id: string) {
+  if (!savedSettings.autoReconnect) return
+  if (manualClosed.has(id)) return
+  const s = sessions.value.find(x => x.id === id)
+  if (!s || s.state === 'online') return
+  if (reconnectTimers.has(id)) return // 等待中不重复调度
+
+  const attempt = (reconnectAttemptMap.get(id) ?? 0) + 1
+  const max = Math.max(0, Math.round(savedSettings.autoReconnectMaxAttempts) || 0)
+  if (max > 0 && attempt > max) {
+    reconnectAttemptMap.delete(id)
+    // 超限只更新浮层文案，终端快照保持不动
+    s.retryAt = null
+    s.disconnectReason = `自动重连已停止（连续 ${max} 次失败），可手动重连`
+    setSessionState(id, 'offline')
+    return
+  }
+
+  reconnectAttemptMap.set(id, attempt)
+  s.retryAt = Date.now() + reconnectDelayMs(attempt)
+  if (!s.disconnectReason) s.disconnectReason = '连接已中断'
+  setSessionState(id, 'reconnecting')
+
+  const timer = setTimeout(() => {
+    reconnectTimers.delete(id)
+    const cur = sessions.value.find(x => x.id === id)
+    // 等待期间被用户接管（手动断开/重连/关标签）：放弃本次
+    if (!cur || cur.state !== 'reconnecting' || manualClosed.has(id)) return
+    // 等待期间用户关闭了自动重连开关：回到已断开态，不再续试
+    if (!savedSettings.autoReconnect) {
+      reconnectAttemptMap.delete(id)
+      cur.retryAt = null
+      cur.disconnectReason = '连接已中断（自动重连已关闭）'
+      setSessionState(id, 'offline')
+      return
+    }
+    cur.retryAt = null // 尝试进行中，浮层转"正在重连"
+    void runAutoReconnect(id)
+  }, reconnectDelayMs(attempt))
+  reconnectTimers.set(id, timer)
+}
+
+/** 执行一次自动重连（复用已记录的 PTY 尺寸；失败后续试由 connectBackend catch 驱动） */
+async function runAutoReconnect(id: string) {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s || manualClosed.has(id)) return
+  const size = termSizes.get(id) ?? { cols: 120, rows: 32 }
+  await connectBackend(s, size.cols, size.rows)
+}
+
+/** 重连：先断开后端会话，再按已记录的 PTY 尺寸重新连接。
+ *  终端缓冲不在此时清理——断线快照保留到新 PTY 建连成功（resetSeq 驱动 reset） */
 export async function reconnectBackend(id: string) {
   const s = sessions.value.find(x => x.id === id)
   if (!s) return
+  // 用户手动接管：取消等待中的自动重连（立即执行本次）、清零计数与手动旗标
+  clearReconnectTimer(id)
+  reconnectAttemptMap.delete(id)
+  manualClosed.delete(id)
   // 先置 reconnecting：旧会话断开产生的 EXIT 帧据此静默丢弃，不向终端写关闭提示；
   // 同时清掉旧连接断开期间排队的帧，避免新终端 attach 时补发旧输出
+  s.retryAt = null
+  s.disconnectReason = ''
   setSessionState(id, 'reconnecting')
   pendingFrames.delete(id)
   if (s.backendId && isTauri) {
@@ -697,16 +891,17 @@ export function restoreSessions() {
   const valid = [...new Set(hostIds)].filter(id => hosts.value.some(h => h.id === id))
   if (!valid.length) return
   // 懒连接：仅活跃会话（最后打开的）立即建连，其余恢复为 idle（灰点"空闲"），切 tab 时再连
-  const restored = valid.map(hostId => ({
+  const restored: Session[] = valid.map((hostId, i) => ({
     id: crypto.randomUUID(),
     host: hosts.value.find(h => h.id === hostId)!,
+    state: (i === valid.length - 1 ? 'connecting' : 'idle') as SessionState,
     startedAt: Date.now(),
+    disconnectReason: '',
+    retryAt: null,
+    resetSeq: 0,
   }))
   const activeId = restored[restored.length - 1]!.id
-  sessions.value = restored.map(s => ({
-    ...s,
-    state: (s.id === activeId ? 'connecting' : 'idle') as SessionState,
-  }))
+  sessions.value = restored
   activeSessionId.value = activeId
   appView.value = 'workbench'
 }
@@ -723,7 +918,10 @@ export function openSession(hostId: string) {
     return
   }
   const id = crypto.randomUUID()
-  sessions.value.push({ id, host, state: 'connecting', startedAt: Date.now() })
+  sessions.value.push({
+    id, host, state: 'connecting', startedAt: Date.now(),
+    disconnectReason: '', retryAt: null, resetSeq: 0,
+  })
   activeSessionId.value = id
   persistSessions()
 }
@@ -740,13 +938,16 @@ export function closeSession(id: string) {
   const idx = sessions.value.findIndex(s => s.id === id)
   if (idx === -1) return
   const s = sessions.value[idx]!
-  // 关闭标签 = 断开后端会话（触发取消令牌，后台任务退出）
+  // 关闭标签 = 停止自动重连 + 断开后端会话（触发取消令牌，后台任务退出）
+  cancelAutoReconnect(id)
+  manualClosed.delete(id)
   if (s.backendId && isTauri) {
     void invoke('disconnect_session', { sessionId: s.backendId }).catch(() => {})
   }
   termSinks.delete(id)
   pendingFrames.delete(id)
   termSizes.delete(id)
+  connectGen.delete(id)
   hostInfoMap.delete(id)
   algoMap.delete(id)
   termSizeMap.delete(id)
@@ -771,23 +972,32 @@ export function setSessionState(id: string, state: SessionState) {
 }
 
 /**
- * 断开连接：仅断开后端 SSH 会话，保留标签页与会话记录（区别于 closeSession 关标签）。
+ * 断开连接：仅断开后端 SSH 会话，保留标签页、终端画面与输入冻结态（区别于 closeSession 关标签）。
+ * 同时是自动重连的手动取消入口：等待退避期间（无 backendId）调用也生效。
  * 主动 disconnect 后后端不会再推 EXIT 帧（取消令牌直接终止转发循环），
- * 因此本地同步置 offline 并向终端写入关闭提示，效果与远端 exit 一致；
- * 之后可通过重连（reconnectBackend）恢复。
+ * 因此本地同步置 offline；不向终端写入任何字节，断线画面作为静态快照保留，
+ * 登记手动旗标抑制在途残留 EXIT，之后可通过重连（reconnectBackend）恢复。
+ * 返回 true 表示会话存在且已处理（已在线或处于重连等待）。
  */
 export async function disconnectSession(id: string): Promise<boolean> {
   const s = sessions.value.find(x => x.id === id)
-  if (!s?.backendId || !isTauri) return false
-  const backendId = s.backendId
-  s.backendId = undefined // 立即置空：断开的转发循环残留的 EXIT 帧不会重复处理
-  try {
-    await invoke('disconnect_session', { sessionId: backendId })
-  } catch (e) {
-    console.warn('disconnect_session 失败:', e)
+  if (!s) return false
+  // 登记手动旗标并取消自动重连（含等待中的定时器），任何残留 EXIT 都不会再触发重连
+  cancelAutoReconnect(id, true)
+  // 代次 +1：在途 connect_ssh 即使随后成功/失败也按孤儿处理
+  connectGen.set(id, (connectGen.get(id) ?? 0) + 1)
+  if (s.backendId && isTauri) {
+    const backendId = s.backendId
+    s.backendId = undefined // 立即置空：断开的转发循环残留的 EXIT 帧不会重复处理
+    try {
+      await invoke('disconnect_session', { sessionId: backendId })
+    } catch (e) {
+      console.warn('disconnect_session 失败:', e)
+    }
   }
+  s.retryAt = null
+  s.disconnectReason = '你已断开连接'
   setSessionState(id, 'offline')
-  deliver(id, textEncoder.encode('\r\n\x1b[2m[连接已断开]\x1b[0m\r\n'))
   return true
 }
 
