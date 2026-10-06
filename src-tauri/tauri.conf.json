@@ -17,19 +17,7 @@
   },
   "app": {
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "title": "Rhost",
-        "width": 1200,
-        "height": 760,
-        "minWidth": 940,
-        "minHeight": 600,
-        "resizable": true,
-        "decorations": false,
-        "transparent": true,
-        "fullscreen": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

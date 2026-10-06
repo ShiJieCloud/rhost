@@ -116,6 +116,14 @@
 | 时间回拨 | `app.clock.rollback` | WARN | `系统时间回拨，日志文件切换` offset_ms（见 §6.3 reclock 机制） |
 | 损坏行容错 | `app.log.corrupt_line` | WARN | `日志文件存在损坏行，已跳过` file、line（见 §6.5） |
 | 队列溢出丢弃 | `app.log.dropped` | WARN | `日志队列溢出，已丢弃` dropped=n（与 §9 背压计数配合） |
+| 配置导出成功 | `app.config.export` | INFO | `配置已导出` path（导出目标路径）、scope、sections、bytes、encrypted（是否密码加密）、elapsed_ms |
+| 配置导出失败 | `app.config.export_failed` | WARN | `配置导出失败` stage（read/assemble/encrypt/write）、error |
+| 配置导入开始 | `app.config.import.start` | INFO | `配置导入开始` file_bytes、file_version、scope（仅信息记录，不参与导入逻辑） |
+| 配置导入成功 | `app.config.import.complete` | INFO | `配置导入完成` connections_added、connections_renamed、keys_added、keys_renamed、groups_added、settings_changed、elapsed_ms |
+| 配置导入失败 | `app.config.import.failed` | WARN | `配置导入失败` stage（size/parse/hash/decrypt/version/write）、error（decrypt 阶段为日志细分文案：密码错误 / 文件损坏或格式无效）、source（文件名不含内容）、bytes；stage=parse 时另带 section；stage=decrypt 时另带 reason（`bad_password` 结构合法但 GCM 认证失败 / `corrupted` envelope 结构非法） |
+| 非关键节损坏跳过 | `app.config.import_section_skipped` | WARN | `导入节已跳过` section、error（ui_state/quick_connect_history 容错） |
+| 恢复默认设置 | `app.config.settings_reset` | INFO | `设置已恢复默认` elapsed_ms |
+| 配置写穿被拒绝 | `app.config.write_rejected` | WARN | `配置节写入被拒绝` section、reason（节名非法或 schema 校验失败） |
 
 启动时序约束：
 
@@ -292,7 +300,7 @@ Channel 推送与 invoke 上报均传结构化 JSON，**字段与 §5.1 文件 J
 | 项 | 规则 |
 |---|---|
 | 默认目录 | 平台应用日志目录（`app_log_dir`）：macOS `~/Library/Logs/com.rhost.app/`、Linux `~/.local/share/com.rhost.app/logs/`、Windows `%LOCALAPPDATA%\com.rhost.app\logs\`。与现有 dev 构建 plugin-log 落点一致 |
-| `logStoragePath` | 语义由「会话日志目录」**修正为「应用日志目录」**；留空 = 默认目录；支持 `~` 展开。默认值由 `~/ssh-logs` 改为空串（避免与会话录制目录混淆；旧值非空时保留生效） |
+| `logStoragePath` | 语义由「会话日志目录」**修正为「应用日志目录」**；留空 = 默认目录；支持 `~` 展开。默认值由 `~/ssh-logs` 改为空串（避免与会话录制目录混淆；旧值非空时保留生效）。设置面板输入框留空时以 placeholder 展示本机解析后的默认绝对路径——经 `AppConfigSnapshot.defaultLogDir`（`load_app_config`）由后端唯一来源下发，前端不按平台自行拼接 |
 | 文件名 | 固定模板 `rhost_app_${date}.log`（`logNaming` 已 disabled，不开放自定义）。`${date}` 按切割策略格式化：daily `YYYYMMDD`、weekly `YYYY-Www`（ISO 周）、monthly `YYYYMM`、none 固定 `rhost_app.log` |
 
 ### 6.2 写入策略

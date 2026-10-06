@@ -1,20 +1,34 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { relaunch } from '@tauri-apps/plugin-process'
 import AppLogo from './AppLogo.vue'
 import { toast } from '../composables/useToast'
 import {
-  DEFAULT_SETTINGS, resolveTerminalFontFamily, savedSettings, saveSettings, showSettings,
+  resolveTerminalFontFamily, savedSettings, saveSettings, showSettings,
   type AppSettings,
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
+import { isTauri } from '../lib/tauri'
+import { promptPassword } from '../composables/usePasswordPrompt'
+import { confirmDialog } from '../composables/useConfirm'
+import {
+  exportConfig,
+  getSnapshot,
+  importConfig,
+  isEncryptedConfig,
+  readImportFile,
+  reloadAllAfterImport,
+  resetSettingsConfig,
+} from '../stores/appConfig'
 
 /* =========================================================
    面板定义（数据驱动）
    ========================================================= */
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
-  | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea'
+  | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'exportOptions'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -23,6 +37,8 @@ interface RowDef {
   desc?: string
   keywords?: string
   kind?: CtrlKind
+  /** TODO 标记：该设置仅持久化未接入业务逻辑；值为简短说明，标题旁展示 TODO 徽章 */
+  todo?: string
   /** 选项：数组为静态；函数为动态（如字体安装态标记），渲染时调用并建立响应式依赖 */
   options?: Opt[] | (() => Opt[])
   min?: number
@@ -41,7 +57,13 @@ interface RowDef {
   placeholder?: string
   /** textarea 行数（默认 4） */
   rows?: number
-  actions?: { id: 'export' | 'import' | 'reset' | 'changelog' | 'checkUpdate' | 'openLogDir'; label: string; danger?: boolean }[]
+  actions?: {
+    id:
+      | 'exportFile' | 'importFile'
+      | 'resetSettings'
+      | 'changelog' | 'checkUpdate' | 'openLogDir'
+    label: string
+  }[]
 }
 interface GroupDef {
   label: string
@@ -88,6 +110,8 @@ const FONT_CHOICES = ['JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code',
 /** 字体名 → 是否已安装；面板打开时刷新，期间新装字体重开面板即更新 */
 const fontAvail = reactive<Record<string, boolean>>({})
 async function refreshFontAvail() {
+  // 浏览器 dev 模式无 Tauri IPC：字体安装态不可检测，留空即可（下拉不显示「未安装」）
+  if (!isTauri) return
   try {
     const res = await invoke<Record<string, boolean>>('check_fonts', { names: [...FONT_CHOICES] })
     for (const name of FONT_CHOICES) fontAvail[name] = res[name] === true
@@ -105,10 +129,10 @@ const PANELS: PanelDef[] = [
       {
         label: '界面',
         rows: [
-          { key: 'uiTheme', title: '界面主题', desc: '跟随系统时随系统外观自动切换', kind: 'segmented', keywords: '界面 主题 明暗 深色 浅色 跟随系统',
+          { key: 'uiTheme', title: '界面主题', desc: '跟随系统时随系统外观自动切换', kind: 'segmented', keywords: '界面 主题 明暗 深色 浅色 跟随系统 TODO', todo: '仅持久化，主题切换未生效',
             options: [{ v: 'dark', t: '深色' }, { v: 'light', t: '浅色' }, { v: 'auto', t: '跟随系统' }] },
           { key: 'accent', title: '强调色', desc: '用于按钮、选中态与焦点环', kind: 'color', keywords: '强调色 主题色 accent 颜色' },
-          { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur' },
+          { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur TODO', todo: '仅持久化，未接入窗口透明度' },
         ],
       },
       {
@@ -185,22 +209,22 @@ const PANELS: PanelDef[] = [
         rows: [
           { key: 'sftpChunkKb', title: '传输块大小', desc: '单次读写的数据量；大块吞吐更高，小块进度更细腻、弱网下重试成本更低', kind: 'select', num: true, width: 150, keywords: 'sftp 传输 块 分块 缓冲 chunk 大小 吞吐 速度',
             options: [32, 64, 128, 256, 512, 1024].map(v => ({ v: String(v), t: v >= 1024 ? '1 MB' : `${v} KB${v === 64 ? '（默认）' : ''}` })) },
-          { key: 'sftpOverwritePolicy', title: '文件覆盖策略', desc: '上传或下载时，如果目标位置已存在同名文件，执行对应的处理规则', kind: 'select', width: 230, keywords: 'sftp 覆盖 策略 同名 冲突 overwrite skip 跳过 询问 更新 mtime',
+          { key: 'sftpOverwritePolicy', title: '文件覆盖策略', desc: '上传或下载时，如果目标位置已存在同名文件，执行对应的处理规则', kind: 'select', width: 230, keywords: 'sftp 覆盖 策略 同名 冲突 overwrite skip 跳过 询问 更新 mtime TODO', todo: '后端未消费',
             options: [
               { v: 'newer', t: '仅源文件更新时覆盖（默认）' },
               { v: 'skip', t: '不覆盖，跳过文件' },
               { v: 'overwrite', t: '直接覆盖全部' },
               { v: 'ask', t: '每次冲突询问' },
             ] },
-          { key: 'sftpUploadTemp', title: '上传临时文件机制', desc: '上传先写入临时文件，传输完成后原子重命名，避免远端产生损坏文件', kind: 'switch', keywords: 'sftp 上传 临时文件 原子 重命名 temp atomic rename 损坏' },
-          { key: 'sftpPreserveMeta', title: '保留文件元数据', desc: '传输文件时同步保留文件修改时间与权限属性，备份场景推荐开启；受服务器账号权限限制', kind: 'switch', keywords: 'sftp 元数据 保留 修改时间 权限 preserve mtime chmod 备份' },
+          { key: 'sftpUploadTemp', title: '上传临时文件机制', desc: '上传先写入临时文件，传输完成后原子重命名，避免远端产生损坏文件', kind: 'switch', keywords: 'sftp 上传 临时文件 原子 重命名 temp atomic rename 损坏 TODO', todo: '后端未消费' },
+          { key: 'sftpPreserveMeta', title: '保留文件元数据', desc: '传输文件时同步保留文件修改时间与权限属性，备份场景推荐开启；受服务器账号权限限制', kind: 'switch', keywords: 'sftp 元数据 保留 修改时间 权限 preserve mtime chmod 备份 TODO', todo: '后端未消费' },
         ],
       },
       {
         label: '断点续传',
         rows: [
           { key: 'sftpResume', title: '启用断点续传', desc: '传输中断后再次发起任务，可以从已传输完成位置继续传输，无需从头重传。关闭后所有文件每次都完整从头传输', kind: 'switch', keywords: 'sftp 断点续传 续传 resume 中断 重传 偏移' },
-          { key: 'sftpResumeCheck', title: '断点校验方式', desc: '续传前校验已存在的半截文件，确认未被改动后从偏移位置续传；仅判断能否续传，与传输完成后的完整性校验相互独立', kind: 'select', width: 200, disabledKey: 'sftpResume', keywords: 'sftp 断点 校验 大小 mtime sha256 哈希 续传 半截',
+          { key: 'sftpResumeCheck', title: '断点校验方式', desc: '续传前校验已存在的半截文件，确认未被改动后从偏移位置续传；仅判断能否续传，与传输完成后的完整性校验相互独立', kind: 'select', width: 200, disabledKey: 'sftpResume', keywords: 'sftp 断点 校验 大小 mtime sha256 哈希 续传 半截 TODO', todo: '后端未消费',
             options: [
               { v: 'size', t: '文件大小（推荐）' },
               { v: 'sizeMtime', t: '文件大小 + mtime' },
@@ -211,20 +235,20 @@ const PANELS: PanelDef[] = [
       {
         label: '并发与限速',
         rows: [
-          { key: 'sftpGlobalConcurrency', title: '全局最大并发传输任务', desc: '整个客户端所有主机同时运行的上传与下载任务总数上限，超出上限的任务进入排队', kind: 'number', width: 100, min: 1, max: 20, step: 1, unit: ' 个', keywords: 'sftp 全局 并发 任务 上传 下载 排队 上限' },
-          { key: 'sftpHostConcurrency', title: '单主机最大并发传输任务', desc: '同一台服务器同时运行的上传、下载任务上限，防止单台服务器并发过高导致连接卡顿', kind: 'number', width: 100, min: 1, max: 10, step: 1, unit: ' 个', keywords: 'sftp 单主机 服务器 并发 任务 卡顿 上限' },
-          { key: 'sftpGlobalRateKb', title: '全局带宽限速', desc: '全部传输任务合计的总带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 全局 带宽 限速 速率 限流 总带宽 KB' },
-          { key: 'sftpTaskRateKb', title: '单任务带宽限速', desc: '单个文件传输任务的最大带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 单任务 带宽 限速 速率 限流 KB' },
-          { key: 'sftpRetryCount', title: '失败重试次数', desc: '遇到网络抖动、临时超时等可恢复错误时自动重试的最大次数，达到次数后任务标记失败', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', keywords: 'sftp 失败 重试 次数 网络抖动 超时 错误' },
-          { key: 'sftpRetryIntervalMs', title: '重试间隔', desc: '单次传输失败后等待指定毫秒再发起下一次重试，避免短时间密集请求冲击服务器', kind: 'number', width: 130, min: 0, step: 100, unit: ' ms', keywords: 'sftp 重试 间隔 等待 毫秒 退避 backoff' },
+          { key: 'sftpGlobalConcurrency', title: '全局最大并发传输任务', desc: '整个客户端所有主机同时运行的上传与下载任务总数上限，超出上限的任务进入排队', kind: 'number', width: 100, min: 1, max: 20, step: 1, unit: ' 个', keywords: 'sftp 全局 并发 任务 上传 下载 排队 上限 TODO', todo: '后端未消费' },
+          { key: 'sftpHostConcurrency', title: '单主机最大并发传输任务', desc: '同一台服务器同时运行的上传、下载任务上限，防止单台服务器并发过高导致连接卡顿', kind: 'number', width: 100, min: 1, max: 10, step: 1, unit: ' 个', keywords: 'sftp 单主机 服务器 并发 任务 卡顿 上限 TODO', todo: '后端未消费' },
+          { key: 'sftpGlobalRateKb', title: '全局带宽限速', desc: '全部传输任务合计的总带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 全局 带宽 限速 速率 限流 总带宽 KB TODO', todo: '后端未消费' },
+          { key: 'sftpTaskRateKb', title: '单任务带宽限速', desc: '单个文件传输任务的最大带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 单任务 带宽 限速 速率 限流 KB TODO', todo: '后端未消费' },
+          { key: 'sftpRetryCount', title: '失败重试次数', desc: '遇到网络抖动、临时超时等可恢复错误时自动重试的最大次数，达到次数后任务标记失败', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', keywords: 'sftp 失败 重试 次数 网络抖动 超时 错误 TODO', todo: '后端未消费' },
+          { key: 'sftpRetryIntervalMs', title: '重试间隔', desc: '单次传输失败后等待指定毫秒再发起下一次重试，避免短时间密集请求冲击服务器', kind: 'number', width: 130, min: 0, step: 100, unit: ' ms', keywords: 'sftp 重试 间隔 等待 毫秒 退避 backoff TODO', todo: '后端未消费' },
         ],
       },
       {
         label: '安全与完整性校验',
         rows: [
-          { key: 'sftpIdleTimeoutSec', title: 'SFTP 会话空闲超时', desc: 'SFTP 子通道长时间没有文件操作时自动关闭释放资源，不会断开 SSH 终端会话，后续传输会自动重建通道；填 0 表示不自动关闭', kind: 'number', width: 130, min: 0, step: 10, unit: ' 秒', keywords: 'sftp 会话 空闲 超时 自动关闭 释放 通道 重建' },
-          { key: 'sftpVerifyHash', title: '传输完成后完整性 Hash 校验', desc: '文件完整传输结束后，对整个文件计算 SHA256 哈希做完整性校验，校验失败标记任务异常；开启会增加 CPU 与 IO 开销', kind: 'switch', keywords: 'sftp 完整性 hash sha256 校验 哈希 完成 异常 cpu io' },
-          { key: 'sftpBlacklist', title: '文件黑名单 glob 过滤列表', desc: '上传文件时，文件名匹配黑名单规则将自动跳过，不创建上传任务，一行一条 glob 表达式', kind: 'textarea', placeholder: '例如：*.tmp', keywords: 'sftp 黑名单 过滤 glob 跳过 上传 DS_Store Thumbs.db 排除 ignore' },
+          { key: 'sftpIdleTimeoutSec', title: 'SFTP 会话空闲超时', desc: 'SFTP 子通道长时间没有文件操作时自动关闭释放资源，不会断开 SSH 终端会话，后续传输会自动重建通道；填 0 表示不自动关闭', kind: 'number', width: 130, min: 0, step: 10, unit: ' 秒', keywords: 'sftp 会话 空闲 超时 自动关闭 释放 通道 重建 TODO', todo: '后端未消费' },
+          { key: 'sftpVerifyHash', title: '传输完成后完整性 Hash 校验', desc: '文件完整传输结束后，对整个文件计算 SHA256 哈希做完整性校验，校验失败标记任务异常；开启会增加 CPU 与 IO 开销', kind: 'switch', keywords: 'sftp 完整性 hash sha256 校验 哈希 完成 异常 cpu io TODO', todo: '后端未消费' },
+          { key: 'sftpBlacklist', title: '文件黑名单 glob 过滤列表', desc: '上传文件时，文件名匹配黑名单规则将自动跳过，不创建上传任务，一行一条 glob 表达式', kind: 'textarea', placeholder: '例如：*.tmp', keywords: 'sftp 黑名单 过滤 glob 跳过 上传 DS_Store Thumbs.db 排除 ignore TODO', todo: '前后端均未消费' },
         ],
       },
       {
@@ -252,7 +276,7 @@ const PANELS: PanelDef[] = [
         label: '持久化',
         rows: [
           { key: 'logPersist', title: '开启持久化', desc: '关闭后日志仅存在于内存，退出即丢失', kind: 'switch', keywords: '日志 磁盘 写入 落盘 持久化 开启 文件' },
-          { key: 'logStoragePath', title: '存储路径', desc: '应用日志文件的存放目录，留空使用默认目录；修改后需重启应用生效', kind: 'text', width: 260, placeholder: '留空使用默认目录', disabledKey: 'logPersist', keywords: '日志 存储 路径 目录 位置 文件' },
+          { key: 'logStoragePath', title: '存储路径', desc: '应用日志文件的存放目录，留空使用平台默认目录；修改后需重启应用生效', kind: 'text', width: 260, placeholder: '留空使用平台默认目录', disabledKey: 'logPersist', keywords: '日志 存储 路径 目录 位置 文件' },
           { key: 'logNaming', title: '文件命名模板', desc: '日志文件名固定使用该模板，${date} 按切割策略格式化为日期（如 rhost_app_20260102.log），暂不支持自定义', kind: 'text', width: 260, placeholder: 'rhost_app_${date}.log', disabled: true, keywords: '日志 命名 文件名 模板 策略 日期' },
           { key: 'logRotate', title: '切割策略', desc: '按时间切割日志文件，各自独立成文件；不切割则所有日志写入单个文件', kind: 'select', width: 160, disabledKey: 'logPersist', keywords: '日志 切割 轮转 滚动 按天 按周 按月 rotate',
             options: [{ v: 'daily', t: '按天' }, { v: 'weekly', t: '按周' }, { v: 'monthly', t: '按月' }, { v: 'none', t: '不切割' }] },
@@ -272,19 +296,19 @@ const PANELS: PanelDef[] = [
       {
         label: '会话',
         rows: [
-          { key: 'key.newTab', title: '新建标签页', kind: 'keys', keywords: '新建 标签页 new tab 快捷键' },
-          { key: 'key.closeTab', title: '关闭标签页', kind: 'keys', keywords: '关闭 标签页 close tab 快捷键' },
-          { key: 'key.splitV', title: '垂直分屏', kind: 'keys', keywords: '分屏 垂直 split 快捷键' },
-          { key: 'key.splitH', title: '水平分屏', kind: 'keys', keywords: '水平 分屏 split 快捷键' },
+          { key: 'key.newTab', title: '新建标签页', kind: 'keys', keywords: '新建 标签页 new tab 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.closeTab', title: '关闭标签页', kind: 'keys', keywords: '关闭 标签页 close tab 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.splitV', title: '垂直分屏', kind: 'keys', keywords: '分屏 垂直 split 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.splitH', title: '水平分屏', kind: 'keys', keywords: '水平 分屏 split 快捷键 TODO', todo: '未绑定键盘事件' },
         ],
       },
       {
         label: '操作',
         rows: [
-          { key: 'key.clear', title: '清空屏幕', kind: 'keys', keywords: '清空 屏幕 clear 快捷键' },
-          { key: 'key.palette', title: '命令面板', kind: 'keys', keywords: '命令 面板 command palette 快捷键' },
-          { key: 'key.find', title: '查找', kind: 'keys', keywords: '搜索 查找 find 快捷键' },
-          { key: 'key.settings', title: '打开设置', kind: 'keys', keywords: '设置 偏好 preferences 快捷键' },
+          { key: 'key.clear', title: '清空屏幕', kind: 'keys', keywords: '清空 屏幕 clear 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.palette', title: '命令面板', kind: 'keys', keywords: '命令 面板 command palette 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.find', title: '查找', kind: 'keys', keywords: '搜索 查找 find 快捷键 TODO', todo: '未绑定键盘事件' },
+          { key: 'key.settings', title: '打开设置', kind: 'keys', keywords: '设置 偏好 preferences 快捷键 TODO', todo: '未绑定键盘事件' },
         ],
       },
     ],
@@ -318,20 +342,21 @@ const PANELS: PanelDef[] = [
       {
         label: '渲染',
         rows: [
-          { key: 'gpuAccel', title: 'GPU 加速', desc: '关闭后使用软件渲染，可解决花屏问题', kind: 'switch', keywords: 'gpu 加速 硬件 渲染 acceleration 性能' },
-          { key: 'renderer', title: '渲染后端', kind: 'select', width: 140, keywords: '渲染器 后端 renderer webgl webgpu',
+          { key: 'gpuAccel', title: 'GPU 加速', desc: '关闭后使用软件渲染，可解决花屏问题', kind: 'switch', keywords: 'gpu 加速 硬件 渲染 acceleration 性能 TODO', todo: '仅持久化，渲染层未消费' },
+          { key: 'renderer', title: '渲染后端', kind: 'select', width: 140, keywords: '渲染器 后端 renderer webgl webgpu TODO', todo: '仅持久化，渲染层未消费',
             options: [{ v: 'auto', t: '自动' }, { v: 'webgl', t: 'WebGL' }, { v: 'webgpu', t: 'WebGPU' }, { v: 'canvas', t: 'Canvas' }] },
-          { key: 'fps', title: '动画帧率', desc: '降低可减少电量消耗', kind: 'segmented', keywords: '刷新率 帧率 fps 动画 性能',
-            options: [{ v: '30', t: '30' }, { v: '60', t: '60' }, { v: '120', t: '120' }] },
         ],
       },
       {
         label: '配置文件',
         rows: [
-          { title: '导入 / 导出', desc: '将当前设置导出为 JSON，或从剪贴板恢复', kind: 'buttons', keywords: '导入 导出 配置 备份 config 文件',
-            actions: [{ id: 'export', label: '导出' }, { id: 'import', label: '导入' }] },
-          { title: '恢复默认设置', desc: '将所有选项还原为初始值，此操作不可撤销', kind: 'buttons', keywords: '重置 恢复 默认 reset 全部',
-            actions: [{ id: 'reset', label: '恢复默认', danger: true }] },
+          { title: '导出范围', desc: '全量配置包含主机、密钥、分组、设置、界面布局与快速连接历史；所有导出文件均以密码加密（AES-256-GCM），导入时需输入同一密码，导入成功后需重启应用生效', kind: 'exportOptions', keywords: '导出 范围 加密 密码 界面 历史 全量 scope aes' },
+          { title: '导出到文件', desc: '按上方范围组装并以密码加密写入 JSON 文件（密钥不包含私钥内容）', kind: 'buttons', keywords: '导出 文件 export json 加密 密码 备份',
+            actions: [{ id: 'exportFile', label: '导出…' }] },
+          { title: '从文件恢复', desc: '选择此前导出的 JSON 配置文件，按节合并进当前配置；重名主机与密钥自动改名，不会删除本地现有数据；导入成功后需重启应用', kind: 'buttons', keywords: '导入 恢复 文件 import json 合并 重启',
+            actions: [{ id: 'importFile', label: '导入…' }] },
+          { title: '恢复默认设置', desc: '仅将设置项还原为初始值，不影响主机、密钥与分组', kind: 'buttons', keywords: '重置 恢复 默认 reset 设置',
+            actions: [{ id: 'resetSettings', label: '恢复默认设置' }] },
         ],
       },
     ],
@@ -343,8 +368,8 @@ const PANELS: PanelDef[] = [
       {
         label: '更新',
         rows: [
-          { key: 'autoUpdate', title: '自动检查更新', desc: '启动时在后台检查新版本', kind: 'switch', keywords: '自动更新 检查 update 升级' },
-          { key: 'updateChannel', title: '更新通道', kind: 'select', width: 140, keywords: '更新通道 beta 稳定 stable channel',
+          { key: 'autoUpdate', title: '自动检查更新', desc: '启动时在后台检查新版本', kind: 'switch', keywords: '自动更新 检查 update 升级 TODO', todo: '仅持久化，无更新检查逻辑' },
+          { key: 'updateChannel', title: '更新通道', kind: 'select', width: 140, keywords: '更新通道 beta 稳定 stable channel TODO', todo: '仅持久化，无更新通道逻辑',
             options: [{ v: 'stable', t: '稳定版' }, { v: 'beta', t: '测试版' }, { v: 'nightly', t: '每日构建' }] },
         ],
       },
@@ -450,6 +475,11 @@ function rowDisabled(r: RowDef, excludeKey?: keyof AppSettings): boolean {
   const keys = (Array.isArray(r.disabledKey) ? r.disabledKey : [r.disabledKey])
     .filter(k => k !== excludeKey)
   return keys.some(k => !boolVal(k))
+}
+/** 文本行 placeholder：日志存储路径留空时展示后端下发的平台默认目录 */
+function rowPlaceholder(r: RowDef): string | undefined {
+  if (r.key === 'logStoragePath') return getSnapshot()?.defaultLogDir || r.placeholder
+  return r.placeholder
 }
 function resetOne(key: keyof AppSettings) {
   setVal(key, JSON.parse(JSON.stringify(savedSettings[key])))
@@ -591,7 +621,7 @@ function onKey(e: KeyboardEvent) {
 onMounted(() => document.addEventListener('keydown', onKey))
 onUnmounted(() => document.removeEventListener('keydown', onKey))
 
-/* ---- 保存 / 放弃 / 恢复默认 ---- */
+/* ---- 保存 / 放弃 ---- */
 function save() {
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
@@ -607,32 +637,173 @@ function discard() {
   Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
   toast('已放弃未保存的更改', 'info', 1600)
 }
-function resetAll() {
-  Object.assign(draft, JSON.parse(JSON.stringify(DEFAULT_SETTINGS)))
-  toast('已恢复默认设置，保存后生效', 'info', 2000)
+/* ---- 配置文件：导入 / 导出 / 重置（§7） ---- */
+
+/** 导出范围（「导出到文件」使用）。
+ *  导出固定包含全部可选节且固定密码加密（§5.1），无勾选开关。 */
+const exportScope = ref<'full' | 'hosts' | 'ui'>('full')
+/** 加密密码最小长度（后端仅拒绝空密码，前端二次把关强度） */
+const EXPORT_PW_MIN = 6
+/** 配置文件操作进行中（禁用按钮防重复触发） */
+const cfgBusy = ref(false)
+
+function timeStamp() {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 
-/* ---- 导入 / 导出 ---- */
-async function exportCfg() {
-  const data = JSON.stringify(draft, null, 2)
+function jsonFilter() {
+  return [{ name: 'JSON 配置文件', extensions: ['json'] }]
+}
+
+function ensureDesktop(): boolean {
+  if (!isTauri) {
+    toast('配置文件功能请在桌面端使用', 'info', 2200)
+    return false
+  }
+  return true
+}
+
+/** 导入/重置后把后端最新值同步进编辑草稿（savedSettings 已由 hydrate 刷新） */
+function syncDraftFromSaved() {
+  Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
+}
+
+/**
+ * 加密导出密码输入：两次确认，至少 6 位。
+ * 用户取消任一次 → 返回 null（调用方中止导出）。
+ */
+async function askExportPassword(): Promise<string | null> {
+  const pw = await promptPassword(
+    '该密码仅用于此文件加密，丢失后无法恢复',
+    '导出配置',
+    `设置加密密码（至少 ${EXPORT_PW_MIN} 位）`,
+  )
+  if (pw === null) return null
+  if (pw.length < EXPORT_PW_MIN) {
+    toast(`密码至少 ${EXPORT_PW_MIN} 位`, 'err', 2600)
+    return null
+  }
+  const again = await promptPassword('请再次输入密码', '确认密码', '再次输入密码')
+  if (again === null) return null
+  if (pw !== again) {
+    toast('两次输入的密码不一致', 'err', 2600)
+    return null
+  }
+  return pw
+}
+
+async function onExportFile() {
+  if (!ensureDesktop() || cfgBusy.value) return
+  // 导出固定加密：必须设置密码（两次确认）
+  const password = await askExportPassword()
+  if (password === null) return
+  const path = await saveDialog({
+    title: '导出加密配置',
+    defaultPath: `rhost_config_${timeStamp()}.json`,
+    filters: jsonFilter(),
+  })
+  if (!path) return
+  cfgBusy.value = true
   try {
-    await navigator.clipboard.writeText(data)
-    toast('配置已复制到剪贴板', 'ok', 2000)
-  } catch {
-    toast('导出失败，请检查权限', 'err', 2200)
+    const abs = await exportConfig(path, exportScope.value, true, true, password)
+    toast(`加密配置已导出：${abs}`, 'ok', 3200)
+  } catch (e) {
+    toast(`导出失败：${e}`, 'err', 3500)
+  } finally {
+    cfgBusy.value = false
   }
 }
-function importCfg() {
-  // TODO: 接入文件选择与配置校验
-  toast('导入功能开发中', 'info')
+
+async function onImportFile() {
+  if (!ensureDesktop() || cfgBusy.value) return
+  const selected = await open({
+    title: '选择要导入的配置文件',
+    multiple: false,
+    filters: jsonFilter(),
+  })
+  if (!selected || typeof selected !== 'string') return
+  cfgBusy.value = true
+  try {
+    const file = await readImportFile(selected)
+    let password: string | undefined
+    if (isEncryptedConfig(file.text)) {
+      const pw = await promptPassword(
+        '请输入导出时设置的密码',
+        '导入配置',
+        '输入密码',
+      )
+      if (pw === null) return
+      password = pw
+    }
+    const s = await importConfig(file.text, file.fileName, password)
+    await reloadAllAfterImport()
+    syncDraftFromSaved()
+    toast(
+      `导入完成：新增主机 ${s.connectionsAdded}（重名改名 ${s.connectionsRenamed}）、新增密钥 ${s.keysAdded}、新增分组 ${s.groupsAdded}、变更设置 ${s.settingsChanged} 项`,
+      'ok',
+      3000,
+    )
+    // 任何范围的配置导入成功后都要求立即重启（主机列表虽热刷新，设置/界面等节需重启完全生效）
+    const restart = await confirmDialog(
+      '配置已导入，重启应用后完全生效。\n是否立即重启？',
+      '导入完成',
+      { confirmText: '立即重启', cancelText: '稍后' },
+    )
+    if (restart) {
+      try {
+        await relaunch()
+      } catch (e) {
+        toast(`重启失败：${e}`, 'err', 3000)
+      }
+    }
+  } catch (e) {
+    toast(`导入失败：${e}`, 'err', 4500)
+  } finally {
+    cfgBusy.value = false
+  }
 }
-function onAction(id: string) {
-  if (id === 'export') exportCfg()
-  else if (id === 'import') importCfg()
-  else if (id === 'reset') resetAll()
-  else if (id === 'checkUpdate') toast('当前已是最新版本', 'ok', 1800)
-  else if (id === 'changelog') toast('更新日志开发中', 'info')
-  else if (id === 'openLogDir') void openLogDir()
+
+async function onResetSettings() {
+  if (!ensureDesktop() || cfgBusy.value) return
+  cfgBusy.value = true
+  try {
+    await resetSettingsConfig()
+    await reloadAllAfterImport()
+    syncDraftFromSaved()
+    syncLogConfig()
+    toast('设置项已恢复为默认值', 'ok', 2400)
+  } catch (e) {
+    toast(`恢复失败：${e}`, 'err', 3000)
+  } finally {
+    cfgBusy.value = false
+  }
+}
+
+async function onAction(id: string) {
+  switch (id) {
+    case 'exportFile':
+      void onExportFile()
+      break
+    case 'importFile':
+      void onImportFile()
+      break
+    case 'resetSettings':
+      void onResetSettings()
+      break
+    case 'checkUpdate':
+      // TODO: 未实现 — 当前为假实现，需接入真实的更新检查后端
+      toast('当前已是最新版本', 'ok', 1800)
+      break
+    case 'changelog':
+      // TODO: 未实现 — 当前为假实现，需接入真实的更新日志视图
+      toast('更新日志开发中', 'info')
+      break
+    case 'openLogDir':
+      void openLogDir()
+      break
+  }
 }
 
 /**
@@ -749,8 +920,12 @@ function optionList(r: RowDef): Opt[] {
                 </div>
               </div>
               <div v-if="p.about" class="st-link-row">
-                <button class="btn" @click="onAction('changelog')">查看更新日志</button>
-                <button class="btn" @click="onAction('checkUpdate')">检查更新</button>
+                <button class="btn" title="TODO: 未实现 — 更新日志视图开发中" @click="onAction('changelog')">
+                  查看更新日志 <span class="st-todo">TODO</span>
+                </button>
+                <button class="btn" title="TODO: 未实现 — 未接入真实更新检查" @click="onAction('checkUpdate')">
+                  检查更新 <span class="st-todo">TODO</span>
+                </button>
               </div>
             </template>
             <div v-else class="st-search-label">{{ p.label }}</div>
@@ -772,6 +947,7 @@ function optionList(r: RowDef): Opt[] {
                   <div class="st-row-main">
                     <div class="st-row-title" :class="{ 'has-tail-switch': !!r.switchKey }">
                       {{ r.title }}
+                      <span v-if="r.todo" class="st-todo" :title="`TODO: ${r.todo}`">TODO</span>
                       <button
                         v-if="r.key"
                         class="st-reset"
@@ -872,7 +1048,7 @@ function optionList(r: RowDef): Opt[] {
                       type="text"
                       :style="{ width: (r.width ?? 200) + 'px' }"
                       :value="strVal(r.key)"
-                      :placeholder="r.placeholder"
+                      :placeholder="rowPlaceholder(r)"
                       :disabled="rowDisabled(r)"
                       spellcheck="false"
                       autocomplete="off"
@@ -942,13 +1118,26 @@ function optionList(r: RowDef): Opt[] {
                       </template>
                     </div>
 
+                    <!-- 导出范围（勾选框已移除：固定包含全部可选节、固定密码加密） -->
+                    <div v-else-if="r.kind === 'exportOptions'" class="st-export-opts">
+                      <select
+                        class="st-select"
+                        style="width: 260px"
+                        v-model="exportScope"
+                      >
+                        <option value="full">全量配置（主机 / 密钥 / 分组 / 设置 / 界面 / 历史）</option>
+                        <option value="hosts">仅主机与分组</option>
+                        <option value="ui">仅界面偏好</option>
+                      </select>
+                    </div>
+
                     <!-- 按钮组 -->
                     <template v-else-if="r.kind === 'buttons'">
                       <button
                         v-for="a in r.actions"
                         :key="a.id"
                         class="btn"
-                        :class="{ danger: a.danger }"
+                        :disabled="cfgBusy"
                         @click="onAction(a.id)"
                       >{{ a.label }}</button>
                     </template>

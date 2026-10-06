@@ -2485,6 +2485,15 @@ body{
 }
 .st-reset:hover{background:rgba(229,181,103,.26);transform:rotate(-40deg)}
 .st-row.modified .st-reset{display:grid}
+/* TODO 徽章：标记仅持久化未接入业务的设置项 */
+.st-todo{
+    flex:none;padding:1px 5px;border-radius:4px;
+    background:rgba(247,118,142,.14);
+    color:var(--red);
+    font-size:9px;font-weight:700;letter-spacing:.4px;line-height:1.4;
+    border:1px solid rgba(247,118,142,.28);
+    cursor:help;user-select:none;
+}
 /* 开关 */
 .st-switch{
     position:relative;flex:none;
@@ -2699,7 +2708,7 @@ body{
     margin-top:6px;line-height:1.55;
 }
 .st-link-row{display:flex;gap:8px;margin-top:12px;margin-bottom:22px}
-/* 恢复默认危险按钮 */
+/* 危险按钮（如密钥删除确认） */
 .btn.danger{
     color:var(--red);
     border-color:rgba(247,118,142,.28);
@@ -2707,6 +2716,12 @@ body{
 .btn.danger:hover{
     background:rgba(247,118,142,.08);
     border-color:rgba(247,118,142,.5);
+}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+/* 导出范围行 */
+.st-export-opts{
+    display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;
+    justify-content:flex-end;
 }
 /* 搜索空态 */
 .st-empty{padding:64px 20px;text-align:center}

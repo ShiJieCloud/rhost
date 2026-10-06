@@ -12,7 +12,7 @@
 
 ### 非目标
 - 不做真实启动进度反馈。Splash 阶段（HTML 首帧 → Vue ready）拿不到任何真实事件流，呼吸动画是"存活信号"而非进度，**不伪造进度**（设计原则：宁可模糊，不可撒谎）。
-- 不跟随用户自定义强调色（`applyAccent` 注入的 `--accent-rgb`）。冷启动时 localStorage / 后端配置尚未加载，splash 固定使用默认主题色 `#3ddc84` 字面量（splash 渲染时 `style.css` 尚未加载，`:root` 变量不存在，无法引用 `var(--green)`）。
+- 不跟随用户自定义强调色（`applyAccent` 注入的 `--accent-rgb`）。冷启动时应用 CSS/后端快照尚未加载，splash 固定使用默认主题色 `#3ddc84` 字面量（splash 渲染时 `style.css` 尚未加载，`:root` 变量不存在，无法引用 `var(--green)`）。
 - 不做恢复会话等业务的等待动画。`loadHosts` + `restoreSessions` 为本地毫秒级操作，无需分阶段展示。
 
 ## 2. 改造前的问题
@@ -92,7 +92,7 @@ Splash DOM 放在 `#app` **外部**（Vue `mount('#app')` 不会触碰它），`
 | 光晕实现 | 用独立 `radial-gradient` 层动 `opacity`，**不用 `drop-shadow` 滤镜动画** —— 后者逐帧触发 SVG filter 重绘，前者仅合成层透明度变化 |
 | 布局 | 垂直居中偏上：偏移施加在 **LOGO 自身**（`translateY(-4vh)`，keyframes 两帧均需携带）。**禁止**施加在 `#splash` 容器上 —— 容器随 `inset:0` 上移会在底部露出 4vh 缝隙，状态栏等底层 UI 穿透（实测缺陷） |
 | 层级 | `z-index: 99999`，高于应用内所有浮层（ContextMenu 9999 等），splash 期间不允许任何主界面元素穿透 |
-| 背景与主界面 | 双模式（设置 `splashTransparent`，重启生效）：**透明**（默认）= 原生窗口 `transparent` + `html/body` 全透明，LOGO 悬浮桌面；**深色** = `<head>` 内联脚本首帧前读 localStorage 给 `<html>` 加 `splash-solid` 类（`background:#06090d`，特异度覆盖透明规则），LOGO 悬浮深色底。两种模式下主界面均以 `.splash-active #app{visibility:hidden}` 隐藏，`__hideSplash` 首行同时移除两个类 —— 主界面显现与 LOGO 淡出同步 |
+| 背景与主界面 | 双模式（设置 `splashTransparent`，重启生效）：**透明**（默认）= 原生窗口 `transparent` + `html/body` 全透明，LOGO 悬浮桌面；**深色** = Rust 创建主窗口时经 `initialization_script` 注入 `window.__RHOST_BOOT__`（首帧前、任何页面脚本之前；数据源为 app_config.json 的 settings 节），`<head>` 内联脚本据此给 `<html>` 加 `splash-solid` 类（`background:#06090d`，特异度覆盖透明规则），LOGO 悬浮深色底。**禁止改走异步 IPC 或 localStorage**（前者首帧读不到导致透明/深色闪烁；localStorage 已下线为配置通道，旧版本残留值不会随设置更新，曾导致开关失效）。两种模式下主界面均以 `.splash-active #app{visibility:hidden}` 隐藏，`__hideSplash` 首行同时移除两个类 —— 主界面显现与 LOGO 淡出同步 |
 
 取舍说明：早期方案的打字机文字与底部不定进度条**未采用** —— 呼吸 LOGO 已传达"正在启动且存活"，打字机与进度条会与呼吸主体争夺视觉焦点，且打字机文本属装饰性伪语义。
 
@@ -131,17 +131,20 @@ Splash DOM 放在 `#app` **外部**（Vue `mount('#app')` 不会触碰它），`
 T0   窗口显示（默认原生窗口透明、LOGO 悬浮桌面；关闭透明设置时为 #06090d 深色底）
 T0+~30ms   HTML 首帧：splash 完整可见，LOGO 呼吸开始
 T1    JS bundle 就绪，Vue mount
-T2    onMounted: initGlobalErrorReporting / syncLogConfig 同步完成，
-      loadHosts / restoreSessions 记为 pending promise
-T3    Promise.race([
-        Promise.all([minDelay(splashDurationMs), loadHosts, restoreSessions]),
-        3s 硬超时
+T2    onMounted: initGlobalErrorReporting → await loadAppConfig() hydrate 各 store
+      （此步完成后 savedSettings.splashDurationMs 才是用户设置值，时长必须在此之后读取）
+T2'   minDelay(splashDurationMs) 开始计时；syncLogConfig / loadHosts /
+      restoreSessions 记为 pending promise
+T3    Promise.all([
+        minDelay(splashDurationMs),
+        Promise.race([loadHosts/restoreSessions 等启动任务, 3s 硬超时])
       ]) 完成 → document.getElementById('splash').classList.add('splash--done')
 T3+300ms   splash.remove()，交出交互权
 ```
 
 参数约定：
-- **最短展示时长**：外观设置项 `splashDurationMs`（范围 200~5000ms，步进 100，默认 400；消费侧用 `Math.min/Math.max` 夹取防手改 localStorage，重启生效），`minDelay` 起点为 App.vue `onMounted` 最早可执行时刻。生产构建若快于此值则补齐，避免"闪一下"的廉价感；dev 模式下 vite 编译较慢，通常自然超过。
+- **最短展示时长**：外观设置项 `splashDurationMs`（范围 200~5000ms，步进 100，默认 400；消费侧用 `Math.min/Math.max` 夹取防手改配置文件越界，重启生效）。**取值时序红线**：时长只能在 `await loadAppConfig()` 完成后读取——配置快照在此之前尚未 hydrate，模块同步阶段/`onMounted` 首个 await 之前求值会恒为默认 400ms，用户设置静默失效（曾发缺陷）。`minDelay` 起点为 hydrate 完成时刻（本地 IPC 仅数十 ms，对起点影响可忽略）。生产构建若快于此值则补齐，避免"闪一下"的廉价感；dev 模式下 vite 编译较慢，通常自然超过。
+- **3s 硬超时只兜底启动任务**（loadHosts / restoreSessions 等挂起时放行），**不截断用户配置的最短展示时长**——`race` 仅包住任务 promise，minDelay 在 race 之外 `Promise.all` 等待，保证 4000/5000ms 等设置完整兑现。
 - **淡出 250ms**，`opacity 1→0` + `ease-out`；不缩放不位移，主界面在 splash 之下自然透出，即"渐显交接"。
 - 主界面**不设入场隐藏**（不做 `.app{opacity:0}`）：若 JS 中途失败，主界面永远不可见的风险不可接受；淡出覆盖已足够优雅。
 
@@ -171,12 +174,14 @@ LOGO 直接内联 [AppLogo.vue](../frontend/src/components/AppLogo.vue) 的 SVG�
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Rhost</title>
     <script>
-      // 启动画面背景模式：首帧前同步读取设置（rhost.settings，splashTransparent 默认开启）。
-      // 关闭透明时给 html 加 splash-solid（深色底），置于 head 保证零闪烁
+      // 启动画面背景模式：Rust 创建主窗口时经 initialization_script 在页面任何脚本
+      // 之前注入 window.__RHOST_BOOT__（读 app_config.json 的 settings.splashTransparent，
+      // 见 src-tauri/src/lib.rs）。关闭透明时给 html 加 splash-solid（深色底），置于 head
+      // 保证零闪烁；纯浏览器 dev 访问（无注入）默认透明。
       try {
-        if (JSON.parse(localStorage.getItem('rhost.settings') || '{}').splashTransparent === false) {
-          document.documentElement.classList.add('splash-solid')
-        }
+        var boot = window.__RHOST_BOOT__
+        var transparent = !(boot && boot.splashTransparent === false)
+        if (!transparent) document.documentElement.classList.add('splash-solid')
       } catch (e) {}
     </script>
     <style>
@@ -264,38 +269,48 @@ createApp(App).mount('#app')
 
 ### 7.3 App.vue（真实交接时机）
 
-`onMounted` 为"最短时长（用户可调）+ 启动任务"竞速：
+`onMounted` 为"最短时长（用户可调，须在配置 hydrate 后读取）+ 启动任务"竞速：
 
 ```ts
-// 设置项 splashDurationMs（200~5000，消费侧夹取防手改 localStorage）
-const MIN_SPLASH_MS = Math.min(5000, Math.max(200, Number(savedSettings.splashDurationMs) || 400))
+// 设置项 splashDurationMs（200~5000，消费侧夹取防手改配置文件越界）
+const clamp = (v: unknown) => Math.min(5000, Math.max(200, Number(v) || 400))
 
 onMounted(async () => {
-  const minDelay = new Promise(r => setTimeout(r, MIN_SPLASH_MS))
-  const boot = (async () => {
-    initGlobalErrorReporting()
+  initGlobalErrorReporting()
+  try { await loadAppConfig() } catch (e) { /* 内置默认值兜底 */ }
+  // hydrate 完成后才读用户时长；在此之前求值恒为默认 400
+  const minDelay = new Promise(r => setTimeout(r, clamp(savedSettings.splashDurationMs)))
+  const restBoot = (async () => {
     syncLogConfig()
     await loadHosts()
     restoreSessions()
   })()
-  // boot 挂起不阻塞交接：3s 后放行（业务容错自理，见 §6）
-  await Promise.race([Promise.all([minDelay, boot]), new Promise(r => setTimeout(r, 3000))])
+  // 3s race 只兜底启动任务，不截断 minDelay
+  await Promise.all([
+    minDelay,
+    Promise.race([restBoot, new Promise(r => setTimeout(r, 3000))]),
+  ])
   ;(window as any).__hideSplash?.()
 })
 ```
 
-### 7.4 tauri.conf.json
+### 7.4 窗口创建与首帧注入（tauri.conf.json + lib.rs）
 
-```json
-{
-  "app": {
-    "macOSPrivateApi": true,
-    "windows": [{ ..., "transparent": true }]
-  }
-}
+`tauri.conf.json` 的 `windows` 留空，主窗口在 `setup` 中以 `WebviewWindowBuilder` 创建——属性与原静态窗口一致（label `"main"`、1200×760 / 最小 940×600、`decorations:false`、`transparent:true`），并在页面任何脚本执行前注入启动设置：
+
+```rust
+let splash_transparent = app_cfg
+    .settings.get("splashTransparent").and_then(|v| v.as_bool()).unwrap_or(true);
+let boot_script = format!("window.__RHOST_BOOT__={};",
+    serde_json::json!({ "splashTransparent": splash_transparent }));
+
+WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    /* …尺寸 / 无边框 / 透明… */
+    .initialization_script(&boot_script)
+    .build()?;
 ```
 
-原生窗口启用透明（`macOSPrivateApi` 为 macOS WKWebView 透明的必要开关），配合 `html/body{background:transparent}` 与 `.splash-active body{background:transparent}`，splash 存活期窗口完全透明、LOGO 悬浮于桌面之上；撤除时 `splash-active` 移除，`style.css` 的 body 深色底恢复，与 LOGO 淡出同步。两点观感代价：撤除瞬间存在"桌面 → 深色主界面"的一次跳变；浅色桌面上绿描边 LOGO 对比度下降。不接受该代价的用户可在外观设置关闭透明，走 `splash-solid` 深色底模式。
+`macOSPrivateApi: true` 为 macOS WKWebView 透明的必要开关，配合 `html/body{background:transparent}` 与 `.splash-active body{background:transparent}`，splash 存活期窗口完全透明、LOGO 悬浮于桌面之上；撤除时 `splash-active` 移除，`style.css` 的 body 深色底恢复，与 LOGO 淡出同步。两点观感代价：撤除瞬间存在"桌面 → 深色主界面"的一次跳变；浅色桌面上绿描边 LOGO 对比度下降。不接受该代价的用户可在外观设置关闭透明，走 `splash-solid` 深色底模式。
 
 ## 8. 验收标准
 
@@ -306,7 +321,7 @@ onMounted(async () => {
 5. `prefers-reduced-motion: reduce` 下呼吸停止、光晕定格中间值，淡出正常。
 6. dev（vite）与 build 两种模式行为一致。
 7. 无新增 npm 依赖；`vue-tsc -b` 零错误；现有前后端测试不回归。
-8. 外观设置中「启动动画时长」（200~5000ms，步进 100）与「启动动画透明背景」开关均可正常保存，修改后重启生效；手改 localStorage 越界值被消费侧夹取到合法范围。
+8. 外观设置中「启动动画时长」（200~5000ms，步进 100）与「启动动画透明背景」开关均可正常保存（app_config.json settings 节），修改后重启生效；开关两种状态冷启动首帧即正确背景（注入脚本 DevTools 中可见 `window.__RHOST_BOOT__`），手改配置文件越界时长被消费侧夹取到合法范围。
 
 ## 9. 后续可选增强
 

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::ssh::sftp::TransferProgress;
 use crate::ssh::session::connect_and_auth;
@@ -14,6 +14,7 @@ use crate::store::{self, StoredHost};
 
 use russh::Disconnect;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /* =========================================================
  *  慢 IPC 调用统计（§4.4：ipc.slow_call，阈值 2000ms，只告警不阻断）
@@ -537,16 +538,30 @@ pub async fn load_connections(app: AppHandle) -> Result<Vec<StoredHost>, String>
 /// 保存单条主机配置（新增或更新，按 id 去重）。密码不入 JSON，
 /// 需前端在保存后另行调用 `save_connection_password`。
 #[tauri::command]
-pub async fn save_connection(app: AppHandle, host: StoredHost) -> Result<(), String> {
+pub async fn save_connection(
+    app: AppHandle,
+    state: State<'_, crate::applog::persisted::ConfigWriteLock>,
+    host: StoredHost,
+) -> Result<(), String> {
     slow_span!("save_connection");
+    // 读—改—写 connections.json 必须在全局配置写锁内，避免与导入/删除交叉丢数据
+    let _guard = state.0.lock().await;
     store::upsert_host(&app, host)
 }
 
 /// 删除主机配置，同时清理钥匙串中对应的密码条目。
 #[tauri::command]
-pub async fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_connection(
+    app: AppHandle,
+    state: State<'_, crate::applog::persisted::ConfigWriteLock>,
+    id: String,
+) -> Result<(), String> {
     slow_span!("delete_connection");
-    store::delete_host(&app, &id)?;
+    {
+        // 锁只保护 connections.json 读改写；keychain 操作不涉及配置文件，放锁外
+        let _guard = state.0.lock().await;
+        store::delete_host(&app, &id)?;
+    }
     store::delete_password(&app, &id)
 }
 
@@ -660,13 +675,480 @@ pub fn reveal_log_storage_dir(path: String) -> Result<String, String> {
 
 /// 热更新日志配置（前端 saveSettings 后调用）。
 /// storage_path 仅重启生效（此处忽略，不做热切换）；日志相关键逐字段发 app.settings.change。
+///
+/// 内存热更新（Hub）与落盘（app_config.json 的 logs 节）在同一把全局配置写锁内：
+/// 与导入/重置互斥。写失败不回滚热更新（本次运行仍按新配置），仅 WARN 留痕。
 #[tauri::command]
-pub fn set_log_config(config: LogConfigPayload) -> Result<(), String> {
+pub async fn set_log_config(
+    state: State<'_, crate::applog::persisted::ConfigWriteLock>,
+    config: LogConfigPayload,
+) -> Result<(), String> {
     slow_span!("set_log_config");
     let Some(hub) = applog::try_hub() else {
         return Ok(()); // 日志系统未初始化时静默丢弃
     };
     let new_cfg = HubConfig::from_payload(&config);
+    let cfg_for_disk = new_cfg.clone();
+    let path = hub.app_config_file().to_path_buf();
+
+    let _guard = state.0.lock().await;
     hub.set_config_with_audit(new_cfg);
+    if let Err(e) = crate::applog::persisted::save_logs(&path, &cfg_for_disk) {
+        crate::applog::emit(
+            log::Level::Warn,
+            "app",
+            crate::applog::events::APP_LOG_CONFIG_PERSIST_FAILED,
+            None,
+            "日志配置持久化失败，重启后将回退",
+            Some(serde_json::json!({
+                "path": path.display().to_string(),
+                "err": e.to_string(),
+            })),
+        );
+    }
+    Ok(())
+}
+
+/* =========================================================
+ *  应用配置：统一快照读取 / 单节写穿（导入导出底座）
+ * ========================================================= */
+
+use crate::applog::persisted::{self as cfg_persisted, ConfigWriteLock};
+
+/// app_config.json 完整路径（app config dir 下）
+fn app_config_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|d| d.join(cfg_persisted::APP_CONFIG_FILE_NAME))
+        .map_err(|e| format!("获取应用配置目录失败: {e}"))
+}
+
+/// 前端启动时一次性拉取的配置快照（后端文件为唯一真相源）。
+/// 各节以原始 JSON 形态透传，前端按各自 store 解析；未知节/未知字段由后端保留。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfigSnapshot {
+    /// logs 节（落盘形态，字段为 snake_case，与 persisted::LogsSection 序列化一致；
+    /// 注意区别于 set_log_config 的入参 LogConfigPayload——后者是 camelCase）
+    logs: serde_json::Value,
+    settings: serde_json::Value,
+    keys: serde_json::Value,
+    groups: serde_json::Value,
+    ui_state: serde_json::Value,
+    quick_connect_history: serde_json::Value,
+    /// 导入文件大小上限（后端权威常量，前端预检取此值）
+    max_import_file_bytes: u64,
+    /// 日志存储路径留空时的平台默认目录（前端输入框 placeholder）
+    default_log_dir: String,
+}
+
+/// 读取应用配置全节快照（localStorage 下线后前端各 store 的唯一数据来源）。
+#[tauri::command]
+pub fn load_app_config(app: AppHandle) -> Result<AppConfigSnapshot, String> {
+    slow_span!("load_app_config");
+    let path = app_config_file(&app)?;
+    let file = cfg_persisted::load_full(&path);
+    Ok(AppConfigSnapshot {
+        logs: file
+            .section_value("logs")
+            .unwrap_or_else(|| serde_json::json!({})),
+        settings: file.settings,
+        keys: file.keys,
+        groups: file.groups,
+        ui_state: file.ui_state,
+        quick_connect_history: file.quick_connect_history,
+        max_import_file_bytes: crate::config_io::MAX_IMPORT_FILE_BYTES,
+        default_log_dir: crate::applog::hub::default_log_dir().display().to_string(),
+    })
+}
+
+/// 通用单节写穿：白名单校验 + 强类型 schema 校验 + 原子写（300ms 防抖在前端）。
+/// 非法节名 / 类型错误一律拒绝且零写入，并记 `app.config.write_rejected`。
+#[tauri::command]
+pub async fn set_app_config_section(
+    app: AppHandle,
+    state: State<'_, ConfigWriteLock>,
+    section: String,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    slow_span!("set_app_config_section");
+    let path = app_config_file(&app)?;
+    let _guard = state.0.lock().await;
+    cfg_persisted::save_section(&path, &section, value).map_err(|e| {
+        crate::applog::emit(
+            log::Level::Warn,
+            "app",
+            crate::applog::events::APP_CONFIG_WRITE_REJECTED,
+            None,
+            "配置节写入被拒绝",
+            Some(serde_json::json!({"section": section, "reason": e})),
+        );
+        e
+    })
+}
+
+/* =========================================================
+ *  配置导出 / 备份（§7.1 / §7.6）
+ * ========================================================= */
+
+/// 导出配置到用户选定文件。后端自行读盘组装，明文 JSON 不经 IPC 返回前端。
+///
+/// - `scope`：full / hosts / ui（§4.1）；
+/// - `include_ui` / `include_history` 仅 scope=full 时附加可选节；
+/// - `password = Some(_)`：PBKDF2-SHA256 + AES-256-GCM 加密写 envelope（§5.1），
+///   密码经 Zeroizing 包裹，函数结束即清零，不进任何日志。
+/// 返回实际写入的绝对路径。
+#[tauri::command]
+pub async fn export_config(
+    app: AppHandle,
+    path: String,
+    scope: String,
+    include_ui: bool,
+    include_history: bool,
+    password: Option<String>,
+) -> Result<String, String> {
+    slow_span!("export_config");
+    let started = Instant::now();
+    let out_path = std::path::PathBuf::from(&path);
+    // 红线：密码不落盘/不进日志；Zeroizing 在任意返回路径 drop 时清零
+    let password = password.map(Zeroizing::new);
+    let encrypted = password.is_some();
+
+    let export_scope = crate::config_io::ExportScope::parse(&scope)
+        .inspect_err(|e| emit_export_failed("assemble", e, started))?;
+
+    // 读盘（原子 rename 保证不会读到半截文件；导出不需持写锁）
+    let hosts = store::load_hosts(&app)
+        .inspect_err(|e| emit_export_failed("read", e, started))?;
+    let cfg_path = app_config_file(&app)?;
+    let cfg = cfg_persisted::load_full(&cfg_path);
+
+    let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let assembled = crate::config_io::assemble_export(
+        &hosts,
+        &cfg,
+        export_scope,
+        include_ui,
+        include_history,
+        env!("CARGO_PKG_VERSION"),
+        &now,
+        &crate::config_io::hostname(),
+    )
+    .inspect_err(|e| emit_export_failed("assemble", e, started))?;
+
+    // 加密分支（§5.1）：明文 Schema → PBKDF2/AES-GCM envelope；明文不经 IPC
+    let output_json = match password.as_ref() {
+        Some(pw) => crate::config_crypto::seal_envelope(&assembled.json, pw)
+            .inspect_err(|e| emit_export_failed("encrypt", e, started))?,
+        None => assembled.json.clone(),
+    };
+    // 导出产物必须能被导入端接受（envelope 5MB 预检）：base64 膨胀后超限则拒绝
+    if output_json.len() as u64 > crate::config_io::MAX_IMPORT_FILE_BYTES {
+        let msg = "配置数据过大，无法导出（超出文件大小上限），请缩小导出范围";
+        emit_export_failed("assemble", msg, started);
+        return Err(msg.to_string());
+    }
+
+    let bytes = crate::config_io::write_export_file(&out_path, &output_json)
+        .inspect_err(|e| emit_export_failed("write", e, started))?;
+
+    let abs_path = std::fs::canonicalize(&out_path)
+        .unwrap_or(out_path)
+        .display()
+        .to_string();
+    crate::applog::emit(
+        log::Level::Info,
+        "app",
+        crate::applog::events::APP_CONFIG_EXPORT,
+        None,
+        "配置已导出",
+        Some(serde_json::json!({
+            "path": abs_path,
+            "scope": export_scope.as_str(),
+            "encrypted": encrypted,
+            "sections": assembled.section_count,
+            "bytes": bytes,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })),
+    );
+    Ok(abs_path)
+}
+
+/// 导出失败统一埋点（kv 不含文件内容/密码，仅 stage 与错误信息、耗时）
+fn emit_export_failed(stage: &str, err: &str, started: Instant) {
+    crate::applog::emit(
+        log::Level::Warn,
+        "app",
+        crate::applog::events::APP_CONFIG_EXPORT_FAILED,
+        None,
+        "配置导出失败",
+        Some(serde_json::json!({
+            "stage": stage,
+            "error": err,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })),
+    );
+}
+
+/* =========================================================
+ *  配置导入（§7.2 / §7.7 / §9）
+ * ========================================================= */
+
+/// `read_import_file` 返回：文件内容（前端预览/二次确认）+ 权威大小与文件名。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFileContent {
+    /// UTF-8 文件全文（上限 5MB；当前版本仅明文 JSON）
+    text: String,
+    bytes: u64,
+    /// 仅文件名（日志/UI 展示用，不含路径）
+    file_name: String,
+}
+
+/// 读取用户选定的导入文件：先 metadata 大小预检（超限不读内容），再按 UTF-8 读取。
+#[tauri::command]
+pub async fn read_import_file(path: String) -> Result<ImportFileContent, String> {
+    slow_span!("read_import_file");
+    let p = std::path::PathBuf::from(&path);
+    let bytes = std::fs::metadata(&p)
+        .map_err(|e| format!("读取文件信息失败: {e}"))?
+        .len();
+    if bytes > crate::config_io::MAX_IMPORT_FILE_BYTES {
+        return Err(format!(
+            "配置文件过大（{} 字节，上限 {} 字节），请确认文件来源",
+            bytes,
+            crate::config_io::MAX_IMPORT_FILE_BYTES
+        ));
+    }
+    let text = std::fs::read_to_string(&p)
+        .map_err(|e| format!("读取配置文件失败（仅支持 UTF-8 文本）: {e}"))?;
+    let file_name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(ImportFileContent {
+        text,
+        bytes,
+        file_name,
+    })
+}
+
+/// 导入失败统一埋点（kv 红线：仅 stage/section/reason/文件名/字节数/错误，不含内容与密码）
+fn emit_import_failed(
+    stage: &str,
+    section: Option<&str>,
+    reason: Option<&str>,
+    err: &str,
+    source: &str,
+    bytes: u64,
+) {
+    let mut kv = serde_json::json!({
+        "stage": stage,
+        "error": err,
+        "source": source,
+        "bytes": bytes,
+    });
+    if let Some(sec) = section {
+        kv["section"] = serde_json::Value::String(sec.to_string());
+    }
+    // decrypt 阶段细分：bad_password（密码错误）/ corrupted（文件损坏）
+    if let Some(reason) = reason {
+        kv["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    crate::applog::emit(
+        log::Level::Warn,
+        "app",
+        crate::applog::events::APP_CONFIG_IMPORT_FAILED,
+        None,
+        "配置导入失败",
+        Some(kv),
+    );
+}
+
+/// 导入事务内核：大小预检 → 持写锁读现状 → 纯函数解析合并 → 同临界区原子写两文件。
+/// `hosts_only=true` 对应 §7.7 `import_hosts`（只消费 connections/groups）。
+async fn run_import(
+    app: &AppHandle,
+    state: &State<'_, ConfigWriteLock>,
+    payload: String,
+    source: String,
+    password: Option<String>,
+    hosts_only: bool,
+) -> Result<crate::config_io::ImportSummary, String> {
+    let started = Instant::now();
+    let bytes = payload.len() as u64;
+
+    // 红线：解密密码用 Zeroizing 包裹，任意返回路径 drop 时清零，不进日志
+    let password = password.map(Zeroizing::new);
+
+    if bytes > crate::config_io::MAX_IMPORT_FILE_BYTES {
+        let msg = format!(
+            "配置文件过大（{} 字节，上限 {} 字节），请确认文件来源",
+            bytes,
+            crate::config_io::MAX_IMPORT_FILE_BYTES
+        );
+        emit_import_failed("size", None, None, &msg, &source, bytes);
+        return Err(msg);
+    }
+
+    let _guard = state.0.lock().await;
+
+    // 临界区内读现状（与合并、写盘构成事务，杜绝并发写丢失）
+    let existing_hosts = store::load_hosts(app)
+        .inspect_err(|e| emit_import_failed("read", None, None, e, &source, bytes))?;
+    let cfg_path = app_config_file(app)?;
+    let existing_cfg = cfg_persisted::load_full(&cfg_path);
+
+    let prepared = crate::config_io::prepare_import(
+        &payload,
+        &existing_hosts,
+        &existing_cfg,
+        hosts_only,
+        password.as_ref().map(|z| z.as_str()),
+    )
+    .map_err(|ie| {
+        // 日志用细分文案（decrypt：密码错误/文件损坏），返回前端仍用统一用户文案
+        let log_err = ie.log_error.as_deref().unwrap_or(&ie.error);
+        emit_import_failed(
+            ie.stage,
+            ie.section.as_deref(),
+            ie.reason,
+            log_err,
+            &source,
+            bytes,
+        );
+        ie.error
+    })?;
+
+    // 解析通过：导入开始
+    crate::applog::emit(
+        log::Level::Info,
+        "app",
+        crate::applog::events::APP_CONFIG_IMPORT_START,
+        None,
+        if hosts_only {
+            "主机导入开始"
+        } else {
+            "配置导入开始"
+        },
+        Some(serde_json::json!({
+            "file_bytes": bytes,
+            "file_version": prepared.file_version,
+            "scope": prepared.meta_scope,
+            "hosts_only": hosts_only,
+        })),
+    );
+
+    // 非关键节容错跳过
+    for s in &prepared.skipped {
+        crate::applog::emit(
+            log::Level::Warn,
+            "app",
+            crate::applog::events::APP_CONFIG_IMPORT_SECTION_SKIPPED,
+            None,
+            "导入配置节损坏，已跳过",
+            Some(serde_json::json!({
+                "section": s.section,
+                "error": s.error,
+            })),
+        );
+    }
+
+    // 先写 app_config 再写 connections：两写均为临时文件+原子 rename；
+    // 若 connections 写失败，app_config 的引用重映射也不会造成悬空
+    // （sessions/keys.hosts 指向的最终 id 集合包含全部本地 id）。
+    cfg_persisted::save_full(&cfg_path, &prepared.app_config).map_err(|e| {
+        let msg = format!("写入应用配置失败: {e}");
+        emit_import_failed("write", None, None, &msg, &source, bytes);
+        msg
+    })?;
+    if let Some(new_hosts) = &prepared.hosts {
+        let conn_path = store::connections_path(app)
+            .inspect_err(|e| emit_import_failed("write", None, None, e, &source, bytes))?;
+        store::write_hosts(&conn_path, new_hosts)
+            .inspect_err(|e| emit_import_failed("write", None, None, e, &source, bytes))?;
+    }
+
+    let s = &prepared.summary;
+    crate::applog::emit(
+        log::Level::Info,
+        "app",
+        crate::applog::events::APP_CONFIG_IMPORT_COMPLETE,
+        None,
+        if hosts_only {
+            "主机导入完成"
+        } else {
+            "配置导入完成"
+        },
+        Some(serde_json::json!({
+            "connections_added": s.connections_added,
+            "connections_renamed": s.connections_renamed,
+            "keys_added": s.keys_added,
+            "keys_renamed": s.keys_renamed,
+            "groups_added": s.groups_added,
+            "settings_changed": s.settings_changed,
+            "skipped_sections": prepared.skipped.len(),
+            "hosts_only": hosts_only,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })),
+    );
+
+    Ok(prepared.summary)
+}
+
+/// 全量/选择性导入配置文件（§7.2）。导入成功后前端必须重启应用再加载新配置。
+#[tauri::command]
+pub async fn import_config(
+    app: AppHandle,
+    state: State<'_, ConfigWriteLock>,
+    payload: String,
+    source: String,
+    password: Option<String>,
+) -> Result<crate::config_io::ImportSummary, String> {
+    slow_span!("import_config");
+    run_import(&app, &state, payload, source, password, false).await
+}
+
+/// 仅导入主机（Hosts 列表「导入主机」入口，§7.7）：
+/// 只消费 connections/groups；本地其余各节（含 ui_state）完全不动。
+#[tauri::command]
+pub async fn import_hosts(
+    app: AppHandle,
+    state: State<'_, ConfigWriteLock>,
+    payload: String,
+    source: String,
+    password: Option<String>,
+) -> Result<crate::config_io::ImportSummary, String> {
+    slow_span!("import_hosts");
+    run_import(&app, &state, payload, source, password, true).await
+}
+
+/* =========================================================
+ *  重置（§7.6）
+ * ========================================================= */
+
+/// 恢复默认设置：仅把 settings 节替换为默认值，连接/密钥/分组/logs/ui_state/历史均不动。
+#[tauri::command]
+pub async fn reset_settings_config(
+    app: AppHandle,
+    state: State<'_, ConfigWriteLock>,
+) -> Result<(), String> {
+    slow_span!("reset_settings_config");
+    let started = Instant::now();
+    let _guard = state.0.lock().await;
+
+    let path = app_config_file(&app)?;
+    cfg_persisted::replace_settings_default(&path)?;
+
+    crate::applog::emit(
+        log::Level::Info,
+        "app",
+        crate::applog::events::APP_CONFIG_SETTINGS_RESET,
+        None,
+        "设置已恢复默认",
+        Some(serde_json::json!({
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })),
+    );
     Ok(())
 }

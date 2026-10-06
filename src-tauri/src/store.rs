@@ -11,6 +11,7 @@
 //!
 //! 写文件采用「先写临时文件再 rename」的原子策略，避免中途崩溃导致文件损坏。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +66,7 @@ const FILE_NAME: &str = "connections.json";
 const KEYRING_SERVICE: &str = "com.rhost.app";
 
 /// 获取 connections.json 的完整路径（位于 Tauri app_data_dir 下）。
-fn connections_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn connections_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -89,7 +90,9 @@ pub fn load_hosts(app: &AppHandle) -> Result<Vec<StoredHost>, String> {
 }
 
 /// 全量写入主机配置（原子写：临时文件 + rename）。
-fn write_hosts(path: &Path, hosts: &[StoredHost]) -> Result<(), String> {
+///
+/// 调用方必须已持有全局配置写锁（`ConfigWriteLock`）。
+pub(crate) fn write_hosts(path: &Path, hosts: &[StoredHost]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败: {e}"))?;
     }
@@ -126,6 +129,77 @@ pub fn delete_host(app: &AppHandle, id: &str) -> Result<(), String> {
     let mut hosts = load_hosts(app)?;
     hosts.retain(|h| h.id != id);
     write_hosts(&path, &hosts)
+}
+
+/* =========================================================
+ *  导入合并（纯函数，不读盘；事务写盘由调用方在写锁内完成）
+ * ========================================================= */
+
+/// 主机导入合并结果
+pub struct HostsMergeResult {
+    /// 合并后的完整主机列表（existing 在前，incoming 追加在后）
+    pub hosts: Vec<StoredHost>,
+    /// 直接新增（id 无冲突）的条数
+    pub added: usize,
+    /// 因 id 冲突被改名的条数
+    pub renamed: usize,
+    /// 导入文件旧 id → 实际落盘 id 的映射（无冲突时映射到自身）。
+    /// 用于重写 keys[].hosts 与 ui_state.sessions 引用。
+    pub id_map: Vec<(String, String)>,
+}
+
+/// id 冲突时的第一次改名后缀
+const IMPORT_SUFFIX: &str = "（导入）";
+
+/// 将导入主机合并进现有列表（upsert by ID 的导入变体）。
+///
+/// 规则（§7.5）：
+/// - id 无冲突：原样追加；
+/// - id 已存在（含导入文件内部重复）：新 id = `原名（导入）`，再冲突追加序号
+///   `原名（导入2）`、`原名（导入3）`……；
+/// - 所有导入主机的 `keyPath` 强制清空（私钥路径不跨实例可信，避免连接上错误文件）；
+/// - 纯函数：不读盘、不依赖 AppHandle，便于单测。
+pub fn import_hosts_merge(existing: &[StoredHost], incoming: Vec<StoredHost>) -> HostsMergeResult {
+    let mut hosts: Vec<StoredHost> = existing.to_vec();
+    // 已占用 id 集合：现有 + 本次已合并（处理文件内部重复）
+    let mut used: HashSet<String> = existing.iter().map(|h| h.id.clone()).collect();
+    let mut added = 0usize;
+    let mut renamed = 0usize;
+    let mut id_map: Vec<(String, String)> = Vec::new();
+
+    for mut host in incoming {
+        let old_id = host.id.clone();
+        host.key_path = None;
+
+        if !used.contains(&old_id) {
+            used.insert(old_id.clone());
+            hosts.push(host);
+            added += 1;
+            id_map.push((old_id.clone(), old_id));
+            continue;
+        }
+
+        // 冲突改名：base = `原名（导入）`，仍占用则追加从 2 起的序号
+        let base = format!("{old_id}{IMPORT_SUFFIX}");
+        let mut new_id = base.clone();
+        let mut seq = 2;
+        while used.contains(&new_id) {
+            new_id = format!("{base}{seq}");
+            seq += 1;
+        }
+        host.id = new_id.clone();
+        used.insert(new_id.clone());
+        hosts.push(host);
+        renamed += 1;
+        id_map.push((old_id, new_id));
+    }
+
+    HostsMergeResult {
+        hosts,
+        added,
+        renamed,
+        id_map,
+    }
 }
 
 /* =========================================================
@@ -277,4 +351,69 @@ pub fn delete_password(_app: &AppHandle, host_id: &str) -> Result<(), String> {
         log::warn!("delete_password: 钥匙串删除失败: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn host(id: &str) -> StoredHost {
+        StoredHost {
+            id: id.into(),
+            conn_type: "ssh".into(),
+            user: "root".into(),
+            ip: "127.0.0.1".into(),
+            port: 22,
+            os: String::new(),
+            color: "blue".into(),
+            label: "t".into(),
+            tag: String::new(),
+            group: String::new(),
+            key_path: Some("/Users/me/.ssh/id_ed25519".into()),
+            extra: serde_json::Value::Null,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn no_conflict_appends_and_maps_identity() {
+        let existing = vec![host("a")];
+        let r = import_hosts_merge(&existing, vec![host("b"), host("c")]);
+        assert_eq!(r.hosts.len(), 3);
+        assert_eq!(r.added, 2);
+        assert_eq!(r.renamed, 0);
+        assert_eq!(r.id_map, vec![("b".into(), "b".into()), ("c".into(), "c".into())]);
+        // 导入项 keyPath 强制清空（存量项在另一个用例验证）
+        assert!(r.hosts[1..].iter().all(|h| h.key_path.is_none()));
+    }
+
+    #[test]
+    fn conflict_gets_import_suffix() {
+        let existing = vec![host("a")];
+        let r = import_hosts_merge(&existing, vec![host("a")]);
+        assert_eq!(r.hosts.len(), 2);
+        assert_eq!(r.added, 0);
+        assert_eq!(r.renamed, 1);
+        assert_eq!(r.hosts[1].id, "a（导入）");
+        assert_eq!(r.id_map, vec![("a".into(), "a（导入）".into())]);
+    }
+
+    #[test]
+    fn repeated_import_keeps_incrementing_and_internal_duplicates_rename() {
+        // 已存在 a、a（导入） → 再导入两个 a：分别得 a（导入2）、a（导入3）
+        let existing = vec![host("a"), host("a（导入）")];
+        let r = import_hosts_merge(&existing, vec![host("a"), host("a")]);
+        assert_eq!(r.renamed, 2);
+        assert_eq!(r.hosts[2].id, "a（导入）2");
+        assert_eq!(r.hosts[3].id, "a（导入）3");
+    }
+
+    #[test]
+    fn existing_entries_keep_their_keypath() {
+        let existing = vec![host("a")];
+        let r = import_hosts_merge(&existing, vec![host("b")]);
+        // 只有导入项清 keyPath，存量项不动
+        assert!(r.hosts[0].key_path.is_some());
+        assert!(r.hosts[1].key_path.is_none());
+    }
 }

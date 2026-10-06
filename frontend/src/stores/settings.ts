@@ -1,4 +1,5 @@
 import { reactive, ref } from 'vue'
+import { onConfigLoad, persistSectionNow } from './appConfig'
 
 /** 设置弹窗显隐（模块级单例，同 showNewConn 模式） */
 export const showSettings = ref(false)
@@ -58,7 +59,6 @@ export interface AppSettings {
   /* ---- 高级 ---- */
   gpuAccel: boolean
   renderer: string
-  fps: string
   /* ---- 监控 ---- */
   /** 工具内存采集间隔（秒），驱动底部状态栏内存指标轮询 */
   memInterval: number
@@ -165,7 +165,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   gpuAccel: true,
   renderer: 'auto',
-  fps: '60',
 
   memInterval: 2,
   metricsInterval: 3,
@@ -203,24 +202,61 @@ export const DEFAULT_SETTINGS: AppSettings = {
   updateChannel: 'stable',
 }
 
-const SETTINGS_KEY = 'rhost.settings'
+/* ---- 持久化：后端 app_config.json settings 节（唯一真相源，localStorage 已下线） ---- */
 
-function load(): AppSettings {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') as Partial<AppSettings>
-    return { ...DEFAULT_SETTINGS, ...raw }
-  } catch {
-    return { ...DEFAULT_SETTINGS }
+function cloneDefaults(): AppSettings {
+  return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)) as AppSettings
+}
+
+/** 启动初始/后端不可用时为默认值；loadAppConfig 后由快照 hydrate 覆盖 */
+export const savedSettings = reactive<AppSettings>(cloneDefaults())
+
+/** settings 节（非 log* 键，后端 camelCase 原样）灌入内存态 */
+function applySettingsSection(section: Record<string, unknown>) {
+  Object.assign(savedSettings, section)
+}
+
+/** logs 节字段（磁盘 snake_case，与后端 LogsSection 序列化一致）→ savedSettings 的 log* 字段；
+ *  类型一致才采纳，拒绝手改脏值。注意不要按 LogConfigPayload 的 camelCase 读——
+ *  快照透传的是落盘形态（snake_case），曾因此导致 storagePath/maxLines 等多词字段回填丢失 */
+function applyLogsSection(logs: Record<string, unknown>) {
+  const mapping: Array<[string, keyof AppSettings]> = [
+    ['collect', 'logCollect'],
+    ['level', 'logLevel'],
+    ['max_lines', 'logMaxLines'],
+    ['persist', 'logPersist'],
+    ['storage_path', 'logStoragePath'],
+    ['rotate', 'logRotate'],
+    ['max_files', 'logMaxFiles'],
+    ['retention_days', 'logRetentionDays'],
+  ]
+  for (const [from, to] of mapping) {
+    const v = logs[from]
+    if (v !== undefined && v !== null && typeof v === typeof savedSettings[to]) {
+      // log* 字段仅 string/boolean/number 三类，typeof 窄化后赋值安全
+      ;(savedSettings as Record<string, unknown>)[to] = v
+    }
   }
 }
 
-/** 已保存的设置（持久化） */
-export const savedSettings = reactive<AppSettings>(load())
+// 快照到达/导入刷新时 hydrate（注册在模块顶层，import 即生效）
+onConfigLoad(snap => {
+  applySettingsSection(snap.settings)
+  applyLogsSection(snap.logs)
+  applyAccent(savedSettings.accent)
+})
 
+/**
+ * 写穿设置：log* 键由调用方经 syncLogConfig（set_log_config）通道处理，
+ * 本函数只写 settings 节；schema 校验失败后端拒绝且零写入。
+ */
 export function persistSettings() {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(savedSettings))
-  } catch { /* 隐私模式等场景忽略 */ }
+  const all = JSON.parse(JSON.stringify(savedSettings)) as Record<string, unknown>
+  // log* 属 logs 节，绝不写入 settings（后端 SettingsSection 亦无这些字段）
+  for (const k of Object.keys(all)) {
+    if (k.startsWith('log')) delete all[k]
+  }
+  persistSectionNow('settings', all).catch(e => console.error('设置写穿失败:', e))
 }
 
 /** 强调色应用到全局（view-card 等处 var(--accent) 生效）。

@@ -1,4 +1,7 @@
 mod applog;
+mod config_crypto;
+mod config_io;
+mod config_migrate;
 mod fonts;
 mod ipc;
 mod localfs;
@@ -10,7 +13,7 @@ mod sysmon;
 
 use applog::events as ev;
 use ssh::manager::SessionManager;
-use tauri::{Manager, RunEvent};
+use tauri::{webview::WebviewWindowBuilder, Manager, RunEvent, WebviewUrl};
 
 /// 应用启动时刻（退出时计算 uptime_s）
 static BOOT_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -24,10 +27,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // 终端复制/粘贴的剪贴板读写（WKWebView 对 Web Clipboard API 读取有限制）
         .plugin(tauri_plugin_clipboard_manager::init())
+        // 配置导入导出：系统打开/保存文件对话框
+        .plugin(tauri_plugin_dialog::init())
+        // 配置导入后提示「立即重启」：relaunch()
+        .plugin(tauri_plugin_process::init())
+        // 全局配置写锁：串行化 app_config.json + connections.json 的所有写操作
+        // （节写穿 / 连接增删 / 导入 / 重置），必须在 setup 与命令注册前挂载
+        .manage(applog::persisted::ConfigWriteLock::new())
         .setup(|app| {
-            // ---- Hub 最先初始化，保证 boot.start 是全局第一条日志 ----
-            // 后端整体配置文件（与 WebView localStorage 独立）：logStoragePath 重启生效
-            // 的唯一载体，同时为后续整体配置导入导出铺垫；缺失/损坏时 load 回退默认值
+            // 后端整体配置文件（前端 localStorage 已下线，此文件为唯一真相源）：
+            // logStoragePath 重启生效的唯一载体，同时为整体配置导入导出与首帧注入提供数据；
+            // 缺失/损坏时 load_full 回退默认值
             let app_config_file = app
                 .path()
                 .app_config_dir()
@@ -37,8 +47,37 @@ pub fn run() {
                         .join("com.rhost.app")
                         .join(applog::persisted::APP_CONFIG_FILE_NAME)
                 });
-            let app_cfg = applog::persisted::load(&app_config_file);
-            let log_dir = match applog::init(app_cfg.logs, app_config_file.clone()) {
+            let app_cfg = applog::persisted::load_full(&app_config_file);
+
+            // 首帧注入：splash 背景模式必须在页面任何脚本执行前同步可知（异步 IPC 会导致
+            // 透明/深色底闪烁）。窗口改由 Rust 创建（tauri.conf.json windows 留空），经
+            // initialization_script 写入 window.__RHOST_BOOT__；settings 节缺失/非法回退默认透明
+            let splash_transparent = app_cfg
+                .settings
+                .get("splashTransparent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let boot_script = format!(
+                "window.__RHOST_BOOT__={};",
+                serde_json::json!({ "splashTransparent": splash_transparent })
+            );
+            // 属性与原静态窗口定义保持一致；label 固定 "main"（capabilities/default.json 按此授权）
+            WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("Rhost")
+            .inner_size(1200.0, 760.0)
+            .min_inner_size(940.0, 600.0)
+            .resizable(true)
+            .decorations(false)
+            .transparent(true)
+            .initialization_script(&boot_script)
+            .build()?;
+
+            // Hub 在窗口创建之后初始化：建窗不产生 applog，boot.start 仍是全局第一条日志
+            let log_dir = match applog::init(app_cfg.logs_config(), app_config_file.clone()) {
                 Ok(dir) => Some(dir),
                 Err(e) => {
                     // Hub 初始化失败降级为无日志运行（emit 全静默），不阻断应用启动
@@ -157,6 +196,13 @@ pub fn run() {
             ipc::reveal_log_dir,
             ipc::reveal_log_storage_dir,
             ipc::set_log_config,
+            ipc::load_app_config,
+            ipc::set_app_config_section,
+            ipc::export_config,
+            ipc::read_import_file,
+            ipc::import_config,
+            ipc::import_hosts,
+            ipc::reset_settings_config,
             fonts::check_fonts,
             localfs::list_local_dir,
             localfs::mkdir,

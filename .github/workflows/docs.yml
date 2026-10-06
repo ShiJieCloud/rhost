@@ -1,0 +1,72 @@
+# 构建 docs/（VitePress）并部署到 GitHub Pages
+# 首次使用：GitHub 仓库 → Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"
+# 推送到 main（或手动 Run workflow）即自动部署，无需 gh-pages 分支
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# GITHUB_TOKEN 部署 Pages 所需权限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只允许一次部署，取消旧的进行中部署可能造成发布中断，这里排队不取消
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # lastUpdated 依赖 git 提交历史
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with VitePress
+        # configure-pages 的 base_path：项目页为 /<repo>、用户主页为空；
+        # 补尾部斜杠后正好满足 VitePress base 首尾斜杠要求（项目页 /<repo>/，主页 /）
+        run: |
+          npm run docs:build
+          touch docs/.vitepress/dist/.nojekyll
+        env:
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}/
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

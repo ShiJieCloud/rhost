@@ -1,28 +1,23 @@
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
+import { isTauri } from '../lib/tauri'
+import { onConfigLoad, patchUiState } from './appConfig'
 
 /** 首页主区可切换的视图；新增页面时在此扩展联合类型 */
 export type HomeViewId = 'quick-connect' | 'hosts' | 'groups' | 'keys' | 'logs'
 
-/** 模块级单例状态；后续接 Pinia 或 Tauri 后端时仅需替换此处 */
-const VIEW_KEY = 'rhost.homeView'
 const VIEW_IDS: HomeViewId[] = ['quick-connect', 'hosts', 'groups', 'keys', 'logs']
 
-function restoreView(): HomeViewId {
-  try {
-    const saved = localStorage.getItem(VIEW_KEY) as HomeViewId | null
-    if (saved && VIEW_IDS.includes(saved)) return saved
-  } catch { /* 隐私模式等场景按默认页处理 */ }
-  return 'quick-connect'
-}
+/** 模块级单例；Tauri 下持久化于后端 ui_state.homeView */
+export const homeView = ref<HomeViewId>('quick-connect')
 
-export const homeView = ref<HomeViewId>(restoreView())
+onConfigLoad(snap => {
+  const saved = snap.uiState.homeView
+  if (typeof saved === 'string' && VIEW_IDS.includes(saved as HomeViewId)) {
+    homeView.value = saved as HomeViewId
+  }
+})
 
 export function setHomeView(id: HomeViewId) {
   homeView.value = id
+  if (isTauri) patchUiState({ homeView: id })
 }
-
-watch(homeView, v => {
-  try {
-    localStorage.setItem(VIEW_KEY, v)
-  } catch { /* 持久化失败不影响切换 */ }
-})

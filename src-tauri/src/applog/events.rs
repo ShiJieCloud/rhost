@@ -27,6 +27,24 @@ pub const APP_CLOCK_ROLLBACK: &str = "app.clock.rollback";
 /// 由 panic hook 直接追加日志文件，不走 Hub 管线（§6.2/§13）
 pub const APP_PANIC: &str = "app.panic";
 
+/* ---- 应用配置导入导出（target: app） ---- */
+/// 配置导出/备份成功
+pub const APP_CONFIG_EXPORT: &str = "app.config.export";
+/// 配置导出失败（stage=read/assemble/write）
+pub const APP_CONFIG_EXPORT_FAILED: &str = "app.config.export_failed";
+/// 配置导入开始（文件解析与版本校验通过后）
+pub const APP_CONFIG_IMPORT_START: &str = "app.config.import.start";
+/// 配置导入成功（kv 为各节合并计数）
+pub const APP_CONFIG_IMPORT_COMPLETE: &str = "app.config.import.complete";
+/// 配置导入失败（stage=size/parse/hash/decrypt/version/write）
+pub const APP_CONFIG_IMPORT_FAILED: &str = "app.config.import.failed";
+/// 非关键节（ui_state/quick_connect_history）损坏被容错跳过
+pub const APP_CONFIG_IMPORT_SECTION_SKIPPED: &str = "app.config.import_section_skipped";
+/// 恢复默认设置成功（仅 settings 节）
+pub const APP_CONFIG_SETTINGS_RESET: &str = "app.config.settings_reset";
+/// set_app_config_section 节名非法或 value schema 校验失败
+pub const APP_CONFIG_WRITE_REJECTED: &str = "app.config.write_rejected";
+
 /* ---- SSH 连接生命周期（target: ssh） ---- */
 pub const SSH_CONNECT_START: &str = "ssh.connect.start";
 pub const SSH_CONNECT_TCP: &str = "ssh.connect.tcp";
@@ -111,6 +129,10 @@ mod tests {
             APP_EXIT, APP_SETTINGS_CHANGE, APP_LOG_CLEANUP, APP_LOG_PERSIST_FAILED,
             APP_LOG_DROPPED, APP_LOG_CORRUPT_LINE, APP_LOG_CONFIG_PERSIST_FAILED,
             APP_CLOCK_ROLLBACK, APP_PANIC,
+            APP_CONFIG_EXPORT, APP_CONFIG_EXPORT_FAILED, APP_CONFIG_IMPORT_START,
+            APP_CONFIG_IMPORT_COMPLETE, APP_CONFIG_IMPORT_FAILED,
+            APP_CONFIG_IMPORT_SECTION_SKIPPED,
+            APP_CONFIG_SETTINGS_RESET, APP_CONFIG_WRITE_REJECTED,
             SSH_CONNECT_START, SSH_CONNECT_TCP, SSH_CONNECT_TCP_FAILED,
             SSH_HANDSHAKE_START, SSH_HANDSHAKE_COMPLETE, SSH_HANDSHAKE_FAILED,
             SSH_HOSTKEY_FINGERPRINT, SSH_AUTH_START, SSH_AUTH_SUCCESS, SSH_AUTH_FAILED,

@@ -4,6 +4,7 @@ import type { Host } from '../types'
 import { hosts } from './hosts'
 import { savedSettings } from './settings'
 import { isTauri } from '../lib/tauri'
+import { getSnapshot, onConfigLoad, patchUiState } from './appConfig'
 import { promptPassword } from '../composables/usePasswordPrompt'
 
 export type SessionState = 'idle' | 'connecting' | 'online' | 'reconnecting' | 'offline'
@@ -43,69 +44,52 @@ export const sidebarVisible = ref(true)
 export const dockHeight = ref(286)
 export const DOCK_DEFAULT_HEIGHT = 286
 
-/* ---- 工作区布局持久化：显隐/折叠/页签/面板高度（全局使用习惯，不绑会话） ---- */
-const LAYOUT_KEY = 'rhost.layout.v1'
+/* ---- 工作区布局持久化：app_config.json ui_state 节（全局使用习惯，不绑会话） ---- */
 
-interface LayoutState {
-  inspectorVisible: boolean
-  dockVisible: boolean
-  dockCollapsed: boolean
-  dockTab: 'sftp' | 'log'
-  dockHeight: number
-  /** SFTP 双栏左侧（本地）宽度占比 0.2~0.8 */
-  sftpLocalRatio: number
-}
-
-function loadLayout(): Partial<LayoutState> {
-  try {
-    return JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}') as Partial<LayoutState>
-  } catch {
-    return {} // 数据损坏按默认布局处理
-  }
-}
-
-const savedLayout = loadLayout()
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const bool = (v: unknown, dflt: boolean) => (typeof v === 'boolean' ? v : dflt)
 
-const savedDockH = num(savedLayout.dockHeight)
-if (savedDockH !== null) dockHeight.value = savedDockH // 视口级 clamp 由 DockPanel 挂载时完成
-
-export const inspectorVisible = ref(bool(savedLayout.inspectorVisible, true))
-export const dockCollapsed = ref(bool(savedLayout.dockCollapsed, false))
-export const dockVisible = ref(bool(savedLayout.dockVisible, true))
+export const inspectorVisible = ref(true)
+export const dockCollapsed = ref(false)
+export const dockVisible = ref(true)
 /** Dock 当前激活页签 */
-export const dockTab = ref<'sftp' | 'log'>(
-  savedLayout.dockTab === 'log' || savedLayout.dockTab === 'sftp' ? savedLayout.dockTab : 'sftp',
-)
+export const dockTab = ref<'sftp' | 'log'>('sftp')
 /** SFTP 双栏左侧（本地）宽度占比；夹取 0.2~0.8 */
-const savedRatio = num(savedLayout.sftpLocalRatio)
-export const sftpLocalRatio = ref(
-  savedRatio !== null ? Math.min(0.8, Math.max(0.2, savedRatio)) : 0.5,
-)
+export const sftpLocalRatio = ref(0.5)
 
-function persistLayout() {
-  try {
-    const data: LayoutState = {
+/** hydrate 当次的批量赋值不回写（watch flush sync 同步拦截） */
+let layoutHydrated = false
+
+onConfigLoad(snap => {
+  const ui = snap.uiState
+  layoutHydrated = false
+  const savedDockH = num(ui.dockHeight)
+  if (savedDockH !== null) dockHeight.value = savedDockH // 视口级 clamp 由 DockPanel 挂载时完成
+  inspectorVisible.value = bool(ui.inspectorVisible, true)
+  dockCollapsed.value = bool(ui.dockCollapsed, false)
+  dockVisible.value = bool(ui.dockVisible, true)
+  dockTab.value = ui.dockTab === 'log' || ui.dockTab === 'sftp' ? ui.dockTab : 'sftp'
+  const savedRatio = num(ui.sftpLocalRatio)
+  sftpLocalRatio.value =
+    savedRatio !== null ? Math.min(0.8, Math.max(0.2, savedRatio)) : 0.5
+  layoutHydrated = true
+})
+
+/** 状态变化经 ui_state 合并写落盘（patchUiState 内部 300ms 防抖合并连续变更） */
+watch(
+  [inspectorVisible, dockVisible, dockCollapsed, dockTab, dockHeight, sftpLocalRatio],
+  () => {
+    if (!isTauri || !layoutHydrated) return
+    patchUiState({
       inspectorVisible: inspectorVisible.value,
       dockVisible: dockVisible.value,
       dockCollapsed: dockCollapsed.value,
       dockTab: dockTab.value,
       dockHeight: dockHeight.value,
       sftpLocalRatio: sftpLocalRatio.value,
-    }
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify(data))
-  } catch { /* 隐私模式等场景忽略 */ }
-}
-
-/** 状态变化防抖 200ms 合并写入 */
-let layoutSaveTimer: ReturnType<typeof setTimeout> | null = null
-watch(
-  [inspectorVisible, dockVisible, dockCollapsed, dockTab, dockHeight, sftpLocalRatio],
-  () => {
-    if (layoutSaveTimer) clearTimeout(layoutSaveTimer)
-    layoutSaveTimer = setTimeout(persistLayout, 200)
+    })
   },
+  { flush: 'sync' },
 )
 
 /** 打开底部面板（取消折叠并显示，可指定页签） */
@@ -872,21 +856,20 @@ export async function reconnectBackend(id: string) {
 
 /* ---- 会话管理 ---- */
 
-/* ---- 会话持久化（冷/热启动分离）：存主机 id 列表，恢复时重新生成会话 id ---- */
-const SESSIONS_KEY = 'rhost.sessions'
+/* ---- 会话持久化（冷/热启动分离）：主机 id 列表存 ui_state.sessions，恢复时重新生成会话 id ---- */
 
 function persistSessions() {
-  try {
-    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions.value.map(s => s.host.id)))
-  } catch { /* 隐私模式等场景忽略 */ }
+  if (!isTauri) return
+  patchUiState({ sessions: sessions.value.map(s => s.host.id) })
 }
 
 /** 启动时恢复上次未关闭的会话；有则直接进入工作台并自动重连（热启动） */
 export function restoreSessions() {
+  const raw = getSnapshot()?.uiState.sessions
   let hostIds: string[] = []
-  try {
-    hostIds = JSON.parse(localStorage.getItem(SESSIONS_KEY) ?? '[]')
-  } catch { /* 数据损坏按无会话处理 */ }
+  if (Array.isArray(raw)) {
+    hostIds = raw.filter((x): x is string => typeof x === 'string')
+  }
   // 同一主机只恢复一个会话
   const valid = [...new Set(hostIds)].filter(id => hosts.value.some(h => h.id === id))
   if (!valid.length) return

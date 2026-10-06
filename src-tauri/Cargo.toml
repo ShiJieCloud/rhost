@@ -21,6 +21,8 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.12.0", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
 russh = "0.63.3"
 russh-sftp = "3.0.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "io-util", "fs"] }
@@ -34,3 +36,9 @@ sysinfo = "0.38.4"
 libc = "0.2"
 tauri-plugin-clipboard-manager = "2.4.1"
 font-kit = "0.14"
+sha2 = "0.10"
+# 配置文件密码加密导出（§5.1）：PBKDF2-SHA256 派生 + AES-256-GCM
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+zeroize = "1"
+base64 = "0.22"

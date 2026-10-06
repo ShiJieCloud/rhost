@@ -59,6 +59,16 @@ export const SFTP_TRANSFER_PAUSE = 'sftp.transfer.pause'
 export const SFTP_TRANSFER_RESUME = 'sftp.transfer.resume'
 export const SFTP_MANAGE_REMOVE = 'sftp.manage.remove'
 
+/* ---- app.config.* 配置导入导出事件（与后端 applog/events.rs 同步，仅登记/展示） ---- */
+export const APP_CONFIG_EXPORT = 'app.config.export'
+export const APP_CONFIG_EXPORT_FAILED = 'app.config.export_failed'
+export const APP_CONFIG_IMPORT_START = 'app.config.import.start'
+export const APP_CONFIG_IMPORT_COMPLETE = 'app.config.import.complete'
+export const APP_CONFIG_IMPORT_FAILED = 'app.config.import.failed'
+export const APP_CONFIG_IMPORT_SECTION_SKIPPED = 'app.config.import_section_skipped'
+export const APP_CONFIG_SETTINGS_RESET = 'app.config.settings_reset'
+export const APP_CONFIG_WRITE_REJECTED = 'app.config.write_rejected'
+
 /** 面板日志数组（模块级单例） */
 export const logs = ref<PanelLogEntry[]>([])
 

@@ -642,28 +642,13 @@ impl Hub {
                 truncated: None,
             });
         }
+        // 落盘职责已拆至 IPC 层（set_log_config 持全局写锁后调 save_logs）：
+        // Hub 只负责内存热更新与审计，持久化失败的 WARN 也由 IPC 层记录。
+    }
 
-        // 持久化到后端整体配置文件（app config dir/app_config.json）的 logs 节：
-        // logStoragePath 下次启动 init 读取后生效；其余项保证重启后行为一致。
-        // save_logs 为读—改—写，不影响文件中的其他配置节。
-        // 写失败不回滚热更新（本次运行仍按新配置），仅 WARN 留痕——用户可知
-        // 「重启后该设置不会保留」。
-        if let Err(e) = super::persisted::save_logs(&self.app_config_file, &new_cfg) {
-            self.log(AppLogEntry {
-                seq: 0,
-                ts: String::new(),
-                level: "warn".to_string(),
-                target: "app".to_string(),
-                event_id: events::APP_LOG_CONFIG_PERSIST_FAILED.to_string(),
-                sid: None,
-                msg: "日志配置持久化失败，重启后将回退".to_string(),
-                kv: Some(serde_json::json!({
-                    "path": self.app_config_file.display().to_string(),
-                    "err": e.to_string(),
-                })),
-                truncated: None,
-            });
-        }
+    /// 后端整体配置文件路径（app_config.json）；IPC 层在写锁内据此落盘 logs 节
+    pub fn app_config_file(&self) -> &Path {
+        &self.app_config_file
     }
 
     /// 关闭 Hub：通知落盘线程 flush 并 join（Tauri ExitRequested 钩子调用）
@@ -685,7 +670,8 @@ fn resolve_log_dir(storage_path: &str) -> PathBuf {
     }
 }
 
-fn default_log_dir() -> PathBuf {
+/// 平台默认日志目录（logStoragePath 留空时的落点；同时经 AppConfigSnapshot 下发给设置面板展示）
+pub fn default_log_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {

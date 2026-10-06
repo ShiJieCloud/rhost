@@ -1,6 +1,8 @@
 import { computed, ref, watch } from 'vue'
 import type { Host, HostColor } from '../types'
 import { hosts } from './hosts'
+import { isTauri } from '../lib/tauri'
+import { onConfigLoad, persistSectionNow, schedulePersist } from './appConfig'
 
 /** 分组定义；主机的归属仍记录在 Host.group 字段上，此处只维护分组的元信息 */
 export interface GroupDef {
@@ -17,8 +19,7 @@ export interface GroupStat {
   offline: number
 }
 
-/** 模块级单例状态；后续接 Pinia 或 Tauri 后端时仅需替换此处 */
-const STORE_KEY = 'rhost.groups'
+/** 模块级单例状态；Tauri 下由后端 app_config.json groups 节持久化 */
 /** 兜底分组：删除分组时其下主机移入该分组，且该分组不可删除 */
 export const FALLBACK_GROUP = '其他'
 
@@ -35,31 +36,45 @@ function pickColor(i: number): HostColor {
   return COLOR_SEQ[i % COLOR_SEQ.length]!
 }
 
-function restore(): GroupDef[] {
-  try {
-    const raw = localStorage.getItem(STORE_KEY)
-    if (!raw) return [...DEFAULT_GROUPS]
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return [...DEFAULT_GROUPS]
-    const list = parsed.filter(
-      (g): g is GroupDef => !!g && typeof g.name === 'string' && typeof g.color === 'string',
-    )
-    return list.length ? list : [...DEFAULT_GROUPS]
-  } catch {
-    return [...DEFAULT_GROUPS]
-  }
+function isValidGroup(v: unknown): v is GroupDef {
+  if (!v || typeof v !== 'object') return false
+  const o = v as Record<string, unknown>
+  return typeof o.name === 'string' && !!o.name && typeof o.color === 'string'
 }
 
-export const groups = ref<GroupDef[]>(restore())
+/** Tauri 启动初始为空（快照 hydrate 前），浏览器 dev 模式直接用默认四组 */
+export const groups = ref<GroupDef[]>(isTauri ? [] : [...DEFAULT_GROUPS])
+
+/** hydrate 当次赋值不回写（flush sync 同步拦截）；播种等主动落盘除外 */
+let hydrated = !isTauri
+
+onConfigLoad(snap => {
+  // 浏览器 dev 模式无后端文件，保留内置默认分组
+  if (!isTauri) return
+  const list = Array.isArray(snap.groups) ? snap.groups.filter(isValidGroup) : []
+  hydrated = false
+  if (list.length) {
+    groups.value = list
+    hydrated = true
+  } else {
+    // 首次启动（或文件无 groups 节）：播种默认四组并立即写盘
+    groups.value = [...DEFAULT_GROUPS]
+    hydrated = true
+    if (isTauri) {
+      persistSectionNow('groups', groups.value).catch(e =>
+        console.error('默认分组播种写盘失败:', e),
+      )
+    }
+  }
+})
 
 watch(
   groups,
   v => {
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(v))
-    } catch { /* 持久化失败不影响内存态 */ }
+    if (!isTauri || !hydrated) return
+    schedulePersist('groups', v)
   },
-  { deep: true },
+  { deep: true, flush: 'sync' },
 )
 
 /** 主机中出现过但未登记的分组（如编辑主机时填写了新分组名），渲染时自动合并 */

@@ -6,12 +6,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Rhost</title>
     <script>
-      // 启动画面背景模式：首帧前同步读取设置（rhost.settings，splashTransparent 默认开启）。
-      // 关闭透明时给 html 加 splash-solid（深色底），置于 head 保证零闪烁
+      // 启动画面背景模式：Rust 创建主窗口时经 initialization_script 在页面任何脚本
+      // 之前注入 window.__RHOST_BOOT__（读 app_config.json 的 settings.splashTransparent，
+      // 见 src-tauri/src/lib.rs）。关闭透明时给 html 加 splash-solid（深色底），置于 head
+      // 保证零闪烁；纯浏览器 dev 访问（无注入）默认透明。
       try {
-        if (JSON.parse(localStorage.getItem('rhost.settings') || '{}').splashTransparent === false) {
-          document.documentElement.classList.add('splash-solid')
-        }
+        var boot = window.__RHOST_BOOT__
+        var transparent = !(boot && boot.splashTransparent === false)
+        if (!transparent) document.documentElement.classList.add('splash-solid')
       } catch (e) {}
     </script>
     <style>

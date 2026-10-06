@@ -110,9 +110,10 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   height: auto;
   max-height: calc(100vh - 60px);
 }
-/* 提示信息（user@host）可能较长，允许换行 */
+/* 提示信息（user@host）可能较长，允许换行；调用方可在 msg 中用 \n 主动换行 */
 .pw-modal .modal-title p {
   word-break: break-all;
+  white-space: pre-line;
   line-height: 1.5;
 }
 .pw-body {

@@ -11,6 +11,11 @@ node_modules/
 # Logs
 *.log
 
+# VitePress
+docs/.vitepress/dist
+docs/.vitepress/.temp
+docs/.vitepress/cache
+
 # OS / Editor
 .DS_Store
 .idea/

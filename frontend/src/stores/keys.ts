@@ -1,18 +1,19 @@
 import { ref, watch } from 'vue'
 import type { KeyType, SshKey } from '../types'
+import { isTauri } from '../lib/tauri'
+import { onConfigLoad, schedulePersist } from './appConfig'
 
 /**
  * SSH 密钥管理状态。
- * 模块级单例；后续接 Pinia 或 Tauri 后端（ssh-keygen / 读取 ~/.ssh）时仅需替换此文件。
+ * 模块级单例；Tauri 下由后端 app_config.json keys 节持久化（本地私钥仅存 ~/.ssh，不入库），
+ * 浏览器 dev 模式降级为内存种子数据。
  */
-
-const STORE_KEY = 'rhost.sshKeys'
 
 function daysAgo(n: number): string {
   return new Date(Date.now() - n * 86400000).toISOString()
 }
 
-/** 首次启动的演示数据；用户产生数据后以 localStorage 为准 */
+/** 浏览器 dev 模式的演示数据；Tauri 生产环境初始为空列表 */
 function seedKeys(): SshKey[] {
   return [
     {
@@ -82,24 +83,40 @@ function seedKeys(): SshKey[] {
   ]
 }
 
-function loadKeys(): SshKey[] {
-  try {
-    const raw = localStorage.getItem(STORE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) return parsed as SshKey[]
-    }
-  } catch { /* 隐私模式或数据损坏时回退种子数据 */ }
-  return seedKeys()
+/** 快照 keys 节元素合法性（后端 schema 已保证 id/name/type，前端再兜底） */
+function isValidKey(v: unknown): v is SshKey {
+  if (!v || typeof v !== 'object') return false
+  const o = v as Record<string, unknown>
+  return (
+    typeof o.id === 'string' &&
+    typeof o.name === 'string' &&
+    typeof o.type === 'string'
+  )
 }
 
-export const keys = ref<SshKey[]>(loadKeys())
+/** Tauri 启动初始为空（快照 hydrate 前），浏览器 dev 模式用演示种子数据 */
+export const keys = ref<SshKey[]>(isTauri ? [] : seedKeys())
 
-watch(keys, v => {
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(v))
-  } catch { /* 持久化失败不影响操作 */ }
-}, { deep: true })
+/** hydrate 当次赋值不回写（flush sync：在 hydrate 回调内同步拦截） */
+let hydrated = !isTauri
+
+onConfigLoad(snap => {
+  // 浏览器 dev 模式无后端文件，保留内置演示种子，不用空快照覆盖
+  if (!isTauri) return
+  const list = Array.isArray(snap.keys) ? snap.keys.filter(isValidKey) : []
+  hydrated = false
+  keys.value = list as SshKey[]
+  hydrated = true
+})
+
+watch(
+  keys,
+  v => {
+    if (!isTauri || !hydrated) return
+    schedulePersist('keys', v)
+  },
+  { deep: true, flush: 'sync' },
+)
 
 /* ==================== CRUD ==================== */
 

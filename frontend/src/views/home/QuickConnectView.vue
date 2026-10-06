@@ -7,6 +7,7 @@ import { promptPassword } from '../../composables/usePasswordPrompt'
 import { addHost, hosts } from '../../stores/hosts'
 import { openSession } from '../../stores/session'
 import { isTauri } from '../../lib/tauri'
+import { onConfigLoad, persistSectionNow } from '../../stores/appConfig'
 import type { Host } from '../../types'
 
 /* ================= 命令解析 ================= */
@@ -112,38 +113,34 @@ function parseCommand(raw: string): ParsedCmd | null {
   return { user, host, port: port || '22', key }
 }
 
-/* ================= 历史记录 ================= */
+/* ================= 历史记录（持久化于后端 quick_connect_history 节，磁盘格式 {host,timestamp}） ================= */
 interface HistoryItem {
   cmd: string
   time: number
 }
 
-const HISTORY_KEY = 'rhost.quickConnect.history'
-const HISTORY_MAX = 20
+/** 磁盘条数上限（与后端 MAX_QUICK_HISTORY_ENTRIES 对齐）；列表仅展示最近 HISTORY_SHOW 条 */
+const HISTORY_MAX = 50
 const HISTORY_SHOW = 6
 
-function loadHistory(): HistoryItem[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .map((it: unknown) =>
-        typeof it === 'string' ? { cmd: it, time: Date.now() } : (it as HistoryItem),
-      )
-      .filter(it => it && typeof it.cmd === 'string')
-  } catch {
-    return []
-  }
-}
+const history = ref<HistoryItem[]>([])
 
-const history = ref<HistoryItem[]>(loadHistory())
+onConfigLoad(snap => {
+  if (!Array.isArray(snap.quickConnectHistory)) return
+  history.value = snap.quickConnectHistory
+    .map(it => {
+      const o = (it ?? {}) as Record<string, unknown>
+      return { cmd: String(o.host ?? ''), time: Number(o.timestamp ?? 0) }
+    })
+    .filter(it => it.cmd)
+})
 
+/** UI 模型 {cmd,time} → 磁盘模型 {host,timestamp} */
 function saveHistory() {
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.value))
-  } catch { /* 忽略 */ }
+  const disk = history.value.map(it => ({ host: it.cmd, timestamp: it.time }))
+  persistSectionNow('quick_connect_history', disk).catch(e =>
+    console.error('快速连接历史写穿失败:', e),
+  )
 }
 
 function pushHistory(cmd: string) {

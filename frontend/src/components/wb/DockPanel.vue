@@ -5,6 +5,7 @@ import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCol
 import { savedSettings } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
 import { isTauri } from '../../lib/tauri'
+import { getSnapshot, onConfigLoad, patchUiState } from '../../stores/appConfig'
 import ContextMenu from './ContextMenu.vue'
 import type { MenuItem } from './ContextMenu.vue'
 import {
@@ -1017,9 +1018,23 @@ const levelCounts = computed(() => {
 })
 
 const autoScroll = ref(true)
-// 日志自动换行（纯视图偏好，默认开启，本地持久化）；关闭时长行单行横向滚动
-const logWrap = ref(localStorage.getItem('rhost.logWrap') !== '0')
-watch(logWrap, v => localStorage.setItem('rhost.logWrap', v ? '1' : '0'))
+// 日志自动换行（纯视图偏好，默认开启，随 ui_state 节持久化）；关闭时长行单行横向滚动。
+// 本组件晚于启动快照挂载，初始值直接读快照；onConfigLoad 处理导入重载后的再 hydrate。
+const logWrap = ref(getSnapshot()?.uiState.logWrap !== false)
+let wrapHydrated = true
+onConfigLoad(snap => {
+  wrapHydrated = false
+  logWrap.value = snap.uiState.logWrap !== false
+  wrapHydrated = true
+})
+watch(
+  logWrap,
+  v => {
+    if (!wrapHydrated) return
+    patchUiState({ logWrap: v })
+  },
+  { flush: 'sync' },
+)
 const logListEl = ref<HTMLElement | null>(null)
 
 const STICK_GAP = 24 // 距底部小于该值视为"贴底"

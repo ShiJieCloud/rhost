@@ -69,7 +69,7 @@ pub fn emit(
 /// 必须在 Tauri `.setup()` 最前面调用（先于其他全局状态挂载），
 /// 保证 `app.boot.start` 是全局第一条日志。
 /// `app_config_file` 为后端整体配置文件路径（app config dir/app_config.json），
-/// 由调用方先用 [`persisted::load`] 读取并取 `logs` 节合并进 `cfg`，此处只负责
+/// 由调用方先用 [`persisted::load_full`] 读取并取 `logs_config()` 节，此处只负责
 /// 交给 Hub 供后续 `set_log_config` 回写 logs 节。
 /// 返回日志目录实际路径（供 boot.log_dir_ready 事件 kv）。
 pub fn init(
