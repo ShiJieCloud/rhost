@@ -1825,6 +1825,15 @@ body{
     border:1px solid var(--border-soft);
     font-variant-numeric:tabular-nums;
 }
+/* 折叠态头部进度摘要：超长省略，hover 看全名；整行可点击切换折叠 */
+.queue-head{cursor:pointer}
+.queue-summary{
+    flex:0 1 auto;min-width:0;
+    display:inline-flex;align-items:center;
+    color:var(--muted-2);font-size:10px;font-family:var(--mono);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    font-variant-numeric:tabular-nums;
+}
 /* 头部图标按钮 */
 .queue-act,.queue-fold{
     width:20px;height:20px;border-radius:4px;

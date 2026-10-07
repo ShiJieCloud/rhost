@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
-import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCollapsed, dockHeight, DOCK_DEFAULT_HEIGHT, dockTab, dockVisible, searchTick, sftpLocalRatio } from '../../stores/session'
+import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCollapsed, dockHeight, DOCK_DEFAULT_HEIGHT, dockTab, dockVisible, searchTick, sftpLocalRatio, sftpQueueCollapsed, sftpQueueHeight } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
 import { isTauri } from '../../lib/tauri'
@@ -344,16 +344,41 @@ const filteredTransfers = computed(() => {
   )
 })
 
-/* 队列面板：head 28 + tabs 28；折叠时只留 head */
-const queueCollapsed = ref(false)
-const queueHeight = ref(180)
+/* 队列面板：head 28 + tabs 28；折叠/高度状态存 ui_state（session store），
+   跨重启保留；首个任务入队时自动展开，折叠态头部以 queueSummary 展示进度摘要 */
 const queueListMaxHeight = computed(() =>
-  queueCollapsed.value ? '0px' : Math.max(0, queueHeight.value - 56) + 'px')
+  sftpQueueCollapsed.value ? '0px' : Math.max(0, sftpQueueHeight.value - 56) + 'px')
 function toggleQueueCollapse() {
-  queueCollapsed.value = !queueCollapsed.value
+  sftpQueueCollapsed.value = !sftpQueueCollapsed.value
   // 拖拽收起到 28 后再展开：恢复默认高度，避免列表区高度为负
-  if (!queueCollapsed.value && queueHeight.value < 120) queueHeight.value = 180
+  if (!sftpQueueCollapsed.value && sftpQueueHeight.value < 120) sftpQueueHeight.value = 180
 }
+/** 点击头部空白区（非按钮）切换折叠，提升折叠态可发现性 */
+function onQueueHeadClick(e: MouseEvent) {
+  if ((e.target as HTMLElement).closest('button')) return
+  toggleQueueCollapse()
+}
+
+/** 折叠态头部摘要：优先进行中任务（方向/名称/百分比/速率），
+ *  否则按 等待 → 暂停 → 失败 → 完成 汇总；空闲留空 */
+const queueSummary = computed(() => {
+  const list = transfers.value
+  if (!list.length) return ''
+  const r = list.find(t => t.status === 'running')
+  if (r) {
+    const arrow = r.dir === 'up' ? '↑' : '↓'
+    const speed = r.speed > 0 ? ' · ' + fmtSpeed(r.speed) : ''
+    return `${arrow} ${r.name} ${Math.floor(Math.min(100, r.pct))}%${speed}`
+  }
+  const pending = list.filter(t => t.status === 'pending').length
+  if (pending) return `等待中 ${pending} 项`
+  const paused = list.filter(t => t.status === 'paused').length
+  if (paused) return `已暂停 ${paused} 项`
+  const failed = list.filter(t => t.status === 'error').length
+  if (failed) return `${failed} 项失败`
+  const done = list.filter(t => t.status === 'success').length
+  return done ? `已完成 ${done} 项` : ''
+})
 
 function fmtSpeed(bps: number) {
   if (!bps || bps <= 0) return '0 B/s'
@@ -401,7 +426,7 @@ function stateText(t: Transfer) {
 function startQueueDrag(e: MouseEvent) {
   e.preventDefault()
   const startY = e.clientY
-  const startH = queueHeight.value
+  const startH = sftpQueueHeight.value
   const sftpEl = (e.target as HTMLElement).closest('.sftp') as HTMLElement | null
   const maxH = sftpEl ? sftpEl.offsetHeight - 1 : 500
   document.body.style.userSelect = 'none'
@@ -411,11 +436,11 @@ function startQueueDrag(e: MouseEvent) {
     const delta = ev.clientY - startY
     const h = startH - delta
     if (h <= 40) {
-      queueCollapsed.value = true
-      queueHeight.value = 28
+      sftpQueueCollapsed.value = true
+      sftpQueueHeight.value = 28
     } else {
-      queueCollapsed.value = false
-      queueHeight.value = Math.min(maxH, h)
+      sftpQueueCollapsed.value = false
+      sftpQueueHeight.value = Math.min(maxH, h)
     }
   }
   const onUp = () => {
@@ -432,13 +457,16 @@ function startTask(
   dir: 'up' | 'down', name: string, size: number,
   extra: { localPath: string; remotePath: string; cutSrc?: string },
 ) {
+  /* 仅在队列从空闲进入活动（首个任务）时自动展开；
+     活动期间用户手动折叠后，后续入队保持折叠，进度看头部摘要 */
+  const wasIdle = transfers.value.length === 0
   transfers.value.push({
     id: ++seq, name, dir, size, pct: 0, status: 'pending', speed: 0, startAt: 0,
     localPath: extra.localPath,
     remotePath: extra.remotePath,
     cutSrc: extra.cutSrc,
   })
-  queueCollapsed.value = false
+  if (wasIdle) sftpQueueCollapsed.value = false
   reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dir === 'up' ? '上传' : '下载'}加入队列`, {
     name, size, dir, from: extra.localPath, to: extra.remotePath,
   })
@@ -1697,14 +1725,18 @@ onUnmounted(() => {
           </div>
 
           <!-- 传输队列 -->
-          <div class="sftp-tasks" :class="{ collapsed: queueCollapsed }"
-               :style="{ height: queueCollapsed ? '28px' : queueHeight + 'px' }">
+          <div class="sftp-tasks" :class="{ collapsed: sftpQueueCollapsed }"
+               :style="{ height: sftpQueueCollapsed ? '28px' : sftpQueueHeight + 'px' }">
             <div class="queue-resizer" @mousedown.prevent="startQueueDrag"></div>
-            <!-- 头部：指示灯 + 标题 + 总数；右侧 全部暂停 / 全部继续 / 清空 / 折叠 -->
-            <div class="queue-head">
+            <!-- 头部：指示灯 + 标题 + 总数（+折叠态进度摘要）；右侧 全部暂停 / 全部继续 / 清空 / 折叠。
+                 点击头部空白区可折叠 / 展开 -->
+            <div class="queue-head" :title="sftpQueueCollapsed ? '点击展开传输队列' : '点击收起传输队列'"
+                 @click="onQueueHeadClick">
               <span class="queue-led" :class="{ idle: !runningCount && !pendingCount }"></span>
               <span class="queue-title">传输队列</span>
               <span class="queue-badge">{{ transfers.length }}</span>
+              <span v-if="sftpQueueCollapsed && queueSummary" class="queue-summary"
+                    :title="queueSummary">{{ queueSummary }}</span>
               <span class="spacer"></span>
               <button class="queue-act" title="全部暂停"
                       :disabled="!runningCount && !pendingCount" @click="pauseAllTasks">
@@ -1728,11 +1760,11 @@ onUnmounted(() => {
                 </svg>
               </button>
               <button class="queue-fold"
-                      :title="queueCollapsed ? '展开传输队列' : '收起传输队列'"
+                      :title="sftpQueueCollapsed ? '展开传输队列' : '收起传输队列'"
                       @click="toggleQueueCollapse">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                      stroke-linecap="round" stroke-linejoin="round">
-                  <path v-if="queueCollapsed" d="M6 15l6-6 6 6"/>
+                  <path v-if="sftpQueueCollapsed" d="M6 15l6-6 6 6"/>
                   <path v-else d="M6 9l6 6 6-6"/>
                 </svg>
               </button>

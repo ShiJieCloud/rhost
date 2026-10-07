@@ -56,6 +56,10 @@ export const dockVisible = ref(true)
 export const dockTab = ref<'sftp' | 'log'>('sftp')
 /** SFTP 双栏左侧（本地）宽度占比；夹取 0.2~0.8 */
 export const sftpLocalRatio = ref(0.5)
+/** SFTP 传输队列展开高度（px）；折叠态下保留，展开无缝恢复 */
+export const sftpQueueHeight = ref(180)
+/** SFTP 传输队列折叠状态；初始折叠，用户调整后跨重启保留 */
+export const sftpQueueCollapsed = ref(true)
 
 /** hydrate 当次的批量赋值不回写（watch flush sync 同步拦截） */
 let layoutHydrated = false
@@ -72,12 +76,19 @@ onConfigLoad(snap => {
   const savedRatio = num(ui.sftpLocalRatio)
   sftpLocalRatio.value =
     savedRatio !== null ? Math.min(0.8, Math.max(0.2, savedRatio)) : 0.5
+  // 队列高度只做异常值防呆夹取（28 为拖拽折叠残留值，展开时组件恢复默认）；
+  // 视口级适配由 DockPanel 布局自然约束
+  const savedQueueH = num(ui.sftpQueueHeight)
+  sftpQueueHeight.value =
+    savedQueueH !== null ? Math.min(720, Math.max(28, savedQueueH)) : 180
+  sftpQueueCollapsed.value = bool(ui.sftpQueueCollapsed, true)
   layoutHydrated = true
 })
 
 /** 状态变化经 ui_state 合并写落盘（patchUiState 内部 300ms 防抖合并连续变更） */
 watch(
-  [inspectorVisible, dockVisible, dockCollapsed, dockTab, dockHeight, sftpLocalRatio],
+  [inspectorVisible, dockVisible, dockCollapsed, dockTab, dockHeight, sftpLocalRatio,
+   sftpQueueHeight, sftpQueueCollapsed],
   () => {
     if (!isTauri || !layoutHydrated) return
     patchUiState({
@@ -87,6 +98,8 @@ watch(
       dockTab: dockTab.value,
       dockHeight: dockHeight.value,
       sftpLocalRatio: sftpLocalRatio.value,
+      sftpQueueHeight: sftpQueueHeight.value,
+      sftpQueueCollapsed: sftpQueueCollapsed.value,
     })
   },
   { flush: 'sync' },
