@@ -167,6 +167,8 @@ pub fn run() {
             ipc::connect_ssh,
             ipc::write_terminal,
             ipc::resize_terminal,
+            ipc::tunnel_start,
+            ipc::tunnel_stop,
             ipc::disconnect_session,
             ipc::sftp_list_dir,
             ipc::sftp_mkdir,

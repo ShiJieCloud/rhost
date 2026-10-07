@@ -3,6 +3,7 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import type { Host } from '../types'
 import { hosts } from './hosts'
 import { savedSettings } from './settings'
+import { clearSessionTunnels, handleTunnelFrame, restoreOnReconnect, startSavedOnConnect, tunnelSnapshots } from './tunnels'
 import { isTauri } from '../lib/tauri'
 import { getSnapshot, onConfigLoad, patchUiState } from './appConfig'
 import { promptPassword } from '../composables/usePasswordPrompt'
@@ -55,7 +56,7 @@ export const inspectorVisible = ref(true)
 export const dockCollapsed = ref(false)
 export const dockVisible = ref(true)
 /** Dock 当前激活页签 */
-export const dockTab = ref<'sftp' | 'log'>('sftp')
+export const dockTab = ref<'sftp' | 'log' | 'tunnel'>('sftp')
 /** SFTP 双栏左侧（本地）宽度占比；夹取 0.2~0.8 */
 export const sftpLocalRatio = ref(0.5)
 /** SFTP 传输队列展开高度（px）；折叠态下保留，展开无缝恢复 */
@@ -74,7 +75,7 @@ onConfigLoad(snap => {
   inspectorVisible.value = bool(ui.inspectorVisible, true)
   dockCollapsed.value = bool(ui.dockCollapsed, false)
   dockVisible.value = bool(ui.dockVisible, true)
-  dockTab.value = ui.dockTab === 'log' || ui.dockTab === 'sftp' ? ui.dockTab : 'sftp'
+  dockTab.value = ui.dockTab === 'log' || ui.dockTab === 'sftp' || ui.dockTab === 'tunnel' ? ui.dockTab : 'sftp'
   const savedRatio = num(ui.sftpLocalRatio)
   sftpLocalRatio.value =
     savedRatio !== null ? Math.min(0.8, Math.max(0.2, savedRatio)) : 0.5
@@ -108,7 +109,7 @@ watch(
 )
 
 /** 打开底部面板（取消折叠并显示，可指定页签） */
-export function openDock(tab?: 'sftp' | 'log') {
+export function openDock(tab?: 'sftp' | 'log' | 'tunnel') {
   dockCollapsed.value = false
   dockVisible.value = true
   if (tab) dockTab.value = tab
@@ -142,6 +143,7 @@ const FRAME_METRICS = 0x06 // 主机动态指标（JSON Metrics，周期推送�
 const FRAME_RTT = 0x07     // 链路 RTT（JSON {"ms": 23}，建连即测 + 30s 周期）
 const FRAME_CWD = 0x08     // Shell 当前工作目录（绝对路径文本，PTY cd 后后端上报）
 const FRAME_ALGO = 0x09    // SSH 协商算法（JSON AlgoInfo，建连时一次，先于 PTY 数据）
+const FRAME_TUNNEL = 0x0A  // 端口转发状态（JSON {"tunnels":[TunnelStatus]}，跃迁即时推/计数流量 1s 节流）
 
 /** Exit 帧 payload 解析结果：reason 为展示文本，lost=true 表示连接意外丢失（可自动重连） */
 interface ExitInfo {
@@ -485,8 +487,20 @@ function handleFrame(id: string, frame: Uint8Array) {
     }
     return
   }
+  if (type === FRAME_TUNNEL) {
+    // 端口转发状态快照：tunnels store 内先校正期望集再整帧替换
+    handleTunnelFrame(id, payload)
+    return
+  }
   if (type === FRAME_EXIT) {
     const s = sessions.value.find(x => x.id === id)
+    // 断线即销毁后端会话：触发 cancel 令牌，隧道监听任务退出释放本地端口、
+    // 后台任务收尾。不销毁则旧监听永久占用端口（重连后 startTunnel 一直报
+    // 端口被占用，只能重启应用）。重复断开幂等（后端 remove 不存在视为成功）。
+    const deadId = s?.backendId
+    if (deadId && isTauri) {
+      void invoke('disconnect_session', { sessionId: deadId }).catch(() => {})
+    }
     if (s) s.backendId = undefined
     // 重连途中旧会话的 EXIT：静默收尾，不写关闭提示、不覆盖 reconnecting 状态
     if (s?.state === 'reconnecting') return
@@ -502,6 +516,9 @@ function handleFrame(id: string, frame: Uint8Array) {
         ? '连接已中断（远端无响应）'
         : (reason || '远端会话已结束')
     }
+    // 断线时清理隧道快照（保留期望集供重连恢复），让用户看到状态变化
+    tunnelSnapshots.value.delete(id)
+    triggerRef(tunnelSnapshots)
     // 仅连接意外丢失（无远端退出状态）时自动重连；用户主动 exit 不重连
     if (lost) scheduleAutoReconnect(id)
     return
@@ -510,10 +527,20 @@ function handleFrame(id: string, frame: Uint8Array) {
     const msg = textDecoder.decode(payload)
     setSessionState(id, 'offline')
     const s = sessions.value.find(x => x.id === id)
+    // 同 EXIT 分支：销毁后端会话释放隧道监听端口与后台任务，并置空 backendId
+    // （原实现未置空，后续 write/resize 会打到死会话）
+    const deadId = s?.backendId
+    if (deadId && isTauri) {
+      void invoke('disconnect_session', { sessionId: deadId }).catch(() => {})
+    }
     if (s) {
+      s.backendId = undefined
       s.retryAt = null
       s.disconnectReason = `连接错误：${msg}`
     }
+    // 断线时清理隧道快照（保留期望集供重连恢复），让用户看到状态变化
+    tunnelSnapshots.value.delete(id)
+    triggerRef(tunnelSnapshots)
     if (!manualClosed.has(id)) scheduleAutoReconnect(id)
   }
 }
@@ -577,6 +604,8 @@ async function connectBackend(s: Session, cols: number, rows: number) {
     setSessionState(s.id, 'offline')
     return
   }
+  // 首次连接与重连（自动/手动）共用本函数：端口转发恢复策略按入口状态分流
+  const wasReconnecting = s.state === 'reconnecting'
   setSessionState(s.id, s.state === 'reconnecting' ? 'reconnecting' : 'connecting')
   // 连接代次 +1：本次 invoke 在途期间若用户断开/再次重连，代次会失配
   const gen = (connectGen.get(s.id) ?? 0) + 1
@@ -635,6 +664,10 @@ async function connectBackend(s: Session, cols: number, rows: number) {
     s.retryAt = null
     s.resetSeq++
     setSessionState(s.id, 'online')
+    // 端口转发：首连按 tunnelAutoStart 批量启动 enabled 规则；重连按期望集恢复
+    //（内部各自清理旧快照/期望集；失败只 toast，不回滚连接状态、不写终端缓冲）
+    if (wasReconnecting) void restoreOnReconnect(s)
+    else void startSavedOnConnect(s)
   } catch (e) {
     // 代次失配：失败已无关当前状态（用户已断开或更新的连接在进行），静默丢弃
     if (gen !== connectGen.get(s.id)) return
@@ -970,6 +1003,7 @@ export function closeSession(id: string) {
   termSizeMap.delete(id)
   metricsMap.value.delete(id)
   netHistMap.value.delete(id)
+  clearSessionTunnels(id)
   const timer = resizeTimers.get(id)
   if (timer) { clearTimeout(timer); resizeTimers.delete(id) }
   pendingResize.delete(id)

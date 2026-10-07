@@ -38,6 +38,10 @@ pub enum FrameType {
     /// 主机密钥算法 / 对称加密算法 / PTY 终端类型 / 终端字符编码）。
     /// 状态栏据此显示真实值，而非硬编码占位。
     Algo = 0x09,
+    /// 端口转发状态全量快照（payload 为 JSON `{"tunnels":[TunnelStatus,...]}`）。
+    /// 状态跃迁（Starting→Active/Error/Stopped）即时推送；活动连接数/流量
+    /// 数值变化经 1s 节流合并推送（脏标记驱动）。
+    Tunnel = 0x0A,
 }
 
 impl FrameType {

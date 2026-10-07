@@ -169,6 +169,7 @@ rhost/
 | 0x07 | Rtt | JSON `{"ms":23}` | 建连即测 + 30s |
 | 0x08 | Cwd | 绝对路径文本（OSC 6667 解析得到） | Shell cd 后 |
 | 0x09 | Algo | JSON 真实协商算法（host_key/cipher/term/enc） | 建连一次 |
+| 0x0A | Tunnel | JSON `{"tunnels":[TunnelStatus,...]}` 全量快照 | 状态跃迁即时推送；连接数/流量 1s 节流合并 |
 
 前端解析注意（`session.ts` 中均有实现）：
 

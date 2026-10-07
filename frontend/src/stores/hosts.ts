@@ -36,6 +36,7 @@ export const filterInfo = computed(() =>
 
 /** 后端 StoredHost → 前端 Host（补齐运行时状态默认值） */
 function storedToHost(s: StoredHost): Host {
+  const extra = (s.extra ?? {}) as Record<string, unknown>
   return {
     id: s.id,
     user: s.user,
@@ -52,6 +53,7 @@ function storedToHost(s: StoredHost): Host {
     uptime: '—',
     group: s.group,
     keyPath: s.keyPath ?? undefined,
+    tunnels: Array.isArray(extra.tunnels) ? (extra.tunnels as Host['tunnels']) : undefined,
     // password 不入 JSON，连接时从钥匙串按需读取
   }
 }
@@ -70,7 +72,7 @@ function hostToStored(h: Host, connType: string): StoredHost {
     tag: h.tag,
     group: h.group,
     keyPath: h.keyPath ?? null,
-    extra: {},
+    extra: h.tunnels?.length ? { tunnels: h.tunnels } : {},
     updatedAt: Date.now(),
   }
 }

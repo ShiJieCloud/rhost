@@ -72,6 +72,35 @@ impl SessionManager {
         }
     }
 
+    /// 启动一条端口转发规则（复制 Arc 后释放读锁；业务逻辑在 TunnelManager）
+    pub(crate) async fn tunnel_start(
+        &self,
+        session_id: &str,
+        rule: super::tunnel::TunnelRule,
+        opts: super::tunnel::StartOptions,
+    ) -> Result<(), SshError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+        match session {
+            Some(s) => s.tunnel().start(rule, opts).await,
+            None => Err(SshError::NotFound),
+        }
+    }
+
+    /// 停止一条端口转发规则（幂等：规则不存在视为成功）
+    pub(crate) async fn tunnel_stop(&self, session_id: &str, rule_id: &str) -> Result<(), SshError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+        match session {
+            Some(s) => s.tunnel().stop(rule_id).await,
+            None => Err(SshError::NotFound),
+        }
+    }
+
     /// 启动某会话的动态指标采集（幂等，间隔由前端指定，单位毫秒；
     /// `iface` 为默认路由网卡，网络计数优先取它）
     pub async fn start_metrics(

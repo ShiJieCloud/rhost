@@ -2,11 +2,13 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { toast } from '../composables/useToast'
+import { confirmDialog, confirmState } from '../composables/useConfirm'
+import { copyText } from '../stores/keys'
 import { addHost, editingHost, showNewConn, updateHost } from '../stores/hosts'
 import { rehostSession } from '../stores/session'
 import { GROUP_OPTIONS } from '../data/mockHosts'
 import { isTauri } from '../lib/tauri'
-import type { HostColor } from '../types'
+import type { HostColor, TunnelRule, TunnelType } from '../types'
 
 /* =========================================================
    类型与表单定义（数据驱动）
@@ -20,7 +22,7 @@ interface FieldDef {
   name: string
   span: 1 | 2
   required?: boolean
-  type?: 'text' | 'number' | 'password' | 'select' | 'segmented' | 'tags' | 'textarea'
+  type?: 'text' | 'number' | 'password' | 'select' | 'segmented' | 'tags' | 'textarea' | 'tunnels'
   value?: string
   placeholder?: string
   hint?: string
@@ -64,6 +66,34 @@ const TYPES: { v: ConnType; t: string; icon: string; sub: string }[] = [
 ]
 
 const GROUP_OPTS: FieldOption[] = GROUP_OPTIONS.map(g => ({ v: g, t: g }))
+
+/* =========================================================
+   端口转发（隧道规则）
+   ========================================================= */
+const TNL_META: Record<TunnelType, { label: string; flag: string }> = {
+  local: { label: '本地转发', flag: '-L' },
+  remote: { label: '远程转发', flag: '-R' },
+  dynamic: { label: '动态转发', flag: '-D' },
+}
+const TNL_UI: Record<TunnelType, { bind: string; target: string; desc: string }> = {
+  local: {
+    bind: '绑定地址（本地）',
+    target: '目标地址（远端）',
+    desc: '在本地监听端口，把收到的连接通过 SSH 通道转发到服务器侧可达的目标地址。',
+  },
+  remote: {
+    bind: '绑定地址（远端）',
+    target: '目标地址（本地）',
+    desc: '在服务器侧监听端口，把收到的连接通过 SSH 通道转发回本地可达的目标地址。',
+  },
+  dynamic: {
+    bind: '监听地址（本地）',
+    target: '',
+    desc: '在本地开启 SOCKS5 代理端口，应用经此代理访问远端网络。',
+  },
+}
+/** 当前主机的隧道规则（保存时写入 Host.tunnels） */
+const tunnelRules = ref<TunnelRule[]>([])
 
 const FORMS: Record<ConnType, { cards: CardDef[] }> = {
   ssh: {
@@ -139,21 +169,17 @@ const FORMS: Record<ConnType, { cards: CardDef[] }> = {
       },
       {
         id: 'forward', title: '端口转发', icon: 'tunnel',
-        desc: '通过 SSH 隧道映射端口。每行一条，格式：端口:目标主机:目标端口。',
-        summary: v => {
+        desc: '通过 SSH 隧道映射端口，多条规则按列表顺序在连接建立后依次生效。',
+        summary: () => {
           const p: string[] = []
-          if (v.localForward) p.push('本地')
-          if (v.remoteForward) p.push('远程')
-          if (v.dynamicForward) p.push('动态')
+          const count = (t: TunnelType) => tunnelRules.value.filter(x => x.type === t).length
+          if (count('local')) p.push(`本地 ×${count('local')}`)
+          if (count('remote')) p.push(`远程 ×${count('remote')}`)
+          if (count('dynamic')) p.push(`动态 ×${count('dynamic')}`)
           return p.join(' · ')
         },
         fields: [
-          { label: '本地转发 (-L)', name: 'localForward', span: 2, type: 'textarea',
-            placeholder: '8080:localhost:80\n3306:db.internal:3306\n每行一条：本地端口:目标主机:目标端口' },
-          { label: '远程转发 (-R)', name: 'remoteForward', span: 2, type: 'textarea',
-            placeholder: '9090:localhost:3000\n每行一条：远程端口:目标主机:目标端口' },
-          { label: '动态转发 (-D)', name: 'dynamicForward', span: 2, placeholder: '1080',
-            hint: '本地 SOCKS5 代理端口' },
+          { label: '转发规则', name: 'tunnels', span: 2, type: 'tunnels' },
         ],
       },
       {
@@ -547,10 +573,13 @@ watch(showNewConn, async v => {
       }
     }
     editingId.value = h.id
+    // 回填端口转发规则（拷贝一份，取消编辑时不污染原数据）
+    tunnelRules.value = (h.tunnels ?? []).map(t => ({ ...t }))
   } else {
     currentType.value = 'ssh'
     currentCardId.value = FORMS.ssh.cards[0].id
     editingId.value = null
+    tunnelRules.value = []
   }
   nextTick(() => setTimeout(() => {
     const el = modalEl.value?.querySelector('.content-pane input:not([type=hidden])') as HTMLElement | null
@@ -566,6 +595,17 @@ function close() {
 
 function onKey(e: KeyboardEvent) {
   if (!showNewConn.value) return
+  // 全局确认弹窗（如删除规则确认）打开时，按键交给 ConfirmModal 处理
+  if (confirmState.visible.value) return
+  if (tnlEditorOpen.value) {
+    // 隧道编辑子弹窗打开时：Esc 只关子弹窗，主弹窗快捷键全部忽略
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      closeTnlEditor()
+    }
+    return
+  }
   if (e.key === 'Escape') {
     e.preventDefault()
     close()
@@ -638,6 +678,241 @@ function focusTagControl(e: Event) {
   (e.currentTarget as HTMLElement).querySelector('input')?.focus()
 }
 watch([currentType, currentCardId], () => { tagDraft.value = '' })
+
+/* =========================================================
+   端口转发：列表操作与规则编辑子弹窗
+   ========================================================= */
+const tnlEditorOpen = ref(false)
+const tnlEditingId = ref<string | null>(null)
+const tnlModalEl = ref<HTMLElement | null>(null)
+const tnlErrors = reactive<Record<string, boolean>>({})
+const tnlForm = reactive({
+  name: '',
+  type: 'local' as TunnelType,
+  bindHost: '127.0.0.1',
+  bindPort: '80',
+  targetHost: '',
+  targetPort: '80',
+})
+
+function tnlUid(): string {
+  return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+}
+
+function defaultTnlName(type: TunnelType, port: number): string {
+  return `${TNL_META[type].label} ${port}`
+}
+
+function openTnlEditor(rule?: TunnelRule) {
+  tnlEditingId.value = rule ? rule.id : null
+  tnlForm.name = rule?.name ?? ''
+  tnlForm.type = rule?.type ?? 'local'
+  tnlForm.bindHost = rule?.bindHost ?? '127.0.0.1'
+  tnlForm.bindPort = rule ? String(rule.bindPort) : '80'
+  tnlForm.targetHost = rule?.targetHost ?? ''
+  tnlForm.targetPort = rule ? String(rule.targetPort ?? '80') : '80'
+  Object.keys(tnlErrors).forEach(k => delete tnlErrors[k])
+  tnlEditorOpen.value = true
+  nextTick(() => setTimeout(() => {
+    ;(tnlModalEl.value?.querySelector('input') as HTMLElement | null)?.focus()
+  }, 60))
+}
+
+function closeTnlEditor() {
+  tnlEditorOpen.value = false
+  tnlEditingId.value = null
+}
+
+function validTnlPort(raw: string): number | null {
+  const n = Number(raw)
+  return raw && Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null
+}
+
+/** 端口步进（自定义上下按钮），clamp 到 1–65535 */
+function stepTnlPort(key: 'bindPort' | 'targetPort', delta: number) {
+  const cur = parseInt(tnlForm[key], 10) || 0
+  tnlForm[key] = String(Math.min(65535, Math.max(1, cur + delta)))
+  tnlErrors[key] = false
+}
+
+function saveTnlRule() {
+  Object.keys(tnlErrors).forEach(k => delete tnlErrors[k])
+  // 两个端口规则一致：留空默认 80，填了则校验 1–65535
+  const rawBindPort = tnlForm.bindPort.trim()
+  const bindPort = rawBindPort ? validTnlPort(rawBindPort) : 80
+  if (!bindPort) tnlErrors.bindPort = true
+  let targetPort: number | null = null
+  if (tnlForm.type !== 'dynamic') {
+    if (!tnlForm.targetHost.trim()) tnlErrors.targetHost = true
+    const rawTargetPort = tnlForm.targetPort.trim()
+    targetPort = rawTargetPort ? validTnlPort(rawTargetPort) : 80
+    if (!targetPort) tnlErrors.targetPort = true
+  }
+  if (Object.keys(tnlErrors).length) return
+
+  const payload: TunnelRule = {
+    id: tnlEditingId.value ?? tnlUid(),
+    type: tnlForm.type,
+    name: tnlForm.name.trim() || defaultTnlName(tnlForm.type, bindPort!),
+    enabled: true,
+    bindHost: tnlForm.bindHost.trim() || '127.0.0.1',
+    bindPort: bindPort!,
+  }
+  if (tnlForm.type !== 'dynamic') {
+    payload.targetHost = tnlForm.targetHost.trim()
+    payload.targetPort = targetPort!
+  }
+
+  if (tnlEditingId.value) {
+    const idx = tunnelRules.value.findIndex(t => t.id === tnlEditingId.value)
+    if (idx !== -1) {
+      payload.enabled = tunnelRules.value[idx]!.enabled // 编辑保留原启用状态
+      tunnelRules.value[idx] = payload
+    }
+  } else {
+    tunnelRules.value.push(payload)
+  }
+  closeTnlEditor()
+}
+
+async function removeTnlRule(rule: TunnelRule) {
+  const ok = await confirmDialog(`确定删除转发规则「${rule.name}」？`, '删除规则', {
+    danger: true, confirmText: '删除',
+  })
+  if (!ok) return
+  tunnelRules.value = tunnelRules.value.filter(t => t.id !== rule.id)
+  toast(`已删除转发规则「${rule.name}」`, 'info', 2000)
+}
+
+function toggleTnlRule(rule: TunnelRule, ev: Event) {
+  rule.enabled = (ev.target as HTMLInputElement).checked
+}
+
+/** 卡片 mousedown 时动态决定是否可拖拽（交互控件上不启动拖拽） */
+function onTnlCardMousedown(e: MouseEvent) {
+  const card = e.currentTarget as HTMLElement
+  card.draggable = !(e.target as HTMLElement).closest('button, input, label')
+}
+
+function onTnlDragKey(id: string, e: KeyboardEvent) {
+  if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    moveTnlRule(id, -1)
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    moveTnlRule(id, 1)
+  }
+}
+
+/** 「N / M 已启用」计数 */
+const tnlEnabledCount = computed(() => tunnelRules.value.filter(t => t.enabled).length)
+
+/* ---- 排序：拖拽 + 手柄聚焦后 ↑ / ↓ ---- */
+const tnlDraggingId = ref<string | null>(null)
+
+function moveTnlRule(id: string, dir: -1 | 1) {
+  const list = tunnelRules.value
+  const idx = list.findIndex(t => t.id === id)
+  const next = idx + dir
+  if (idx === -1 || next < 0 || next >= list.length) return
+  ;[list[idx], list[next]] = [list[next]!, list[idx]!]
+}
+
+function onTnlDragStart(rule: TunnelRule) {
+  tnlDraggingId.value = rule.id
+}
+function onTnlDragOver(e: DragEvent, rule: TunnelRule) {
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  const from = tunnelRules.value.findIndex(t => t.id === tnlDraggingId.value)
+  const to = tunnelRules.value.findIndex(t => t.id === rule.id)
+  if (from === -1 || to === -1 || from === to) return
+  const [moved] = tunnelRules.value.splice(from, 1)
+  tunnelRules.value.splice(to, 0, moved!)
+}
+function onTnlDragEnd() {
+  tnlDraggingId.value = null
+}
+
+/* ---- 等效命令预览 ---- */
+interface CmdToken { cls: string; text: string }
+
+/** 子弹窗内等效命令（随表单输入实时更新；目标端口留空时以弱化样式展示默认值 80） */
+const tnlCmd = computed<CmdToken[]>(() => {
+  const bindHost = tnlForm.bindHost.trim()
+  const bindPort = tnlForm.bindPort.trim()
+  const targetHost = tnlForm.targetHost.trim()
+  const targetPort = tnlForm.targetPort.trim()
+  const seg = (host: string, port: string, hostFb: string, portFb: string): CmdToken[] => [
+    { cls: 'c-arg', text: host || hostFb },
+    { cls: 'c-sep', text: ':' },
+    { cls: port ? 'c-arg' : 'c-ph', text: port || portFb },
+  ]
+  const tokens: CmdToken[] = [
+    { cls: 'c-prompt', text: '$' },
+    { cls: 'c-cmd', text: 'ssh' },
+    { cls: 'c-flag', text: '-N' },
+  ]
+  if (tnlForm.type === 'dynamic') {
+    tokens.push({ cls: 'c-flag', text: '-D' }, ...seg(bindHost, bindPort, '127.0.0.1', '80'))
+  } else {
+    tokens.push(
+      { cls: 'c-flag', text: tnlForm.type === 'local' ? '-L' : '-R' },
+      ...seg(bindHost, bindPort, '127.0.0.1', '80'),
+      { cls: 'c-sep', text: ':' },
+      ...seg(targetHost, targetPort, 'localhost', '80'),
+    )
+  }
+  tokens.push({ cls: 'c-host', text: 'user@host' })
+  return tokens
+})
+
+const tnlCmdText = computed(() => {
+  const bindHost = tnlForm.bindHost.trim() || '127.0.0.1'
+  const bindPort = tnlForm.bindPort.trim() || '80'
+  let cmd = 'ssh -N'
+  if (tnlForm.type === 'dynamic') {
+    cmd += ` -D ${bindHost}:${bindPort}`
+  } else {
+    cmd += ` ${tnlForm.type === 'local' ? '-L' : '-R'} ` +
+      `${bindHost}:${bindPort}:${tnlForm.targetHost.trim() || 'localhost'}:${tnlForm.targetPort.trim() || '80'}`
+  }
+  return cmd + ' user@host'
+})
+
+async function copyTnlCmd() {
+  if (await copyText(tnlCmdText.value)) toast('命令已复制', 'ok', 1600)
+}
+
+/** 列表底部命令预览：多行续行符格式，仅包含启用的规则 */
+const tnlPreview = computed<CmdToken[][]>(() => {
+  const active = tunnelRules.value.filter(t => t.enabled)
+  const user = (values.value.user || '').trim()
+  const host = (values.value.host || '').trim()
+  const target = user && host ? `${user}@${host}` : 'user@example.com'
+  if (!active.length) {
+    return [[{ cls: 'c-cmd', text: 'ssh' }, { cls: 'c-host', text: target }]]
+  }
+  const lines: CmdToken[][] = [
+    [
+      { cls: 'c-cmd', text: 'ssh' },
+      { cls: 'c-flag', text: '-N' },
+      { cls: 'c-sep', text: '\\' },
+    ],
+  ]
+  active.forEach(t => {
+    const arg = t.type === 'dynamic'
+      ? `${t.bindHost}:${t.bindPort}`
+      : `${t.bindHost}:${t.bindPort}:${t.targetHost}:${t.targetPort}`
+    lines.push([
+      { cls: 'c-flag', text: TNL_META[t.type].flag },
+      { cls: 'c-arg', text: arg },
+      { cls: 'c-sep', text: '\\' },
+    ])
+  })
+  lines.push([{ cls: 'c-host', text: target }])
+  return lines
+})
 
 function isVisible(f: FieldDef) {
   return !f.showWhen || f.showWhen(values.value)
@@ -787,6 +1062,7 @@ function autoName(v: Values): string {
 
 async function save() {
   if (saving.value) return
+  if (tnlEditorOpen.value) return // 隧道编辑子弹窗打开时不触发主保存
   if (!validate()) {
     toast('请先完善必填项', 'warn')
     return
@@ -808,6 +1084,7 @@ async function save() {
   const tagVal = tagList.length ? tagList.join(',') : (currentType.value === 'sftp' ? 'SFTP' : '新建')
   const connType = currentType.value
   const hasPassword = v.auth === 'password' && !!v.password
+  const tunnelsVal = tunnelRules.value.length ? tunnelRules.value.map(t => ({ ...t })) : undefined
 
   /** 保存密码到系统钥匙串（Tauri 环境）；浏览器 dev 模式跳过。
    *  改名场景下旧 id 的钥匙串条目已由 updateHost 内部清理。 */
@@ -830,6 +1107,7 @@ async function save() {
       tag: tagVal,
       group: v.group || GROUP_OPTIONS[0],
       keyPath: v.auth === 'key' ? v.keyfile : undefined,
+      tunnels: connType === 'ssh' ? tunnelsVal : undefined,
       // 密码仅暂存内存（hostToStored 不会写入 JSON），供本次会话连接直接使用；
       // 同时异步写入系统钥匙串，供下次启动读取
       password: v.auth === 'password' ? v.password : undefined,
@@ -862,6 +1140,7 @@ async function save() {
       uptime: '—',
       group: v.group || GROUP_OPTIONS[0],
       keyPath: v.auth === 'key' ? v.keyfile : undefined,
+      tunnels: isSftp ? undefined : tunnelsVal,
       // 密码仅暂存内存（不入 JSON），首次连接直接使用免弹框；钥匙串持久化由 persistPassword 完成
       password: v.auth === 'password' ? v.password : undefined,
     }
@@ -1044,6 +1323,90 @@ async function save() {
                   @input="setField(f.name, ($event.target as HTMLTextAreaElement).value)"
                 ></textarea>
 
+                <!-- 端口转发：规则列表 -->
+                <div v-else-if="f.type === 'tunnels'" class="tnl-field">
+                  <div class="tnl-head">
+                    <span class="tnl-count">{{ tnlEnabledCount }} / {{ tunnelRules.length }} 已启用</span>
+                    <button type="button" class="btn tnl-add" @click="openTnlEditor()">+ 新建</button>
+                  </div>
+
+                  <div v-if="!tunnelRules.length" class="tnl-empty">
+                    <strong>暂无转发规则</strong>
+                    点击右上角「新建」添加第一条端口映射规则
+                  </div>
+                  <div v-else class="tnl-list">
+                    <div
+                      v-for="rule in tunnelRules"
+                      :key="rule.id"
+                      class="tnl-card"
+                      :class="[`t-${rule.type}`, { disabled: !rule.enabled, dragging: tnlDraggingId === rule.id }]"
+                      draggable="false"
+                      @mousedown="onTnlCardMousedown($event)"
+                      @dragstart="onTnlDragStart(rule)"
+                      @dragover="onTnlDragOver($event, rule)"
+                      @dragend="onTnlDragEnd"
+                    >
+                      <div
+                        class="tnl-drag" tabindex="0"
+                        title="拖拽调整顺序（聚焦后按 ↑ / ↓ 亦可）"
+                        @keydown="onTnlDragKey(rule.id, $event)"
+                      >
+                        <svg width="9" height="14" viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">
+                          <circle cx="2" cy="3" r="1.3"/><circle cx="8" cy="3" r="1.3"/>
+                          <circle cx="2" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/>
+                          <circle cx="2" cy="13" r="1.3"/><circle cx="8" cy="13" r="1.3"/>
+                        </svg>
+                      </div>
+
+                      <div class="tnl-body">
+                        <div class="tnl-top">
+                          <span class="tnl-badge">{{ TNL_META[rule.type].label }} {{ TNL_META[rule.type].flag }}</span>
+                          <span class="tnl-name">{{ rule.name }}</span>
+                        </div>
+                        <div class="tnl-route">
+                          <span class="tnl-ep">
+                            <i class="tnl-ep-role">{{ rule.type === 'remote' ? '远端' : '本地' }}</i>
+                            <code>{{ rule.bindHost }}:{{ rule.bindPort }}</code>
+                          </span>
+                          <template v-if="rule.type !== 'dynamic'">
+                            <svg class="tnl-arrow" width="11" height="11" viewBox="0 0 24 24" fill="none"
+                                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+                            </svg>
+                            <span class="tnl-ep">
+                              <i class="tnl-ep-role">{{ rule.type === 'remote' ? '本地' : '远端' }}</i>
+                              <code>{{ rule.targetHost }}:{{ rule.targetPort }}</code>
+                            </span>
+                          </template>
+                          <span v-else class="tnl-ep"><i class="tnl-ep-role">SOCKS5</i></span>
+                        </div>
+                      </div>
+
+                      <div class="tnl-actions">
+                        <label class="st-switch" :title="rule.enabled ? '点击禁用' : '点击启用'">
+                          <input type="checkbox" :checked="rule.enabled" @change="toggleTnlRule(rule, $event)" />
+                        </label>
+                        <button type="button" class="tnl-icon-btn" title="编辑" @click="openTnlEditor(rule)">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                               stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+                          </svg>
+                        </button>
+                        <button type="button" class="tnl-icon-btn danger" title="删除" @click="removeTnlRule(rule)">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                               stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="tunnelRules.length" class="tnl-hint">
+                    拖拽左侧 <b>⠿</b> 手柄调整顺序，或聚焦后按 <kbd>↑</kbd> <kbd>↓</kbd> 移动
+                  </div>
+                </div>
+
                 <input
                   v-else
                   :id="`f-${f.name}`"
@@ -1060,6 +1423,16 @@ async function save() {
 
                 <span v-if="f.hint" class="desc">{{ f.hint }}</span>
                 <span class="error-text">{{ errorText(f) }}</span>
+              </div>
+
+              <!-- 命令预览：从转发规则实时派生，跟随转发规则渲染，无需字段定义 -->
+              <div v-if="card.id === 'forward'" class="field">
+                <label>命令预览</label>
+                <div class="tnl-preview">
+                  <div class="tnl-preview-body">
+                    <span v-for="(line, li) in tnlPreview" :key="li" class="ln"><template v-for="(tk, ti) in line" :key="ti"><span :class="tk.cls">{{ tk.text }}</span>{{ ' ' }}</template></span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1112,6 +1485,132 @@ async function save() {
           </svg>
           {{ saving ? '保存中…' : (isEdit ? '保存修改' : '保存并连接') }}
         </button>
+      </div>
+    </div>
+
+    <!-- 隧道规则编辑子弹窗 -->
+    <div v-if="tnlEditorOpen" class="tnl-mask" @click.self="closeTnlEditor">
+      <div ref="tnlModalEl" class="tnl-modal" role="dialog" aria-modal="true" @keydown.enter.exact.prevent="saveTnlRule">
+        <div class="tnl-modal-head">
+          <span>{{ tnlEditingId ? '编辑转发规则' : '新建转发规则' }}</span>
+          <button type="button" class="modal-close" title="关闭" @click="closeTnlEditor">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <div class="tnl-modal-body">
+          <div class="field">
+            <label for="tnl-name">名称</label>
+            <input
+              id="tnl-name" v-model="tnlForm.name" type="text"
+              placeholder="留空自动生成，如：本地转发 3306" maxlength="40"
+              autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+            >
+          </div>
+
+          <div class="field">
+            <label>转发类型</label>
+            <div class="segmented">
+              <button
+                v-for="(m, t) in TNL_META" :key="t" type="button"
+                :class="{ active: tnlForm.type === t }"
+                @click="tnlForm.type = t as TunnelType"
+              >
+                {{ m.label }} {{ m.flag }}
+              </button>
+            </div>
+          </div>
+
+          <div class="tnl-grid2">
+            <div class="field">
+              <label for="tnl-bindHost">{{ TNL_UI[tnlForm.type].bind }}</label>
+              <input
+                id="tnl-bindHost" v-model="tnlForm.bindHost" type="text"
+                placeholder="127.0.0.1"
+                autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+              >
+            </div>
+            <div class="field">
+              <label for="tnl-bindPort">端口</label>
+              <div class="tnl-spin">
+                <input
+                  id="tnl-bindPort" :value="tnlForm.bindPort" type="number"
+                  min="1" max="65535"
+                  :class="{ invalid: tnlErrors.bindPort }"
+                  @input="tnlForm.bindPort = ($event.target as HTMLInputElement).value; tnlErrors.bindPort = false"
+                >
+                <div class="tnl-spin-btns">
+                  <button type="button" tabindex="-1" aria-label="增加" @click="stepTnlPort('bindPort', 1)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 14l6-6 6 6"/></svg>
+                  </button>
+                  <button type="button" tabindex="-1" aria-label="减少" @click="stepTnlPort('bindPort', -1)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 10l6 6 6-6"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-show="tnlForm.type !== 'dynamic'" class="tnl-grid2">
+            <div class="field">
+              <label for="tnl-targetHost">{{ TNL_UI[tnlForm.type].target }}</label>
+              <input
+                id="tnl-targetHost" v-model="tnlForm.targetHost" type="text"
+                placeholder="10.0.0.1"
+                :class="{ invalid: tnlErrors.targetHost }"
+                autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                @input="tnlErrors.targetHost = false"
+              >
+            </div>
+            <div class="field">
+              <label for="tnl-targetPort">端口</label>
+              <div class="tnl-spin">
+                <input
+                  id="tnl-targetPort" :value="tnlForm.targetPort" type="number"
+                  min="1" max="65535"
+                  :class="{ invalid: tnlErrors.targetPort }"
+                  @input="tnlForm.targetPort = ($event.target as HTMLInputElement).value; tnlErrors.targetPort = false"
+                >
+                <div class="tnl-spin-btns">
+                  <button type="button" tabindex="-1" aria-label="增加" @click="stepTnlPort('targetPort', 1)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 14l6-6 6 6"/></svg>
+                  </button>
+                  <button type="button" tabindex="-1" aria-label="减少" @click="stepTnlPort('targetPort', -1)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 10l6 6 6-6"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tnl-type-hint">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+            </svg>
+            <span>{{ TNL_UI[tnlForm.type].desc }}</span>
+          </div>
+
+          <div class="field">
+            <label>等效命令</label>
+            <div class="tnl-cmd">
+              <code class="tnl-cmd-body"><template v-for="(tk, i) in tnlCmd" :key="i"><span :class="tk.cls">{{ tk.text }}</span>{{ ' ' }}</template></code>
+              <button type="button" class="tnl-copy" title="复制命令" @click="copyTnlCmd">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="tnl-modal-foot">
+          <button type="button" class="btn ghost" @click="closeTnlEditor">取消</button>
+          <button type="button" class="btn primary" @click="saveTnlRule">保存</button>
+        </div>
       </div>
     </div>
   </div>

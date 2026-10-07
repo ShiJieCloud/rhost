@@ -931,6 +931,202 @@ body{
 }
 .tag-chip-x:hover{opacity:1;background:var(--hover);color:var(--text)}
 .tag-chip-x svg{width:9px;height:9px;display:block}
+/* ---------- 端口转发（隧道规则列表） ---------- */
+.tnl-field{display:grid;gap:8px}
+.tnl-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tnl-count{
+    font-size:10px;color:var(--muted);letter-spacing:.3px;
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:999px;padding:2px 9px;
+}
+.tnl-add{height:26px;padding:0 11px;font-size:11px;border-radius:6px}
+.tnl-list{display:flex;flex-direction:column;gap:5px}
+.tnl-card{
+    display:flex;align-items:center;gap:9px;
+    padding:7px 10px;
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:8px;
+    user-select:none;
+    transition:background .14s,border-color .14s;
+}
+.tnl-card:hover{background:var(--hover);border-color:#223041}
+.tnl-card.dragging{opacity:.4;border-style:dashed;border-color:rgba(61,220,132,.5)}
+.tnl-card.t-local{--t:var(--blue);--t-rgb:122,162,247}
+.tnl-card.t-remote{--t:var(--purple);--t-rgb:187,154,247}
+.tnl-card.t-dynamic{--t:var(--cyan);--t-rgb:79,214,224}
+.tnl-drag{
+    flex:none;width:14px;height:22px;
+    display:flex;align-items:center;justify-content:center;
+    color:#39465a;cursor:grab;border-radius:4px;outline:none;
+    opacity:.55;transition:.14s;
+}
+.tnl-card:hover .tnl-drag{opacity:1}
+.tnl-drag:hover{color:var(--muted);background:rgba(255,255,255,.04)}
+.tnl-drag:focus-visible{opacity:1;box-shadow:0 0 0 2px rgba(61,220,132,.4)}
+.tnl-drag:active{cursor:grabbing}
+.tnl-body{flex:1;min-width:0}
+.tnl-top{display:flex;align-items:center;gap:7px;margin-bottom:2px;min-width:0}
+.tnl-badge{
+    flex:none;display:inline-flex;align-items:center;gap:4px;
+    font-size:9.5px;font-weight:600;letter-spacing:.03em;
+    padding:1px 6px 1px 5px;border-radius:4px;
+    color:var(--t);background:rgba(var(--t-rgb),.1);
+    white-space:nowrap;line-height:1.6;
+}
+.tnl-badge::before{content:'';width:4px;height:4px;border-radius:50%;background:var(--t)}
+.tnl-name{
+    font-size:12px;font-weight:500;color:var(--text);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.tnl-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:10.5px}
+.tnl-ep{display:inline-flex;align-items:center;gap:4px;min-width:0}
+.tnl-ep-role{
+    flex:none;font-style:normal;
+    font-size:9px;font-weight:600;letter-spacing:.08em;
+    color:var(--muted-2);
+}
+.tnl-ep code{font-family:var(--mono);font-size:10.5px;color:#93a4bd;white-space:nowrap}
+.tnl-arrow{flex:none;color:#334054}
+.tnl-actions{flex:none;display:flex;align-items:center;gap:2px}
+.tnl-icon-btn{
+    width:24px;height:24px;flex:none;padding:0;
+    display:grid;place-items:center;
+    border-radius:6px;border:1px solid transparent;
+    background:transparent;color:var(--muted-2);
+    cursor:pointer;transition:.13s;
+}
+.tnl-icon-btn:hover{background:rgba(255,255,255,.05);color:var(--text);border-color:var(--border)}
+.tnl-icon-btn.danger:hover{color:var(--red);background:rgba(247,118,142,.1);border-color:rgba(247,118,142,.28)}
+.tnl-icon-btn svg{width:13px;height:13px}
+.tnl-card.disabled{background:#0d131c;border-color:var(--border-soft)}
+.tnl-card.disabled .tnl-name{color:var(--muted)}
+.tnl-card.disabled .tnl-badge{opacity:.5}
+.tnl-card.disabled .tnl-ep code{color:#4a586c}
+.tnl-empty{
+    text-align:center;padding:22px 16px;
+    border:1px dashed var(--border);border-radius:8px;
+    color:var(--muted-2);font-size:11px;
+}
+.tnl-empty strong{display:block;color:var(--muted);font-weight:500;margin-bottom:3px;font-size:12px}
+.tnl-hint{
+    font-size:10px;color:var(--muted-2);letter-spacing:.2px;
+    background:#0a0f16;
+    border:1px dashed var(--border);border-radius:6px;
+    padding:4px 9px;
+}
+.tnl-hint b{color:var(--muted);font-weight:500}
+.tnl-hint kbd{
+    font-family:inherit;font-size:9.5px;
+    background:var(--panel-2);border:1px solid var(--border);border-bottom-width:2px;
+    border-radius:3px;padding:0 4px;color:var(--muted);
+}
+.tnl-preview{
+    background:#080d14;
+    border:1px solid var(--border-soft);border-radius:7px;
+    padding:9px 12px 10px;
+}
+.tnl-preview-body{
+    display:grid;gap:1px;
+    overflow-x:auto;white-space:pre;
+    font-family:var(--mono);font-size:11px;line-height:1.75;
+    color:#7f92ab;
+}
+.tnl-preview-body .ln{display:block;min-width:max-content;padding-left:4px}
+.tnl-preview-body .ln+.ln{padding-left:26px}
+/* 命令语法高亮 token（列表预览与子弹窗等效命令共用） */
+.c-cmd{color:var(--green);font-weight:600}
+.c-flag{color:var(--blue);font-weight:600}
+.c-arg{color:var(--yellow)}
+.c-host{color:var(--purple)}
+.c-sep{color:#3a475c}
+.c-ph{color:#3a475c;font-style:italic}
+.c-prompt{color:#3a475c;font-weight:600;margin-right:2px;user-select:none}
+/* 隧道规则编辑子弹窗 */
+.tnl-mask{
+    position:fixed;inset:0;z-index:5;
+    background:rgba(4,7,12,.68);
+    backdrop-filter:blur(2px);
+    display:flex;align-items:center;justify-content:center;
+    padding:20px;
+    animation:tnlFade .14s ease;
+}
+@keyframes tnlFade{from{opacity:0}to{opacity:1}}
+.tnl-modal{
+    width:100%;max-width:470px;max-height:calc(100vh - 60px);
+    overflow-y:auto;
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:12px;
+    box-shadow:0 24px 60px -18px rgba(0,0,0,.75);
+    animation:tnlPop .16s cubic-bezier(.2,.9,.3,1.15);
+}
+@keyframes tnlPop{from{transform:translateY(8px) scale(.985);opacity:0}to{transform:none;opacity:1}}
+.tnl-modal-head{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:11px 15px;
+    border-bottom:1px solid var(--border);
+    font-size:12.5px;font-weight:600;color:#fff;letter-spacing:.2px;
+}
+.tnl-modal-body{padding:13px 15px 4px;display:grid;gap:11px}
+.tnl-modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 15px 14px}
+.tnl-grid2{display:grid;grid-template-columns:1fr 110px;gap:9px}
+/* 隧道端口自定义步进按钮：隐藏原生 number spinner，换主题色上下箭头 */
+.tnl-spin{position:relative}
+.tnl-spin input{padding-right:24px}
+.tnl-spin input[type=number]::-webkit-outer-spin-button,
+.tnl-spin input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.tnl-spin input[type=number]{-moz-appearance:textfield;appearance:textfield}
+.tnl-spin-btns{
+    position:absolute;right:4px;top:50%;transform:translateY(-50%);
+    display:flex;flex-direction:column;gap:1px;
+}
+.tnl-spin-btns button{
+    width:16px;height:11px;
+    display:grid;place-items:center;
+    padding:0;border:none;border-radius:3px;
+    background:transparent;color:var(--green);
+    cursor:pointer;transition:.12s;
+}
+.tnl-spin-btns button:hover{background:rgba(61,220,132,.15);filter:brightness(1.25)}
+.tnl-spin-btns button:active{transform:scale(.85)}
+.tnl-spin-btns svg{width:10px;height:10px;display:block}
+.tnl-type-hint{
+    display:flex;align-items:flex-start;gap:8px;
+    padding:8px 11px;
+    background:#0a0f16;
+    border:1px solid var(--border-soft);border-radius:7px;
+    font-size:10.5px;color:var(--muted);line-height:1.55;
+}
+.tnl-type-hint svg{flex:none;width:13px;height:13px;color:var(--muted-2);margin-top:1px}
+/* 等效命令代码块 */
+.tnl-cmd{
+    position:relative;display:flex;align-items:stretch;gap:5px;
+    background:#080d14;
+    border:1px solid var(--border-soft);border-radius:7px;
+    padding:2px;
+    overflow:hidden;transition:border-color .14s;
+}
+.tnl-cmd-body{
+    flex:1;min-width:0;display:block;
+    padding:7px 4px 7px 9px;
+    font-family:var(--mono);font-size:11px;line-height:1.65;
+    color:#7f92ab;white-space:nowrap;
+    overflow-x:auto;overflow-y:hidden;
+    scrollbar-width:thin;
+}
+.tnl-copy{
+    flex:none;align-self:center;
+    width:26px;height:26px;margin-right:2px;padding:0;
+    display:grid;place-items:center;
+    border-radius:6px;border:1px solid var(--border);
+    background:var(--panel-2);
+    color:var(--muted);cursor:pointer;transition:.13s;
+}
+.tnl-copy:hover{background:var(--hover);border-color:#223041;color:var(--text)}
+.tnl-copy:active{transform:scale(.94)}
+.tnl-copy svg{width:13px;height:13px}
 /* 底部按钮 */
 .modal-foot{
     display:flex;align-items:center;gap:10px;

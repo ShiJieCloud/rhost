@@ -12,6 +12,7 @@
 //! frame_rx ──► ipc 层转发到 Tauri Channel<Vec<u8>>
 //! ```
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 use super::frame::{FrameType, encode_frame};
 use super::sftp::SftpState;
+use super::tunnel::{REMOTE_CONNECT_TIMEOUT, RemoteRegistry, TunnelManager, run_relay_conn};
 use super::{AuthMethod, SessionConfig, SshError};
 use crate::applog;
 use crate::applog::events as ev;
@@ -70,6 +72,11 @@ pub(crate) struct ClientHandler {
     algo: Arc<StdMutex<Option<NegotiatedAlgo>>>,
     /// 会话标签（主机密钥指纹等握手期日志事件用）
     sid: String,
+    /// -R 回调查表：远端来连时按 (绑定地址, 绑定端口) 查出转发目标与规则闸门。
+    /// 与 `TunnelManager` 共享同一实例（`SshSession::connect` 创建后 Arc clone）。
+    remote: RemoteRegistry,
+    /// 会话级转发连接总闸（MAX_CONN_GLOBAL）：-R 回调与 TunnelManager 共用
+    global_conns: Arc<Semaphore>,
 }
 
 /// 会话初始化脚本（写入远端临时文件，由前端 source）。
@@ -328,6 +335,84 @@ impl client::Handler for ClientHandler {
             cipher: names.cipher.as_ref().to_string(),
         });
         async { Ok(()) }
+    }
+
+    /// 远程转发（-R）接入回调：远端 sshd 有新连接进入本地注册的监听端口时调用。
+    /// 流程（tunnel-design.md §6.5）：查表 → 并发闸门 → 连本地目标 → accept →
+    /// spawn 双向 copy。同步段先查表/clone 出 owned 数据，async 块不持
+    /// `&mut self` 跨 await（沿用 `kex_done` 既有手法）。
+    /// 未命中/闸门已满/本地目标连接失败一律 reject，绝不影响主连接与其他规则。
+    fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // 同步段：锁内 clone 出 binding（内含 Arc，clone 廉价）后立即放锁
+        let binding = self
+            .remote
+            .lookup(connected_address, connected_port as u16);
+        let global_conns = self.global_conns.clone();
+        let bound = format!("{connected_address}:{connected_port}");
+        async move {
+            let Some(binding) = binding else {
+                // 规则已停止或从未注册：拒绝接入（cancel-tcpip-forward 存在竞态窗口：
+                // 撤监听与回调投递并发，属正常时序，debug 即可）
+                debug!("远程转发 {bound} 回调未命中（规则已停止），拒绝接入");
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            };
+            // 并发闸门（与本地 accept 同一套防线）：try 语义失败立即拒绝，绝不排队
+            let permits = match (
+                binding.entry.rule_conns.clone().try_acquire_owned(),
+                global_conns.clone().try_acquire_owned(),
+            ) {
+                (Ok(a), Ok(b)) => (a, b),
+                (a, b) => {
+                    drop((a, b));
+                    debug!("远程转发 {bound} 并发闸门已满，拒绝接入");
+                    reply
+                        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                        .await;
+                    return Ok(());
+                }
+            };
+            // 先连本地目标再 accept：REMOTE_CONNECT_TIMEOUT 内连不上即拒绝，
+            // 不为注定失败的转发占用远端 channel
+            let target = (binding.target.host.as_str(), binding.target.port);
+            let tcp = match tokio::time::timeout(
+                REMOTE_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(target),
+            )
+            .await
+            {
+                Ok(Ok(tcp)) => tcp,
+                Ok(Err(e)) => {
+                    debug!(
+                        "远程转发 {bound} 连本地目标 {}:{} 失败: {e}",
+                        binding.target.host, binding.target.port
+                    );
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+                Err(_) => {
+                    debug!("远程转发 {bound} 连本地目标超时，拒绝接入");
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+            };
+            reply.accept().await;
+            // 双向 copy：活动计数/流量统计/许可收尾全在 run_relay_conn 内 RAII 管理；
+            // owned channel 可安全 move 进独立任务（russh 0.63.3 已验证）
+            tokio::spawn(run_relay_conn(channel, tcp, binding.entry, permits));
+            Ok(())
+        }
     }
 }
 
@@ -607,6 +692,9 @@ pub struct SshSession {
     /// Shell 当前工作目录：由 merge_task 解析 PTY 中的 OSC 6667 序列更新，
     /// sftp_list_dir 无参数时以此为默认目录，保持 Shell 与 SFTP CWD 一致。
     pub(super) cwd: Arc<Mutex<Option<String>>>,
+    /// 端口转发管理器：与 ClientHandler 共享 RemoteRegistry / 全局闸门，
+    /// 与 SFTP 子系统、metrics 采集器平级，共用同一条已认证主连接
+    tunnel: TunnelManager,
     /// 断开日志状态：共享给 read_task，防止主动关闭与异常断开重复记录
     dc_state: Arc<DisconnectState>,
 }
@@ -634,6 +722,10 @@ pub(crate) async fn connect_and_auth(
     cfg: &SessionConfig,
     algo: Arc<StdMutex<Option<NegotiatedAlgo>>>,
     sid: &str,
+    // -R 回调所需的共享件：正式连接传入与 TunnelManager 共享的实例；
+    // 测试连接无转发，传入默认值即可（registry 为空表，闸门不消费）
+    remote: RemoteRegistry,
+    global_conns: Arc<Semaphore>,
 ) -> Result<client::Handle<ClientHandler>, SshError> {
     let auth_method = match &cfg.auth {
         AuthMethod::Password(_) => "password",
@@ -708,6 +800,8 @@ pub(crate) async fn connect_and_auth(
         ClientHandler {
             algo: algo.clone(),
             sid: sid.to_string(),
+            remote,
+            global_conns,
         },
     )
     .await
@@ -917,9 +1011,21 @@ impl SshSession {
         //    连接阶段（MOTD/落盘/开 PTY）与连接后的指标 exec 通道共用同一个 handle，
         //    Mutex 串行化通道操作，Arc 保证 PTY 后台任务存活期间连接不被释放。
         //    algo 是 KEX 协商算法的出口（kex_done 回调已在认证前填入）。
+        //    remote/global_conns 先创建、后与 TunnelManager 共享：
+        //    ClientHandler 的 -R 回调与转发引擎走同一张注册表、同一套闸门。
         let algo = Arc::new(StdMutex::new(None));
-        let handle =
-            Arc::new(Mutex::new(connect_and_auth(&cfg, algo.clone(), sid).await?));
+        let remote = RemoteRegistry::default();
+        let global_conns = Arc::new(Semaphore::new(super::tunnel::MAX_CONN_GLOBAL));
+        let handle = Arc::new(Mutex::new(
+            connect_and_auth(
+                &cfg,
+                algo.clone(),
+                sid,
+                remote.clone(),
+                global_conns.clone(),
+            )
+            .await?,
+        ));
 
         // 2.【阶段 A/B】PTY 尚未打开：独立 exec 子通道并行采集服务器状态，
         //    本地组装 MOTD 渲染指令数组（不碰 PTY、不经键盘、不解析 shell 输出）。
@@ -1089,6 +1195,13 @@ impl SshSession {
             })),
         );
 
+        let tunnel = TunnelManager::new(
+            handle.clone(),
+            metrics_frame_tx.clone(),
+            cancel.clone(),
+            remote,
+            global_conns,
+        );
         Ok((
             Self {
                 cancel,
@@ -1098,6 +1211,7 @@ impl SshSession {
                 metrics: StdMutex::new(None),
                 sftp: SftpState::new(sid),
                 cwd,
+                tunnel,
                 dc_state,
             },
             frame_rx,
@@ -1248,6 +1362,9 @@ impl SshSession {
         if self.cancel.is_cancelled() {
             return;
         }
+        // 端口转发收尾：撤规则任务、清 -R 注册表、置 Stopped（同步实现，无 await）。
+        // 必须在 cancel 之前做：engine 内部还要读各 entry 的状态字段
+        self.tunnel.shutdown();
         // 采集任务挂在会话 cancel 的 child token 上，根取消即连带停止
         if let Ok(mut guard) = self.metrics.lock() {
             *guard = None;
@@ -1278,6 +1395,11 @@ impl SshSession {
     /// 会话标签（uuid 前 6 位）：供 metrics 采集器等跨模块组件的日志事件使用
     pub(crate) fn sid(&self) -> &str {
         &self.dc_state.sid
+    }
+
+    /// 端口转发管理器引用（供 manager/ipc 层转发 tunnel_start/tunnel_stop、e2e 直连调用）
+    pub fn tunnel(&self) -> &TunnelManager {
+        &self.tunnel
     }
 }
 
@@ -1312,7 +1434,17 @@ async fn read_task(
     let mut exit_log_reason = "eof";
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => {
+                // 取消令牌触发（shutdown）：发送 EOF 通知前端连接已断开
+                try_log_disconnect(&dc_state, "cancelled");
+                let _ = event_tx
+                    .send(PtyEvent::Eof {
+                        reason: None,
+                        lost: true,
+                    })
+                    .await;
+                break;
+            }
             msg = read_half.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {

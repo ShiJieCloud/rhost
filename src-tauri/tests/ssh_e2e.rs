@@ -5,6 +5,12 @@
 //! docker run -d --name rhost-test-sshd -p 2222:2222 \
 //!   -e PASSWORD_ACCESS=true -e USER_NAME=test -e USER_PASSWORD=rhost123 \
 //!   lscr.io/linuxserver/openssh-server:latest
+//! # 该镜像默认 sshd 配置禁用转发；隧道用例（tunnel_*）需开启转发、放宽 preauth
+//! # 并发并关闭来源惩罚（高并发闸门用例以 sshd 自身端口为数据面目标）后重启：
+//! docker exec rhost-test-sshd sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /config/sshd/sshd_config
+//! docker exec rhost-test-sshd sh -c 'echo "MaxStartups 100" >> /config/sshd/sshd_config'
+//! docker exec rhost-test-sshd sh -c 'echo "PerSourcePenalties no" >> /config/sshd/sshd_config'
+//! docker restart rhost-test-sshd
 //! ```
 //! 无容器时测试自动跳过（连接失败即视为环境缺失，不误报失败）。
 
@@ -1018,5 +1024,612 @@ async fn ssh_metrics_100_sessions_gated() {
     assert!(
         wait_inflight_drain(Duration::from_secs(5)).await,
         "100 会话关闭后在飞 exec 未归零"
+    );
+}
+
+/* ============================================================
+ * 端口转发 e2e（-L / -D / -R / next 策略 / 生命周期）
+ *
+ * 目标服务：容器内用 exec 起一个循环 nc 服务（每个接入客户端收到固定
+ * 标记后连接被关闭），随被测会话 shutdown 自动消亡，无需容器预置服务。
+ * 前提：容器为 Debian 系（OpenBSD netcat + curl），连接失败即跳过。
+ * ============================================================ */
+
+use rhost_lib::ssh::tunnel::{
+    DnsResolve, PortConflict, StartOptions, TunnelManager, TunnelRule, TunnelState, TunnelType,
+};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+/** 起一条本地/远程规则（target 127.0.0.1:target_port） */
+fn fwd_rule(id: &str, kind: TunnelType, bind_port: u16, target_port: u16) -> TunnelRule {
+    TunnelRule {
+        id: id.into(),
+        kind,
+        bind_host: "127.0.0.1".into(),
+        bind_port,
+        target_host: Some("127.0.0.1".into()),
+        target_port: Some(target_port),
+    }
+}
+
+/** 起一条动态（SOCKS5）规则 */
+fn socks_rule(id: &str, bind_port: u16) -> TunnelRule {
+    TunnelRule {
+        id: id.into(),
+        kind: TunnelType::Dynamic,
+        bind_host: "127.0.0.1".into(),
+        bind_port,
+        target_host: None,
+        target_port: None,
+    }
+}
+
+const STOP_OPTS: StartOptions = StartOptions {
+    port_conflict: PortConflict::Stop,
+    dns_resolve: DnsResolve::Remote,
+    retry_count: 0,
+};
+
+/// 轮询等待指定规则达到期望状态，超时返回该规则最终状态（供断言信息）
+async fn wait_state(
+    tunnel: &TunnelManager,
+    rule_id: &str,
+    want: TunnelState,
+    timeout: Duration,
+) -> Option<rhost_lib::ssh::tunnel::TunnelStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let cur = tunnel
+            .statuses()
+            .await
+            .into_iter()
+            .find(|s| s.id == rule_id);
+        if let Some(st) = &cur {
+            if st.state == want {
+                return cur;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return cur;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// -L/-D 数据面目标：容器内 sshd 自身端口（连接即回 `SSH-2.0` banner）。
+/// 不依赖额外标记服务——容器为 busybox 工具链，`printf | nc -lk` 在 stdin EOF
+/// 后不发数据即退出，无法作为可靠标记源；sshd 并发能力也足以支撑闸门压测。
+const SSHD_TARGET_PORT: u16 = 2222;
+const BANNER: &[u8] = b"SSH-2.0";
+
+/// 连接 127.0.0.1:port 读取服务端首包（如 sshd banner）。
+/// 连不上返回 None；连上后对端立即关闭/被闸门拒绝时返回空数据。
+async fn probe_banner(port: u16, timeout: Duration) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .ok()?
+        .ok()?;
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+        .await
+        .ok()?
+        .unwrap_or(0);
+    Some(buf[..n].to_vec())
+}
+
+/// SOCKS5 一次性客户端：无认证握手 → CONNECT 请求（IPv4/域名）→ 读响应与后续数据。
+/// 返回 (REP 码, 连接建立后的全部数据)。
+async fn socks_connect(
+    port: u16,
+    target: SocksTarget<'_>,
+    timeout: Duration,
+) -> Result<(u8, Vec<u8>), String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut s = tokio::time::timeout(timeout, TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .map_err(|_| "连接 SOCKS 监听超时".to_string())?
+        .map_err(|e| format!("连接 SOCKS 监听失败: {e}"))?;
+
+    // 方法协商：仅 0x00
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await.unwrap();
+    if method != [0x05, 0x00] {
+        return Err(format!("方法协商响应异常: {method:?}"));
+    }
+
+    // CONNECT 请求
+    let mut req = vec![0x05, 0x01, 0x00];
+    let port = match target {
+        SocksTarget::Ipv4(ip, p) => {
+            req.push(0x01);
+            req.extend_from_slice(&ip.octets());
+            p
+        }
+        SocksTarget::Domain(host, p) => {
+            req.push(0x03);
+            req.push(host.len() as u8);
+            req.extend_from_slice(host.as_bytes());
+            p
+        }
+    };
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).await.unwrap();
+
+    // 响应：VER REP RSV ATYP BND.ADDR BND.PORT（最短 10 字节，IPv4 BND）
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    let rep = reply[1];
+
+    // 建立成功才继续读目标服务首包（如 sshd banner）
+    let mut data = [0u8; 256];
+    if rep == 0x00 {
+        let n = tokio::time::timeout(timeout, s.read(&mut data))
+            .await
+            .map_err(|_| "读目标首包超时".to_string())?
+            .map_err(|e| format!("读目标首包失败: {e}"))?;
+        return Ok((rep, data[..n].to_vec()));
+    }
+    Ok((rep, Vec::new()))
+}
+
+enum SocksTarget<'a> {
+    Ipv4(std::net::Ipv4Addr, u16),
+    Domain(&'a str, u16),
+}
+
+/// -L 基础链路：容器内 sshd（经 direct-tcpip）读回 banner；0x0A 状态帧可解析且含
+/// Active 规则；stop 后规则 Stopped、本地端口释放。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_local_forward_roundtrip_and_status_frame() {
+    let (session, mut frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+
+    let tunnel = session.tunnel();
+    tunnel
+        .start(
+            fwd_rule("e2e-l1", TunnelType::Local, 21001, SSHD_TARGET_PORT),
+            STOP_OPTS,
+        )
+        .await
+        .expect("启动 -L 规则");
+
+    let st = wait_state(tunnel, "e2e-l1", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+    assert_eq!(st.bound_port, 21001, "固定端口 bind 后 bound_port 应一致");
+
+    // 0x0A 状态帧：JSON {"tunnels":[...]} 含 active 的 e2e-l1
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_frame = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), frame_rx.recv()).await {
+            Ok(Some(frame)) => {
+                if let Some((0x0A, payload)) = decode_frame(&frame) {
+                    let v: serde_json::Value = match serde_json::from_slice(payload) {
+                        Ok(v) => v,
+                        Err(e) => panic!("0x0A payload 非 JSON: {e}"),
+                    };
+                    let hit = v["tunnels"].as_array().is_some_and(|arr| {
+                        arr.iter()
+                            .any(|r| r["id"] == "e2e-l1" && r["state"] == "active")
+                    });
+                    if hit {
+                        saw_frame = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_frame, "未收到含 e2e-l1 active 的 0x0A 状态帧");
+
+    // 数据面：本地监听 → SSH direct-tcpip → 容器内 sshd banner
+    let data = probe_banner(21001, Duration::from_secs(10))
+        .await
+        .expect("应能连接本地转发监听");
+    assert!(
+        data.windows(BANNER.len()).any(|w| w == BANNER),
+        "未读到 sshd banner: {:?}",
+        String::from_utf8_lossy(&data)
+    );
+
+    // 停止：Stopped + 端口释放
+    tunnel.stop("e2e-l1").await.expect("停止规则");
+    wait_state(tunnel, "e2e-l1", TunnelState::Stopped, Duration::from_secs(5))
+        .await
+        .expect("规则应 Stopped");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21001)))
+            .await
+            .map(|r| r.is_err())
+            .unwrap_or(true),
+        "停止后本地端口应已释放"
+    );
+
+    session.shutdown();
+}
+
+/// -L 高并发闸门：100 条并发 > 单规则 64 许可——恰好 64 条成功、其余立即关闭、
+/// 监听器不崩溃且继续服务新连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_local_forward_high_concurrency_gate() {
+    let (session, _frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+
+    let tunnel = session.tunnel();
+    tunnel
+        .start(
+            fwd_rule("e2e-c1", TunnelType::Local, 21002, SSHD_TARGET_PORT),
+            STOP_OPTS,
+        )
+        .await
+        .expect("启动 -L 规则");
+    wait_state(tunnel, "e2e-c1", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+
+    const N: usize = 100;
+    const EXPECT_OK: usize = 64;
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..N {
+        set.spawn(probe_banner(21002, Duration::from_secs(20)));
+    }
+    let (mut ok, mut fail) = (0usize, 0usize);
+    while let Some(res) = set.join_next().await {
+        match res.unwrap() {
+            Some(data) if data.windows(BANNER.len()).any(|w| w == BANNER) => ok += 1,
+            _ => fail += 1,
+        }
+    }
+    eprintln!("高并发：ok={ok} fail={fail}");
+    assert_eq!(ok, EXPECT_OK, "应恰好 {EXPECT_OK} 条成功（闸门 64 许可）");
+    assert_eq!(ok + fail, N, "全部连接均应有明确结局（无悬挂）");
+
+    // 监听器存活：闸门打满后新连接照常服务
+    let data = probe_banner(21002, Duration::from_secs(10))
+        .await
+        .expect("高并发后监听器应继续服务");
+    assert!(
+        data.windows(BANNER.len()).any(|w| w == BANNER),
+        "后续连接未读到 sshd banner"
+    );
+
+    session.shutdown();
+}
+
+/// -D SOCKS5：IPv4 ATYP、域名 ATYP（local 解析 / remote 解析）三条链路，
+/// 以及非法 CMD（BIND）回 0x07 命令不支持。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_dynamic_socks5_forward() {
+    let (session, _frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+
+    let tunnel = session.tunnel();
+    // local 解析规则
+    tunnel
+        .start(
+            socks_rule("e2e-d1", 21003),
+            StartOptions { dns_resolve: DnsResolve::Local, ..STOP_OPTS },
+        )
+        .await
+        .expect("启动 -D(local) 规则");
+    wait_state(tunnel, "e2e-d1", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+    // remote 解析规则
+    tunnel
+        .start(socks_rule("e2e-d2", 21004), STOP_OPTS)
+        .await
+        .expect("启动 -D(remote) 规则");
+    wait_state(tunnel, "e2e-d2", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+
+    // (a) IPv4 ATYP → 容器内 sshd
+    let (rep, data) = socks_connect(
+        21003,
+        SocksTarget::Ipv4(std::net::Ipv4Addr::LOCALHOST, SSHD_TARGET_PORT),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("IPv4 CONNECT 失败");
+    assert_eq!(rep, 0x00, "IPv4 CONNECT 应成功");
+    assert!(
+        data.windows(BANNER.len()).any(|w| w == BANNER),
+        "IPv4 链路未读到 sshd banner"
+    );
+
+    // (b) 域名 ATYP + local 解析（localhost → 127.0.0.1）
+    let (rep, data) = socks_connect(
+        21003,
+        SocksTarget::Domain("localhost", SSHD_TARGET_PORT),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("域名(local) CONNECT 失败");
+    assert_eq!(rep, 0x00, "域名 CONNECT（local 解析）应成功");
+    assert!(
+        data.windows(BANNER.len()).any(|w| w == BANNER),
+        "域名链路（local 解析）未读到 sshd banner"
+    );
+
+    // (c) 域名 ATYP + remote 解析（域名透传 sshd）
+    let (rep, data) = socks_connect(
+        21004,
+        SocksTarget::Domain("localhost", SSHD_TARGET_PORT),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("域名(remote) CONNECT 失败");
+    assert_eq!(rep, 0x00, "域名 CONNECT（remote 解析）应成功");
+    assert!(
+        data.windows(BANNER.len()).any(|w| w == BANNER),
+        "域名链路（remote 解析）未读到 sshd banner"
+    );
+
+    // (d) 非法 CMD（0x02 BIND）→ REP 0x07 命令不支持
+    let mut s = TcpStream::connect(("127.0.0.1", 21003)).await.unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await.unwrap();
+    s.write_all(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x07, "BIND 应回命令不支持(0x07)，实际 {:#x}", reply[1]);
+
+    session.shutdown();
+}
+
+/// -R 远程转发：远端（容器）绑定端口回源到本进程 HTTP 目标；curl 单发 + 64 路并发
+/// 全部成功；停止后远端端口不再接受连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_remote_forward_curl_roundtrip_and_concurrency() {
+    const BODY: &str = "RHOST-R-OK";
+    let (session, _frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+
+    // 本机目标：一次性 HTTP 应答服务（-R 回调从本进程接入）
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let target_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                // 读到请求头即可应答（不解析，忽略解析错误）
+                let _ = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    sock.write_all(resp.as_bytes()),
+                )
+                .await;
+            });
+        }
+    });
+
+    let tunnel = session.tunnel();
+    tunnel
+        .start(
+            fwd_rule("e2e-r1", TunnelType::Remote, 24001, target_port),
+            STOP_OPTS,
+        )
+        .await
+        .expect("启动 -R 规则");
+    let st = wait_state(tunnel, "e2e-r1", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+    assert_eq!(st.bound_port, 24001, "远端回报端口应与请求一致");
+
+    // 单发：容器内 curl 经远端转发回源到本进程
+    let out = session
+        .exec_collect("curl -s -m 5 http://127.0.0.1:24001/", Duration::from_secs(15))
+        .await
+        .expect("容器内 curl 执行失败");
+    assert!(
+        out.contains(BODY),
+        "远端转发未回源到本地目标，curl 输出: {out}"
+    );
+
+    // 64 路并发：恰好打满单规则许可，全部应成功（无 panic / 挂起 / channel 提前 drop）
+    let out = session
+        .exec_collect(
+            "for i in $(seq 1 64); do curl -s -m 10 http://127.0.0.1:24001/ & done; wait",
+            Duration::from_secs(40),
+        )
+        .await
+        .expect("并发 curl 执行失败");
+    let hits = out.matches(BODY).count();
+    eprintln!("-R 并发：{hits}/64 回源成功");
+    assert_eq!(hits, 64, "64 路并发应全部回源成功（实际 {hits}）");
+
+    // 停止后远端端口关闭：curl 直接失败（连接拒绝）
+    tunnel.stop("e2e-r1").await.expect("停止规则");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let out = session
+        .exec_collect("curl -s -m 3 http://127.0.0.1:24001/ >/dev/null 2>&1; echo EXIT:$?", Duration::from_secs(10))
+        .await
+        .expect("容器内 curl 探测执行失败");
+    assert!(
+        !out.contains("EXIT:0"),
+        "停止后远端端口仍可连接: {out}"
+    );
+
+    session.shutdown();
+}
+
+/// next 策略：8 条规则抢占同一 bind_port，全部 Active 且实际端口互不重复。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_next_policy_multi_rule_distinct_ports() {
+    let (session, _frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+
+    // 探测一个空闲端口作为抢占比对基准
+    let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let tunnel = session.tunnel();
+    const NEXT_OPTS: StartOptions = StartOptions {
+        port_conflict: PortConflict::Next,
+        dns_resolve: DnsResolve::Remote,
+        retry_count: 0,
+    };
+    let ids: Vec<String> = (0..8).map(|i| format!("e2e-n{i}")).collect();
+    for id in &ids {
+        tunnel
+            .start(fwd_rule(id, TunnelType::Local, base, 9), NEXT_OPTS)
+            .await
+            .unwrap_or_else(|e| panic!("next 规则 {id} 启动失败: {e}"));
+    }
+
+    // 等待全部 Active
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sts = tunnel.statuses().await;
+        let hit = sts
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .filter(|s| s.state == TunnelState::Active)
+            .count();
+        if hit == ids.len() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let sts: Vec<_> = tunnel
+        .statuses()
+        .await
+        .into_iter()
+        .filter(|s| ids.contains(&s.id))
+        .collect();
+    assert_eq!(sts.len(), ids.len(), "8 条规则均应入表");
+    let mut ports: Vec<u16> = Vec::new();
+    for s in &sts {
+        assert_eq!(s.state, TunnelState::Active, "规则 {} 未 Active: {s:?}", s.id);
+        assert!(
+            s.bound_port >= base && s.bound_port < base + 10,
+            "顺延端口应落在 base..base+10: {}",
+            s.bound_port
+        );
+        ports.push(s.bound_port);
+    }
+    ports.sort_unstable();
+    let distinct = ports.len();
+    ports.dedup();
+    assert_eq!(ports.len(), distinct, "存在重复 bound_port: {ports:?}");
+    assert_eq!(ports.len(), ids.len(), "8 条规则端口应互不相同: {ports:?}");
+
+    for id in &ids {
+        tunnel.stop(id).await.unwrap();
+    }
+    session.shutdown();
+}
+
+/// 生命周期：重复 start 幂等返回 TUNNEL_RUNNING；stop 后端口释放；Error/Stopped
+/// 可重新启动；会话 shutdown 后监听 socket 释放。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_lifecycle_idempotent_and_release() {
+    let (session, _frame_rx) = match SshSession::connect(test_cfg(), "e2e001").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("跳过：测试容器不可用（{e}）");
+            return;
+        }
+    };
+    let session = std::sync::Arc::new(session);
+    let tunnel = session.tunnel();
+
+    let rule = fwd_rule("e2e-life", TunnelType::Local, 21006, 9); // 目标不可达：连接级失败不影响规则
+    tunnel.start(rule.clone(), STOP_OPTS).await.expect("首次启动");
+    wait_state(tunnel, "e2e-life", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("规则应 Active");
+
+    // 幂等：Active/Starting 重复 start → TUNNEL_RUNNING 错误前缀
+    let err = tunnel
+        .start(rule.clone(), STOP_OPTS)
+        .await
+        .expect_err("重复启动应报 TUNNEL_RUNNING");
+    assert!(
+        err.to_string().starts_with("TUNNEL_RUNNING:"),
+        "错误前缀应为 TUNNEL_RUNNING:，实际: {err}"
+    );
+
+    // 停止 → Stopped → 本地端口释放
+    tunnel.stop("e2e-life").await.expect("停止");
+    wait_state(tunnel, "e2e-life", TunnelState::Stopped, Duration::from_secs(5))
+        .await
+        .expect("规则应 Stopped");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21006)))
+            .await
+            .map(|r| r.is_err())
+            .unwrap_or(true),
+        "停止后本地端口应已释放"
+    );
+
+    // Stopped 重新 start：真正的新任务
+    tunnel.start(rule, STOP_OPTS).await.expect("重新启动");
+    wait_state(tunnel, "e2e-life", TunnelState::Active, Duration::from_secs(10))
+        .await
+        .expect("重启后应 Active");
+
+    // 会话 shutdown：监听 socket 应随之释放
+    session.shutdown();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21006)))
+            .await
+            .map(|r| r.is_err())
+            .unwrap_or(true),
+        "会话断开后监听端口应释放"
     );
 }

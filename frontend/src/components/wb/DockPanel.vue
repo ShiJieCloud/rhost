@@ -4,6 +4,7 @@ import { invoke, Channel } from '@tauri-apps/api/core'
 import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCollapsed, dockHeight, DOCK_DEFAULT_HEIGHT, dockTab, dockVisible, searchTick, sftpLocalRatio, sftpQueueCollapsed, sftpQueueHeight } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
+import TunnelPane from './TunnelPane.vue'
 import { isTauri } from '../../lib/tauri'
 import { getSnapshot, onConfigLoad, patchUiState } from '../../stores/appConfig'
 import ContextMenu from './ContextMenu.vue'
@@ -1016,7 +1017,7 @@ watch(activeSftpCwd, (cwd) => {
 
 /* ---- Dock tab 切换（状态在 store，供顶部工具栏等外部入口同步） ---- */
 const activeTab = dockTab
-function switchTab(tab: 'sftp' | 'log') {
+function switchTab(tab: 'sftp' | 'log' | 'tunnel') {
   activeTab.value = tab
   expandDock() // 折叠状态下点击 tab 时一并展开
 }
@@ -1425,6 +1426,17 @@ onUnmounted(() => {
           <line x1="12" y1="19" x2="20" y2="19"></line>
         </svg>
         日志
+      </button>
+
+      <button class="dock-tab" :class="{ active: activeTab === 'tunnel' }" title="端口转发"
+              @click="switchTab('tunnel')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="5" cy="12" r="2.5"></circle>
+          <circle cx="19" cy="12" r="2.5"></circle>
+          <path d="M7.5 12h9"></path>
+        </svg>
+        端口转发
       </button>
 
       <button class="dock-tab" :class="{ active: activeTab === 'sftp' }" title="文件管理"
@@ -1995,6 +2007,11 @@ onUnmounted(() => {
           </div>
           </template>
         </div>
+      </div>
+
+      <!-- 端口转发（规则启停与运行态观测；规则编辑在主机配置面板） -->
+      <div class="dock-pane" :class="{ show: activeTab === 'tunnel' }">
+        <TunnelPane />
       </div>
     </div>
 

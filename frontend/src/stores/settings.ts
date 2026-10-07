@@ -120,7 +120,7 @@ export interface AppSettings {
   sftpBlacklist: string
   /** 文件树显示以 . 开头的隐藏文件（本地/远端两侧均生效） */
   sftpShowHidden: boolean
-  /* ---- 隧道（端口转发，UI 占位：转发引擎未实现，仅持久化） ---- */
+  /* ---- 端口转发（tunnel；引擎见 src-tauri/src/ssh/tunnel.rs，store 见 stores/tunnels.ts） ---- */
   /** SSH 连接建立后自动启用该主机已保存的端口转发规则 */
   tunnelAutoStart: boolean
   /** 本地监听端口被占用时的处理：stop 终止规则 / skip 跳过规则 / next 顺延端口 */
@@ -129,14 +129,12 @@ export interface AppSettings {
   tunnelRetryCount: number
   /** 转发通道中断后自动重建 */
   tunnelReconnect: boolean
-  /** 通道保活间隔（秒），防止空闲链路被中间设备掐断，0 不发送 */
+  /** 通道保活间隔（秒）——TODO 未消费：主连接 RTT 心跳（30s 周期）已覆盖 NAT 保活作用 */
   tunnelKeepaliveSec: number
   /** 通道空闲自动断开（秒），0 不断开 */
   tunnelIdleTimeoutSec: number
   /** 动态转发（SOCKS）域名解析位置：local 本地 / remote 远端 */
   tunnelDnsResolve: string
-  /** 转发规则启动/断开/失败时发送系统通知 */
-  tunnelNotify: boolean
   /* ---- 关于 ---- */
   autoUpdate: boolean
   updateChannel: string
@@ -222,7 +220,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   tunnelKeepaliveSec: 15,
   tunnelIdleTimeoutSec: 0,
   tunnelDnsResolve: 'local',
-  tunnelNotify: true,
 
   autoUpdate: true,
   updateChannel: 'stable',

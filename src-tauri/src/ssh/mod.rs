@@ -9,6 +9,7 @@ pub mod frame;
 pub mod manager;
 pub mod session;
 pub mod sftp;
+pub mod tunnel;
 
 pub use manager::SessionManager;
 
@@ -66,4 +67,9 @@ pub enum SshError {
     Closed,
     #[error("传输已取消")]
     Cancelled,
+    /// 端口转发错误：payload 携带前后端约定的协议前缀（`TUNNEL_RUNNING:` /
+    /// `TUNNEL_BAD_RULE:` / `TUNNEL_PORT_IN_USE:` / `TUNNEL_REMOTE_DENIED:` /
+    /// `TUNNEL_LIMIT:`），前端据此分流 toast 文案与批量策略，不得改为普通文案
+    #[error("{0}")]
+    Tunnel(String),
 }

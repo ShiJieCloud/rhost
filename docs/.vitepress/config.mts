@@ -25,7 +25,7 @@ export default defineConfig({
       { text: '架构', link: '/architecture', activeMatch: '/architecture' },
       {
         text: '设计',
-        activeMatch: '/(metrics-design|applog-design|config-import-export|splash-design|tab-context-menu-design|tab-scroll-design|explanation)/',
+        activeMatch: '/(metrics-design|applog-design|config-import-export|splash-design|tab-context-menu-design|tab-scroll-design|tunnel-design|tunnel-dev-plan|explanation)/',
         items: [
           { text: '主机指标采集', link: '/metrics-design' },
           { text: '应用日志', link: '/applog-design' },
@@ -34,6 +34,8 @@ export default defineConfig({
           { text: '标签栏右键菜单', link: '/explanation/design/tab-context-menu-design' },
           { text: '标签栏右键菜单开发计划', link: '/explanation/design/tab-context-menu-dev-plan' },
           { text: '标签栏横向滚动', link: '/explanation/design/tab-scroll-design' },
+          { text: 'SSH 端口转发', link: '/explanation/design/tunnel-design' },
+          { text: 'SSH 端口转发开发计划', link: '/explanation/design/tunnel-dev-plan' },
           { text: '文档规范', link: '/explanation/design/docs-spec' },
         ],
       },
@@ -65,6 +67,8 @@ export default defineConfig({
           { text: '标签栏右键菜单', link: '/explanation/design/tab-context-menu-design' },
           { text: '标签栏右键菜单开发计划', link: '/explanation/design/tab-context-menu-dev-plan' },
           { text: '标签栏横向滚动', link: '/explanation/design/tab-scroll-design' },
+          { text: 'SSH 端口转发', link: '/explanation/design/tunnel-design' },
+          { text: 'SSH 端口转发开发计划', link: '/explanation/design/tunnel-dev-plan' },
           { text: '文档规范', link: '/explanation/design/docs-spec' },
         ],
       },

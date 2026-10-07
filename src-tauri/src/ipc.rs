@@ -208,6 +208,76 @@ pub async fn resize_terminal(
         .map_err(|e| e.to_string())
 }
 
+/* =========================================================
+ *  端口转发（tunnel-design.md §6.7）
+ * ========================================================= */
+
+/// 端口转发规则入参（camelCase，与前端 types.ts `TunnelRule` 对齐；
+/// name/enabled 为前端配置态字段，前端 invoke 前剥离，引擎不消费）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelRuleDto {
+    pub id: String,
+    /// 转发类型：`local` / `remote` / `dynamic`（serde 直接映射引擎枚举）
+    #[serde(rename = "type")]
+    pub kind: crate::ssh::tunnel::TunnelType,
+    pub bind_host: String,
+    pub bind_port: u16,
+    #[serde(default)]
+    pub target_host: Option<String>,
+    #[serde(default)]
+    pub target_port: Option<u16>,
+}
+
+/// 启动一条端口转发规则。
+///
+/// 错误即协议：返回字符串带前缀（前端据此分流，勿改文案）：
+/// `TUNNEL_RUNNING:`（幂等成功）/ `TUNNEL_BAD_RULE:` / `TUNNEL_PORT_IN_USE:` /
+/// `TUNNEL_REMOTE_DENIED:` / `TUNNEL_LIMIT:`。
+#[tauri::command]
+pub async fn tunnel_start(
+    session_id: String,
+    rule: TunnelRuleDto,
+    port_conflict: String,
+    dns_resolve: String,
+    retry_count: u32,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    slow_span!("tunnel_start");
+    let opts = crate::ssh::tunnel::StartOptions {
+        port_conflict: crate::ssh::tunnel::PortConflict::parse(&port_conflict),
+        dns_resolve: crate::ssh::tunnel::DnsResolve::parse(&dns_resolve),
+        // 引擎约定 0–20，越界钳位（前端已是滑杆范围，此处兜底）
+        retry_count: retry_count.min(20),
+    };
+    let rule = crate::ssh::tunnel::TunnelRule {
+        id: rule.id,
+        kind: rule.kind,
+        bind_host: rule.bind_host,
+        bind_port: rule.bind_port,
+        target_host: rule.target_host,
+        target_port: rule.target_port,
+    };
+    manager
+        .tunnel_start(&session_id, rule, opts)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 停止一条端口转发规则（幂等：规则不存在视为成功）
+#[tauri::command]
+pub async fn tunnel_stop(
+    session_id: String,
+    rule_id: String,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    slow_span!("tunnel_stop");
+    manager
+        .tunnel_stop(&session_id, &rule_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 断开会话：取消令牌触发全部后台任务退出，并从会话池移除
 #[tauri::command]
 pub async fn disconnect_session(
@@ -506,11 +576,20 @@ pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, 
 
     let start = Instant::now();
     // 测试连接不需要协商算法出口，给个一次性空槽即可（kex_done 仍会写入）；
-    // sid 用固定值便于排障时过滤测试连接日志
+    // sid 用固定值便于排障时过滤测试连接日志。
+    // -R 回调共享件给默认值：registry 为空表、闸门不参与，测试连接不做转发
     let algo = std::sync::Arc::new(std::sync::Mutex::new(None));
     let handle = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_and_auth(&cfg, algo, "test"),
+        connect_and_auth(
+            &cfg,
+            algo,
+            "test",
+            Default::default(),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::ssh::tunnel::MAX_CONN_GLOBAL,
+            )),
+        ),
     )
     .await
     .map_err(|_| "连接超时（10 秒内未响应）".to_string())?

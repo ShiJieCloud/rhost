@@ -93,6 +93,19 @@ pub const WEB_UNHANDLED_ERROR: &str = "web.unhandled_error";
 /// 第三方 crate 日志统一事件：原始 target 放 kv.crate_target
 pub const EXTERNAL_RAW_LOG: &str = "external.raw_log";
 
+/* ---- 端口转发隧道（target: tunnel） ---- */
+pub const TUNNEL_START: &str = "tunnel.start";
+pub const TUNNEL_START_FAILED: &str = "tunnel.start_failed";
+pub const TUNNEL_STOP: &str = "tunnel.stop";
+pub const TUNNEL_PORT_CONFLICT: &str = "tunnel.port_conflict";
+pub const TUNNEL_SOCKS_HANDSHAKE_FAILED: &str = "tunnel.socks_handshake_failed";
+pub const TUNNEL_SOCKS_HANDSHAKE_TIMEOUT: &str = "tunnel.socks_handshake_timeout";
+pub const TUNNEL_REMOTE_DENIED: &str = "tunnel.remote_denied";
+pub const TUNNEL_REMOTE_READY: &str = "tunnel.remote_ready";
+pub const TUNNEL_STATUS_PUSH_FAILED: &str = "tunnel.status_push_failed";
+pub const TUNNEL_LISTENER_RETRY: &str = "tunnel.listener_retry";
+pub const TUNNEL_LISTENER_FAILED: &str = "tunnel.listener_failed";
+
 /// 前端上报允许的 event_id 域（report_app_log 校验白名单）：
 /// web.* 前端通用事件 + sftp.* 传输队列事件（队列管理逻辑在前端，§7.3）
 pub const REPORT_ALLOWED_PREFIXES: &[&str] = &["web.", "sftp."];
@@ -146,6 +159,10 @@ mod tests {
             SFTP_MANAGE_RENAME, SFTP_MANAGE_MKDIR, SFTP_MANAGE_COPY,
             METRICS_COLLECT_START, METRICS_COLLECT_STOP, METRICS_COLLECT_DEGRADED,
             IPC_SLOW_CALL, WEB_IPC_ERROR, WEB_UNHANDLED_ERROR, EXTERNAL_RAW_LOG,
+            TUNNEL_START, TUNNEL_START_FAILED, TUNNEL_STOP, TUNNEL_PORT_CONFLICT,
+            TUNNEL_SOCKS_HANDSHAKE_FAILED, TUNNEL_SOCKS_HANDSHAKE_TIMEOUT,
+            TUNNEL_REMOTE_DENIED, TUNNEL_REMOTE_READY, TUNNEL_STATUS_PUSH_FAILED,
+            TUNNEL_LISTENER_RETRY, TUNNEL_LISTENER_FAILED,
         ];
         for id in all {
             assert!(
@@ -155,7 +172,7 @@ mod tests {
             let mut parts = id.split('.');
             let domain = parts.next().unwrap();
             assert!(
-                ["app", "ssh", "sftp", "metrics", "ipc", "web", "external"].contains(&domain),
+                ["app", "ssh", "sftp", "metrics", "ipc", "web", "external", "tunnel"].contains(&domain),
                 "未知 domain: {id}"
             );
             assert!(parts.next().is_some(), "event_id 至少两段: {id}");
