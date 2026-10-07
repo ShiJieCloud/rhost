@@ -941,6 +941,15 @@ body{
     flex-wrap:wrap;
 }
 .modal-foot .spacer{flex:1}
+/* 会话属性弹窗 */
+.sp-modal{width:460px;height:auto;max-height:calc(100vh - 60px)}
+.sp-body{padding:18px 20px;overflow-y:auto}
+.sp-table{width:100%;border-collapse:collapse;font-size:13px}
+.sp-table td{padding:7px 0;border-bottom:1px solid var(--border)}
+.sp-table tr:last-child td{border-bottom:none}
+.sp-label{color:var(--muted);width:110px;white-space:nowrap}
+.sp-value{color:var(--text);word-break:break-all;font-family:var(--mono,monospace)}
+.sp-foot{padding:12px 18px 14px}
 .btn.ghost{background:transparent}
 .btn.ghost:hover{background:var(--hover)}
 .btn.loading{pointer-events:none;opacity:.75}
@@ -1146,25 +1155,78 @@ body{
 
 /* ---- 工作区 ---- */
 .workspace{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
-.tabs{
+.tabs-bar{
     height:40px;flex-shrink:0;display:flex;align-items:stretch;
     background:var(--panel);border-bottom:1px solid var(--border);
-    /* overflow-y 必须显式 hidden：x 轴设 auto 后，按 CSS 规范 y 轴 visible
-       会被计算为 auto，从而冒出纵向滚动条 */
-    overflow-x:auto;overflow-y:hidden;position:relative;
+    position:relative;
+}
+/* 视窗包装层：滚动容器的 flex 占位父级 */
+.tabs-viewport{
+    flex:1 1 auto;min-width:0;position:relative;
+}
+/* 滚动容器填满包装层：溢出时横向滚动；x 轴设 auto 后 y 轴 visible
+   按 CSS 规范会被计算为 auto，故 y 轴显式 hidden，避免冒出纵向滚动条 */
+.tabs-scroll{
+    width:100%;height:100%;position:relative;
+    overflow-x:auto;overflow-y:hidden;cursor:grab;
+}
+/* 轨道：width:100% 让标签参与压缩分配；标签压到最小宽仍溢出时，flex items
+   自然溢出容器，scrollWidth 包含溢出部分，横向滚动照常工作。
+   min-width:100% 保证标签很少时仍撑满视窗，空白区可右键。 */
+.tabs-track{
+    display:flex;align-items:stretch;height:100%;
+    width:100%;min-width:100%;
 }
 /* 横/纵滚动条都彻底隐藏：横向滚动（shift+滚轮/触控板）功能保留 */
-.tabs::-webkit-scrollbar{height:0;width:0}
+.tabs-scroll::-webkit-scrollbar{height:0;width:0}
+/* 左右分居的滚动箭头：未溢出时宽度 0 且透明，不占标签空间；
+   .show 后展开到 32px；禁用态靠 aria-disabled 标记 */
+.tab-arrow{
+    width:0;flex-shrink:0;overflow:hidden;
+    display:grid;place-items:center;
+    background:transparent;border:none;
+    color:var(--muted);cursor:pointer;font-size:14px;line-height:1;
+    opacity:0;pointer-events:none;
+    transition:width .18s,opacity .18s,color .15s,background .15s;
+}
+.tab-arrow.show{width:32px;opacity:1;pointer-events:auto}
+.tab-arrow-left.show{border-right:1px solid var(--border)}
+.tab-arrow-right.show{border-left:1px solid var(--border)}
+.tab-arrow.show:hover{background:var(--hover);color:var(--text)}
+.tab-arrow.show[aria-disabled="true"]{opacity:.35;pointer-events:none}
 .tab{
     display:flex;align-items:center;gap:8px;
-    padding:0 11px;flex-shrink:0;
+    padding:0 11px;
+    /* Chrome 风格压缩：基准宽 190px 不 grow（少标签时左对齐不留拉伸）；
+       总宽溢出视窗时 flex-shrink 平分收缩，下限 90px；到下限后停止收缩、
+       溢出转横向滚动。宽度随视窗几何实时变化，无需 JS 参与。 */
+    flex:0 1 auto;width:190px;min-width:90px;max-width:190px;
     border-right:1px solid var(--border);
     color:var(--muted);font-size:11.5px;cursor:pointer;
-    transition:.15s;position:relative;max-width:190px;
+    /* width 不参与过渡：激活/失活时宽度即时变化（90↔190）。
+       若给 width 加过渡，宽度插值动画会与 ensureVisible 的 smooth
+       滚动并行，动画期间 scrollWidth/几何逐帧漂移，滚动目标被干扰、
+       停在半路，导致激活标签右缘仍被遮住（Chrome/iTerm2 同款即时变化）。 */
+    transition:color .15s,background-color .15s,box-shadow .15s;
+    position:relative;
 }
 .tab:hover{color:var(--text);background:var(--hover)}
-.tab.active{color:var(--text);background:var(--bg);box-shadow:inset 0 -2px 0 var(--green)}
-.tab .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tab.active{color:var(--text);background:var(--bg);box-shadow:inset 0 -2px 0 var(--green);
+    /* 激活标签不参与压缩：溢出时只收缩非激活标签，激活标签恒为 190px */
+    flex-shrink:0;}
+/* 拖拽态：全部 grabbing、禁止文本选中；特异性高于 .tab 的 cursor:pointer */
+.tabs-scroll.dragging{cursor:grabbing}
+.tabs-scroll.dragging .tab,.tabs-scroll.dragging .tab *{cursor:grabbing;user-select:none}
+/* 名称占满圆点与关闭钮之间的全部空间：关闭按钮恒贴标签右缘，
+   各标签的 × 纵向对齐成一列；min-width:0 允许收缩并触发省略号 */
+.tab .name{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tab .rename-input{
+    background:transparent;border:1px solid var(--green);border-radius:3px;
+    outline:none;color:var(--text);font-size:11.5px;font-family:inherit;
+    padding:1px 4px;max-width:100%;width:90px;flex:1 1 auto;
+    box-sizing:border-box;user-select:text;
+}
+.tab:has(.rename-input){overflow:hidden}
 .tab .close{
     width:15px;height:15px;border-radius:4px;flex-shrink:0;
     display:grid;place-items:center;font-size:13px;line-height:1;
@@ -1172,33 +1234,6 @@ body{
 }
 .tab:hover .close{color:#5f6d82}
 .tab .close:hover{background:#242f3d;color:var(--red)}
-.tab-add{
-    width:38px;flex-shrink:0;display:grid;place-items:center;
-    background:transparent;border:none;border-right:1px solid var(--border);
-    color:var(--muted);cursor:pointer;font-size:16px;transition:.15s;
-}
-.tab-add:hover{background:var(--hover);color:var(--text)}
-.quick-menu{
-    position:absolute;top:41px;left:0;z-index:40;
-    width:250px;
-    background:rgba(16,24,35,.98);
-    border:1px solid var(--border);border-radius:10px;
-    box-shadow:0 20px 46px rgba(0,0,0,.6);
-    backdrop-filter:blur(14px);padding:7px;
-    opacity:0;pointer-events:none;transform:translateY(-6px);
-    transition:.18s;
-}
-.quick-menu.show{opacity:1;pointer-events:auto;transform:none}
-.qm-head{font-size:9.5px;letter-spacing:1.2px;text-transform:uppercase;color:#3d4a59;padding:7px 9px 6px}
-.qm-item{
-    display:flex;align-items:center;gap:9px;
-    width:100%;padding:7px 9px;border-radius:7px;
-    background:none;border:none;cursor:pointer;
-    color:var(--text);font-family:inherit;font-size:11.5px;
-    text-align:left;transition:.13s;
-}
-.qm-item:hover{background:var(--hover)}
-.qm-item .m{font-size:9.5px;color:var(--muted-2);margin-left:auto}
 
 /* ---- 终端 ---- */
 /* min-height:0 —— 允许 Dock 面板上拖覆盖终端直至 Tab 下沿 */

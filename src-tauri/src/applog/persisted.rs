@@ -333,13 +333,23 @@ pub(crate) struct GroupSection {
     extra: Map<String, Value>,
 }
 
+/// `ui_state.sessions` 条目：会话持久化唯一键 + 主机 id + 标签别名
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionEntry {
+    pub session_id: String,
+    pub host_id: String,
+    #[serde(default)]
+    pub alias: String,
+}
+
 /// `ui_state` 节：已知子字段校验类型，未知子字段经 extra 保留
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct UiStateSection {
     home_view: Option<String>,
     layout: Value,
-    sessions: Vec<String>,
+    sessions: Vec<SessionEntry>,
     log_wrap: Option<bool>,
     config_export_scope: Option<String>,
     config_export_include_ui: Option<bool>,
@@ -808,7 +818,10 @@ mod tests {
         save_section(
             &f,
             "ui_state",
-            json!({"homeView": "hosts", "sessions": ["a", "b"], "logWrap": false,
+            json!({"homeView": "hosts", "sessions": [
+                {"sessionId": "s1", "hostId": "a", "alias": ""},
+                {"sessionId": "s2", "hostId": "b", "alias": "prod"}
+            ], "logWrap": false,
                    "futureUiFlag": "keep"}),
         )
         .unwrap();

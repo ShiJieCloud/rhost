@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 
 /** 菜单项：divider=true 时渲染为分隔符行（不绑定 click，与动作项显式分支） */
 export interface MenuItem {
@@ -50,7 +50,7 @@ watch(visible, (v) => {
     clampPos()
     activeIdx.value = -1
   }
-})
+}, { immediate: true })
 /* 菜单开着时再次右键会重建 items（新数组引用），重夹取位置让菜单跟随新坐标 */
 watch(() => props.items, () => {
   activeIdx.value = -1
@@ -66,19 +66,31 @@ function pick(idx: number) {
 
 function onKeydown(e: KeyboardEvent) {
   if (!visible.value) return
+  const isModifierCombo = e.ctrlKey || e.metaKey || e.altKey
   if (e.key === 'Escape') {
     visible.value = false
+    e.stopPropagation()
     return
   }
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault()
     const n = actionIdx.value.length
-    if (!n) return
+    if (!n) { e.stopPropagation(); return }
     let p = actionIdx.value.indexOf(activeIdx.value)
     p = e.key === 'ArrowDown' ? (p + 1) % n : (p - 1 + n) % n
     activeIdx.value = actionIdx.value[p]!
-  } else if (e.key === 'Enter') {
+    e.stopPropagation()
+    return
+  }
+  if (e.key === 'Enter') {
     if (activeIdx.value >= 0) pick(activeIdx.value)
+    e.stopPropagation()
+    return
+  }
+  // 非导航键：修饰键组合（Ctrl/Cmd/Alt+key）放行到终端（复制粘贴等）；
+  // 普通单字符 stopPropagation，阻止穿透到 xterm textarea / PTY
+  if (!isModifierCombo) {
+    e.stopPropagation()
   }
 }
 
@@ -95,19 +107,31 @@ function onScrollClose(e: Event) {
 function onClose() { if (visible.value) visible.value = false }
 
 const menuEl = ref<HTMLElement | null>(null)
+
+function addListeners() {
+  document.addEventListener('keydown', onKeydown, true)
+  document.addEventListener('mousedown', onDocMouseDown, true)
+  document.addEventListener('scroll', onScrollClose, true)
+  window.addEventListener('resize', onClose)
+}
+function removeListeners() {
+  document.removeEventListener('keydown', onKeydown, true)
+  document.removeEventListener('mousedown', onDocMouseDown, true)
+  document.removeEventListener('scroll', onScrollClose, true)
+  window.removeEventListener('resize', onClose)
+}
+
 watch(visible, (v) => {
-  if (v) {
-    document.addEventListener('keydown', onKeydown, true)
-    document.addEventListener('mousedown', onDocMouseDown, true)
-    document.addEventListener('scroll', onScrollClose, true)
-    window.addEventListener('resize', onClose)
-  } else {
-    document.removeEventListener('keydown', onKeydown, true)
-    document.removeEventListener('mousedown', onDocMouseDown, true)
-    document.removeEventListener('scroll', onScrollClose, true)
-    window.removeEventListener('resize', onClose)
-  }
-})
+  if (v) addListeners()
+  else removeListeners()
+}, { immediate: true })
+
+/* 兜底：组件卸载时强制移除所有监听器。
+ * 正常关闭流程中 visible→false 的 watch 回调会异步执行 removeListeners，
+ * 但菜单关闭会同时触发父级 v-if 卸载组件，若卸载先于 watch 刷新发生，
+ * 监听器会泄漏并持续拦截终端按键（Enter 等 stopPropagation）。
+ * onUnmounted 确保无论时序如何，监听器必被清理。 */
+onUnmounted(removeListeners)
 </script>
 
 <template>

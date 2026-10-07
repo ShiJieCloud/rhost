@@ -88,6 +88,7 @@ const ICONS: Record<string, string> = {
   advanced: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
   monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>',
   sftp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/><path d="M12 8v6"/><path d="M9.5 11.5L12 14l2.5-2.5"/></svg>',
+  tunnel: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="8" r="2"/><circle cx="12" cy="8" r="2"/><path d="M6 8h4"/></svg>',
   about: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
 }
 
@@ -255,6 +256,36 @@ const PANELS: PanelDef[] = [
         label: '浏览',
         rows: [
           { key: 'sftpShowHidden', title: '显示隐藏文件', desc: '在本地与远端文件树中显示以 . 开头的文件', kind: 'switch', keywords: 'sftp 隐藏文件 点文件 hidden dotfile 显示' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'tunnel', label: '隧道', glyph: 'tunnel',
+    title: '隧道', sub: '配置 SSH 端口转发规则与通道行为',
+    groups: [
+      {
+        label: '端口转发规则',
+        rows: [
+          { key: 'tunnelAutoStart', title: '连接后自动启用规则', desc: '该主机已保存的端口转发规则在 SSH 连接建立后自动启动，无需逐条手动开启', kind: 'switch', keywords: '隧道 端口转发 规则 自动 启用 连接 tunnel forward TODO', todo: '端口转发引擎未实现' },
+          { key: 'tunnelPortConflict', title: '本地端口占用处理', desc: '规则的本地监听端口被其他进程占用时的处理方式', kind: 'select', width: 200, keywords: '隧道 端口转发 端口 占用 冲突 监听 tunnel port conflict TODO', todo: '端口转发引擎未实现',
+            options: [
+              { v: 'stop', t: '终止该规则并提示（默认）' },
+              { v: 'skip', t: '跳过该规则，其余照常启动' },
+              { v: 'next', t: '从 +1 起顺延可用端口' },
+            ] },
+          { key: 'tunnelRetryCount', title: '建立失败重试次数', desc: '转发通道建立失败（如远端拒绝监听）时的自动重试次数，0 表示不重试直接标记失败', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', keywords: '隧道 端口转发 失败 重试 次数 tunnel retry TODO', todo: '端口转发引擎未实现' },
+        ],
+      },
+      {
+        label: '端口转发选项',
+        rows: [
+          { key: 'tunnelReconnect', title: '通道断开自动重建', desc: '网络抖动导致转发通道中断时自动重新建立，连接期间持续生效', kind: 'switch', keywords: '隧道 通道 断开 重连 重建 tunnel reconnect TODO', todo: '端口转发引擎未实现' },
+          { key: 'tunnelKeepaliveSec', title: '通道保活间隔', desc: '定期发送 SSH 层保活消息，防止空闲链路被中间设备掐断；0 表示不发送', kind: 'number', width: 130, min: 0, step: 5, unit: ' 秒', keywords: '隧道 通道 保活 keepalive 空闲 心跳 TODO', todo: '端口转发引擎未实现' },
+          { key: 'tunnelIdleTimeoutSec', title: '空闲自动断开', desc: '通道持续无流量超过该时长后自动关闭释放资源，下次转发时重建；0 表示不断开', kind: 'number', width: 130, min: 0, step: 10, unit: ' 秒', keywords: '隧道 通道 空闲 超时 断开 释放 idle timeout TODO', todo: '端口转发引擎未实现' },
+          { key: 'tunnelDnsResolve', title: 'SOCKS 域名解析位置', desc: '动态转发（SOCKS 代理）中域名在哪一侧解析：本地解析后传 IP，或域名透传由服务器解析', kind: 'segmented', keywords: '隧道 socks 动态 转发 域名 解析 dns 本地 远端 TODO', todo: '端口转发引擎未实现',
+            options: [{ v: 'local', t: '本地解析' }, { v: 'remote', t: '远端解析' }] },
+          { key: 'tunnelNotify', title: '状态桌面通知', desc: '端口转发规则启动、断开与失败时发送系统通知', kind: 'switch', keywords: '隧道 端口转发 通知 提示 notification TODO', todo: '端口转发引擎未实现' },
         ],
       },
     ],

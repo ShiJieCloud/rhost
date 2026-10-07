@@ -140,6 +140,15 @@ fn strip_keys_sensitive(keys: &Value) -> Value {
     v
 }
 
+/// 导出时剔除 ui_state.sessions：会话/标签是本地运行时状态，不进入配置导出。
+fn strip_sessions(ui_state: &Value) -> Value {
+    let mut v = ui_state.clone();
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("sessions");
+    }
+    v
+}
+
 /// 组装明文导出 Schema（读盘数据 → 脱敏 → scope 过滤 → 完整性哈希）。
 ///
 /// - `settings` 节磁盘为空（首启未写过）时以内置默认值兜底合并，保证导出的是
@@ -170,7 +179,7 @@ pub fn assemble_export(
             data.insert("groups".into(), cfg.groups.clone());
         }
         ExportScope::Ui => {
-            data.insert("ui_state".into(), cfg.ui_state.clone());
+            data.insert("ui_state".into(), strip_sessions(&cfg.ui_state));
         }
         ExportScope::Full => {
             data.insert("connections".into(), Value::Array(connections));
@@ -180,7 +189,7 @@ pub fn assemble_export(
             data.insert("keys".into(), strip_keys_sensitive(&cfg.keys));
             data.insert("groups".into(), cfg.groups.clone());
             if include_ui {
-                data.insert("ui_state".into(), cfg.ui_state.clone());
+                data.insert("ui_state".into(), strip_sessions(&cfg.ui_state));
             }
             if include_history {
                 data.insert(
@@ -346,7 +355,7 @@ pub struct PreparedImport {
 ///   `password` 内存解密（§5.1），解密后内容等价于明文文件；
 /// - `hosts_only=false`：`import_config`，消费 data 中存在的全部节；
 /// - `hosts_only=true`：`import_hosts`，只消费 connections/groups，
-///   并用连接 id 映射重写**本地** ui_state.sessions（§7.7）；
+///   本地 ui_state.sessions 保持不变（会话不进入导入导出）；
 /// - `logs` 节恒忽略；节缺失 = 不动本地；关键节损坏整体 Err（零写入），
 ///   非关键节损坏收集进 `skipped`。
 pub fn prepare_import(
@@ -462,23 +471,8 @@ pub fn prepare_import(
         out_cfg.groups = merged_groups.value;
     }
 
-    // ui_state.sessions 重映射（同时用于文件 ui_state 与 hosts_only 的本地 ui_state）
-    let remap_sessions = |sessions: &Value| -> Value {
-        let Some(arr) = sessions.as_array() else {
-            return sessions.clone();
-        };
-        arr.iter()
-            .filter_map(|s| s.as_str().map(str::to_string))
-            .filter_map(|id| {
-                let mapped = id_map.get(&id).cloned().unwrap_or(id);
-                match &final_ids {
-                    Some(ids) if !ids.contains(&mapped) => None,
-                    _ => Some(Value::String(mapped)),
-                }
-            })
-            .collect::<Vec<_>>()
-            .into()
-    };
+    // ui_state.sessions 不进入配置导入导出：导入时忽略文件中的 sessions 字段，
+    // 保留本地 sessions（会话为临时状态，不随配置迁移）。
 
     // hosts_only 时不消费文件的 keys/settings/ui_state/history；
     // 本地 ui_state.sessions 也无需重映射——主机合并只增不删，本地 id 全部保留，
@@ -501,16 +495,23 @@ pub fn prepare_import(
             out_cfg.settings = merged.value;
         }
 
-        // 5.5 界面状态（非关键；全量覆盖 + sessions 重映射）
+        // 5.5 界面状态（非关键；全量覆盖，但 sessions 字段忽略——保留本地 sessions）
         if let Some(ui_v) = data.get("ui_state") {
             let mut candidate = ui_v.clone();
-            if let Some(obj) = candidate.as_object_mut()
-                && let Some(sessions) = obj.get("sessions").cloned()
-            {
-                obj.insert("sessions".into(), remap_sessions(&sessions));
+            // 剥离导入文件中的 sessions，不做 ID 重映射
+            if let Some(obj) = candidate.as_object_mut() {
+                obj.remove("sessions");
             }
             match serde_json::from_value::<persisted::UiStateSection>(candidate.clone()) {
-                Ok(_) => out_cfg.ui_state = candidate,
+                Ok(_) => {
+                    // 保留本地 sessions：导入配置不含 sessions，合并回本地 sessions
+                    if let Some(local_sessions) = out_cfg.ui_state.get("sessions").cloned()
+                        && let Some(obj) = candidate.as_object_mut()
+                    {
+                        obj.insert("sessions".into(), local_sessions);
+                    }
+                    out_cfg.ui_state = candidate;
+                }
                 Err(e) => skipped.push(SkippedSection {
                     section: "ui_state".into(),
                     error: format!("ui_state 节格式错误: {e}"),
@@ -761,7 +762,9 @@ mod tests {
              "hosts": ["h1"], "publicKey": "ssh-ed25519 AAAA"}
         ]);
         cfg.groups = serde_json::json!([{"name": "g", "color": "red"}]);
-        cfg.ui_state = serde_json::json!({"homeView": "hosts"});
+        cfg.ui_state = serde_json::json!({"homeView": "hosts", "sessions": [
+            {"sessionId": "s1", "hostId": "h1", "alias": ""}
+        ]});
         cfg
     }
 
@@ -810,6 +813,9 @@ mod tests {
         let data = v["data"].as_object().unwrap();
         assert_eq!(data.len(), 1);
         assert!(data.contains_key("ui_state"));
+        // sessions 不进入导出
+        assert!(data["ui_state"].get("sessions").is_none());
+        assert_eq!(data["ui_state"]["homeView"], "hosts");
     }
 
     #[test]
@@ -981,11 +987,11 @@ mod tests {
         assert_eq!(p.app_config.settings["uiTheme"], "light");
         assert_eq!(p.app_config.settings["customFuture"], 7);
 
-        // ui_state：全量覆盖 + sessions 悬空剔除
+        // ui_state：全量覆盖（homeView），但 sessions 忽略导入值、保留本地 sessions
         assert_eq!(p.app_config.ui_state["homeView"], "sftp");
         assert_eq!(
             p.app_config.ui_state["sessions"],
-            serde_json::json!(["h1", "h2"])
+            serde_json::json!(["h1", "gone"])
         );
 
         // history 追加
@@ -1088,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn import_hosts_only_consumes_connections_groups_and_remaps_local_sessions() {
+    fn import_hosts_only_consumes_connections_groups_and_preserves_local_sessions() {
         let mut existing = cfg_with_keys();
         existing.ui_state =
             serde_json::json!({"homeView": "hosts", "sessions": ["h1", "ghost"]});

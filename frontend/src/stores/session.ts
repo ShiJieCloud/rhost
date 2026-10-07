@@ -25,6 +25,8 @@ export interface Session {
   /** 建连成功序号：每次成功自增，TerminalPane 监听后 term.reset() 清空旧画面，
    *  让全新 PTY 从干净 shell 提示符开始 */
   resetSeq: number
+  /** 标签自定义别名；空字符串表示无别名，UI 回落展示 host.id */
+  alias: string
 }
 
 export const appView = ref<AppView>('home')
@@ -869,32 +871,51 @@ export async function reconnectBackend(id: string) {
 
 /* ---- 会话管理 ---- */
 
-/* ---- 会话持久化（冷/热启动分离）：主机 id 列表存 ui_state.sessions，恢复时重新生成会话 id ---- */
+/* ---- 会话持久化（冷/热启动分离）：SessionEntry[] 存 ui_state.sessions，恢复时用持久化 sessionId ---- */
 
 function persistSessions() {
   if (!isTauri) return
-  patchUiState({ sessions: sessions.value.map(s => s.host.id) })
+  patchUiState({
+    sessions: sessions.value.map(s => ({
+      sessionId: s.id,
+      hostId: s.host.id,
+      alias: s.alias,
+    })),
+  })
 }
 
-/** 启动时恢复上次未关闭的会话；有则直接进入工作台并自动重连（热启动） */
+/** 启动时恢复上次未关闭的会话；有则直接进入工作台并自动重连（热启动）。
+ *  持久化格式为 SessionEntry[] = [{ sessionId, hostId, alias }]；
+ *  旧 string[] 格式读取失败直接清空（不迁移，会话为临时状态）。
+ *  不再按 hostId 去重——同一主机的多个会话逐条恢复。 */
 export function restoreSessions() {
   const raw = getSnapshot()?.uiState.sessions
-  let hostIds: string[] = []
+  interface StoredEntry { sessionId: string; hostId: string; alias: string }
+  const entries: StoredEntry[] = []
   if (Array.isArray(raw)) {
-    hostIds = raw.filter((x): x is string => typeof x === 'string')
+    for (const x of raw) {
+      if (x && typeof x === 'object' && 'sessionId' in x && 'hostId' in x) {
+        const o = x as Record<string, unknown>
+        entries.push({
+          sessionId: typeof o.sessionId === 'string' ? o.sessionId : '',
+          hostId: typeof o.hostId === 'string' ? o.hostId : '',
+          alias: typeof o.alias === 'string' ? o.alias : '',
+        })
+      }
+    }
   }
-  // 同一主机只恢复一个会话
-  const valid = [...new Set(hostIds)].filter(id => hosts.value.some(h => h.id === id))
+  const valid = entries.filter(e => e.sessionId && e.hostId && hosts.value.some(h => h.id === e.hostId))
   if (!valid.length) return
   // 懒连接：仅活跃会话（最后打开的）立即建连，其余恢复为 idle（灰点"空闲"），切 tab 时再连
-  const restored: Session[] = valid.map((hostId, i) => ({
-    id: crypto.randomUUID(),
-    host: hosts.value.find(h => h.id === hostId)!,
+  const restored: Session[] = valid.map((e, i) => ({
+    id: e.sessionId,
+    host: hosts.value.find(h => h.id === e.hostId)!,
     state: (i === valid.length - 1 ? 'connecting' : 'idle') as SessionState,
     startedAt: Date.now(),
     disconnectReason: '',
     retryAt: null,
     resetSeq: 0,
+    alias: e.alias,
   }))
   const activeId = restored[restored.length - 1]!.id
   sessions.value = restored
@@ -916,7 +937,7 @@ export function openSession(hostId: string) {
   const id = crypto.randomUUID()
   sessions.value.push({
     id, host, state: 'connecting', startedAt: Date.now(),
-    disconnectReason: '', retryAt: null, resetSeq: 0,
+    disconnectReason: '', retryAt: null, resetSeq: 0, alias: '',
   })
   activeSessionId.value = id
   persistSessions()
@@ -960,6 +981,96 @@ export function closeSession(id: string) {
     activeSessionId.value = rest.length ? rest[rest.length - 1]!.id : null
   }
   persistSessions()
+}
+
+/* ---- 批量关闭（全部复用 closeSession，禁止另写清理路径） ---- */
+
+/** 关闭除 id 外的全部会话；完成后激活 id */
+export function closeOtherSessions(id: string) {
+  const targets = sessions.value.filter(s => s.id !== id).map(s => s.id)
+  targets.forEach(closeSession)
+  activeSessionId.value = id
+}
+
+/** 关闭 id 左侧（按当前标签顺序）全部会话 */
+export function closeSessionsToLeft(id: string) {
+  const idx = sessions.value.findIndex(s => s.id === id)
+  if (idx <= 0) return
+  sessions.value.slice(0, idx).map(s => s.id).forEach(closeSession)
+}
+
+/** 关闭 id 右侧全部会话 */
+export function closeSessionsToRight(id: string) {
+  const idx = sessions.value.findIndex(s => s.id === id)
+  if (idx < 0) return
+  sessions.value.slice(idx + 1).map(s => s.id).forEach(closeSession)
+}
+
+/** 关闭全部 offline 标签；返回实际关闭数量（toast 用）。
+ *  idle 态不属于"已断开"，不会被清理。 */
+export function closeDisconnectedSessions(): number {
+  const targets = sessions.value.filter(s => s.state === 'offline').map(s => s.id)
+  targets.forEach(closeSession)
+  return targets.length
+}
+
+/** 关闭全部标签，进入工作台空态 */
+export function closeAllSessions() {
+  sessions.value.map(s => s.id).forEach(closeSession)
+}
+
+/** 设置标签别名；空字符串 "" 表示清除别名，UI 回落展示 host.id。 */
+export function setSessionAlias(sessionId: string, alias: string) {
+  const item = sessions.value.find(s => s.id === sessionId)
+  if (!item) return
+  item.alias = alias
+  persistSessions()
+}
+
+/* ---- 复制会话 ---- */
+
+/** 进行中的复制会话源会话 id 集合（前端互斥，防止快速连点并发创建） */
+const duplicating = new Set<string>()
+const DUPLICATE_TIMEOUT_MS = 8000
+
+/** 查询某源会话是否有进行中的复制请求（菜单项 disabled 判断用） */
+export function isDuplicating(sourceSessionId: string): boolean {
+  return duplicating.has(sourceSessionId)
+}
+
+/** 复制会话：基于源会话 id，创建全新独立会话，返回新 sessionId。
+ *  新会话立即以 connecting 态加入 sessions；终端组件挂载后 attachTerminal
+ *  自动发起 connectBackend，成功转 online，失败转 offline。
+ *  并发保护：duplicating 集合互斥；8s setTimeout 兜底防止 IPC 异常导致
+ *  finally 不执行、菜单项永久置灰。 */
+export async function duplicateSession(sourceSessionId: string): Promise<string | null> {
+  if (duplicating.has(sourceSessionId)) return null
+  duplicating.add(sourceSessionId)
+  const timer = setTimeout(() => duplicating.delete(sourceSessionId), DUPLICATE_TIMEOUT_MS)
+  try {
+    const source = sessions.value.find(s => s.id === sourceSessionId)
+    if (!source) return null
+    const newId = crypto.randomUUID()
+    sessions.value.push({
+      id: newId,
+      host: source.host,
+      state: 'connecting',
+      startedAt: Date.now(),
+      disconnectReason: '',
+      retryAt: null,
+      resetSeq: 0,
+      // 继承源会话别名：源有别名则复制别名（与源同名，用户可自行重命名区分）；
+      // 源无别名则 alias 为空，UI 回落展示 host.id（与源一致）。
+      alias: source.alias,
+    })
+    activeSessionId.value = newId
+    appView.value = 'workbench'
+    persistSessions()
+    return newId
+  } finally {
+    clearTimeout(timer)
+    duplicating.delete(sourceSessionId)
+  }
 }
 
 export function setSessionState(id: string, state: SessionState) {
