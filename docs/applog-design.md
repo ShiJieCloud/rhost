@@ -151,6 +151,7 @@
 | 握手失败 | `ssh.handshake.failed` | ERROR | `SSH 握手失败` err、server_banner（若有） |
 | 握手完成 | `ssh.handshake.complete` | INFO | `SSH 握手完成` server_banner、kex、host_key、cipher（复用 0x09 Algo 帧数据） |
 | 主机密钥 | `ssh.hostkey.fingerprint` | DEBUG | `主机密钥指纹` fingerprint（SHA256:…） |
+| 主机密钥落盘失败 | `ssh.hostkey.record_failed` | ERROR | `无法保存主机密钥，下次连接将重新确认指纹` err（known_hosts.json 不可写；会话不断开） |
 | 认证开始 | `ssh.auth.start` | DEBUG | `开始认证` method、user |
 | 认证成功 | `ssh.auth.success` | INFO | `认证成功` method、user |
 | 认证失败 | `ssh.auth.failed` | ERROR | `认证失败` method、reason（服务端返回文本，**不含密码**） |

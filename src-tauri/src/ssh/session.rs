@@ -30,7 +30,7 @@ use uuid::Uuid;
 use super::frame::{FrameType, encode_frame};
 use super::sftp::SftpState;
 use super::tunnel::{REMOTE_CONNECT_TIMEOUT, RemoteRegistry, TunnelManager, run_relay_conn};
-use super::{AuthMethod, SessionConfig, SshError};
+use super::{AuthMethod, HostKeyCheck, SessionConfig, SshError};
 use crate::applog;
 use crate::applog::events as ev;
 
@@ -64,12 +64,73 @@ pub(crate) struct NegotiatedAlgo {
     cipher: String,
 }
 
+/// 主机密钥校验结论：`check_server_key` 写入共享槽，
+/// `connect_and_auth` 连接失败时读出做错误映射（Mismatch/Unknown → 协议前缀错误）。
+#[derive(Clone, Debug)]
+pub(crate) struct HostKeyVerdict {
+    pub kind: VerdictKind,
+    /// 主机密钥算法标准名（如 `ssh-ed25519`）
+    pub algo: String,
+    /// SHA256 指纹（`SHA256:…`）
+    pub fingerprint: String,
+    /// OpenSSH 格式公钥（`algorithm base64`，前端「查看完整公钥」展开区用）
+    pub pubkey: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerdictKind {
+    /// trust 重试命中（用户确认指纹 = 本次握手指纹）：通过并落盘
+    Trusted,
+    /// 磁盘记录比对一致：通过
+    Match,
+    /// 密钥变更（确认指纹或已存指纹 ≠ 本次指纹）：拒绝
+    Mismatch,
+    /// 首连未知（无记录且未信任）：拒绝
+    Unknown,
+}
+
+/// 主机密钥校验决策表（hostkey-verification-design.md §6.4）：
+/// 自上而下命中即止，**trust 覆盖分支必须先于 stored 比对**——mismatch 的
+/// 「更新指纹并重连」以 `trust=true, trust_fp=新指纹` 重试时 `stored=Some(旧)`
+/// 仍与当前不等，若 stored 比对在前会再次判 Mismatch、落盘永不可达。
+/// 纯函数（不触 IO），Trusted 时的落盘由调用方执行；单测覆盖全分支。
+fn evaluate_host_key(
+    stored: Option<&(String, String)>,
+    trust: bool,
+    trust_fp: Option<&str>,
+    current_fp: &str,
+) -> (bool, VerdictKind) {
+    if trust {
+        match trust_fp {
+            // 第 1 行：确认指纹 = 本次指纹 → 通过并落盘（对 stored 不作区分，
+            // 首连信任与变更更新统一由此行落盘覆盖）
+            Some(fp) if fp == current_fp => return (true, VerdictKind::Trusted),
+            // 第 2 行：确认指纹 ≠ 本次指纹 → 二次握手密钥已变（TOFU 竞态防护），拒绝
+            Some(_) => return (false, VerdictKind::Mismatch),
+            // 第 3 行：trust=true 但未携带确认指纹 → 视同未确认，落回 stored 比对，
+            // 绝不落盘（杜绝伪造 IPC 携带 trust=true 直接落盘的旁路）
+            None => {}
+        }
+    }
+    match stored {
+        // 第 4 行：磁盘记录一致
+        Some((_, fp)) if fp == current_fp => (true, VerdictKind::Match),
+        // 第 5 行：密钥变更
+        Some(_) => (false, VerdictKind::Mismatch),
+        // 第 6 行：首连未知
+        None => (false, VerdictKind::Unknown),
+    }
+}
+
 /// russh 客户端回调。
-/// 当前阶段接受任意服务器主机密钥。
-// TODO: 接入 known_hosts 校验，首次连接提示指纹确认
 pub(crate) struct ClientHandler {
     /// 协商算法出口：russh 在 KEX 完成时经 `kex_done` 填入，Arc 共享给连接主流程
     algo: Arc<StdMutex<Option<NegotiatedAlgo>>>,
+    /// 主机密钥校验结论出口：`check_server_key` 写入，连接主流程读出做错误映射
+    ///（`connect_and_auth` 内创建共享，复用 `algo` 槽手法）
+    hk: Arc<StdMutex<Option<HostKeyVerdict>>>,
+    /// 主机密钥校验输入（`HostKeyPolicy::SkipForTests` 时为 None：无条件放行）
+    hk_check: Option<HostKeyCheck>,
     /// 会话标签（主机密钥指纹等握手期日志事件用）
     sid: String,
     /// -R 回调查表：远端来连时按 (绑定地址, 绑定端口) 查出转发目标与规则闸门。
@@ -92,7 +153,9 @@ fn env_export_lines(env: &[(String, String)]) -> String {
     let mut out = String::new();
     for (k, v) in env {
         let valid = k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && k.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_');
+            && k.chars()
+                .skip(1)
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !valid || v.contains(['\n', '\r']) {
             continue;
         }
@@ -255,7 +318,9 @@ async fn try_upload_script(
     let _ = ch.close().await;
     match status {
         Some(0) => Ok(()),
-        Some(code) => Err(format!("远端写入命令退出码 {code}（{path}，可能 /tmp 不可写或磁盘满）")),
+        Some(code) => Err(format!(
+            "远端写入命令退出码 {code}（{path}，可能 /tmp 不可写或磁盘满）"
+        )),
         None => Err(format!("未收到远端退出状态（{path}）")),
     }
 }
@@ -300,24 +365,92 @@ impl client::Handler for ClientHandler {
         &mut self,
         key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        use russh::keys::PublicKeyOrCertificate as PKC;
-        let fingerprint = match key {
-            PKC::PublicKey { key, .. } => {
-                key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
-            }
-            PKC::Certificate(cert) => cert
-                .public_key()
-                .fingerprint(russh::keys::HashAlg::Sha256)
-                .to_string(),
+        use russh::keys::HashAlg;
+        use russh::keys::PublicKeyBase64;
+        // 统一取内层公钥：PublicKeyOrCertificate::public_key() 对普通密钥与证书
+        // 均返回 ssh_key::PublicKey，算法名/指纹/OpenSSH 公钥串由此算出（设计 §6.4）
+        let pk = key.public_key();
+        let algo = pk.algorithm().to_string();
+        let fingerprint = pk.fingerprint(HashAlg::Sha256).to_string();
+        let pubkey = format!("{algo} {}", pk.public_key_base64());
+        // SkipForTests：仅 e2e 可达（doc(hidden)），记日志后放行
+        let Some(check) = self.hk_check.clone() else {
+            applog::emit(
+                log::Level::Debug,
+                "ssh",
+                ev::SSH_HOSTKEY_FINGERPRINT,
+                Some(&self.sid),
+                "主机密钥指纹（校验已跳过）",
+                Some(serde_json::json!({ "fingerprint": fingerprint })),
+            );
+            return Ok(true);
         };
+
+        // 决策表评估（§6.4）并写入共享槽，供连接失败时错误映射
+        let (pass, kind) = evaluate_host_key(
+            check.stored.as_ref(),
+            check.trust,
+            check.trust_fp.as_deref(),
+            &fingerprint,
+        );
+        *self.hk.lock().unwrap() = Some(HostKeyVerdict {
+            kind,
+            algo: algo.clone(),
+            fingerprint: fingerprint.clone(),
+            pubkey: pubkey.clone(),
+        });
+        // 指纹/算法属公开信息可记录（设计 §7）；密码/PTY 字节流永不入日志
         applog::emit(
             log::Level::Debug,
             "ssh",
             ev::SSH_HOSTKEY_FINGERPRINT,
             Some(&self.sid),
-            "主机密钥指纹",
-            Some(serde_json::json!({ "fingerprint": fingerprint })),
+            "主机密钥校验",
+            Some(serde_json::json!({
+                "algo": algo,
+                "fingerprint": fingerprint,
+                "verdict": format!("{kind:?}"),
+            })),
         );
+
+        if !pass {
+            // 拒绝：russh 随即中断握手，错误映射在 connect_and_auth 读槽完成
+            return Ok(false);
+        }
+        if kind == VerdictKind::Trusted && check.persist {
+            // TOFU 落盘：「仅本次连接」（persist=false）跳过——内存信任不跨会话，
+            // 下次新建会话重新首连确认。与握手完成同步收敛（同步小文件 I/O，
+            // 几 KB 可接受），禁止 tokio::spawn 异步写（设计 §6.2：写未完成时断开
+            // 重连会读到旧文件，产生「连接成功但马上重弹确认」竞态）。
+            // upsert by host+port 覆盖旧条目。
+            // 写失败绝不断开已建立的会话（§7 行为契约 1）：本次连接继续可信，
+            // 下次连接重新确认。
+            let entry = crate::known_hosts::KnownHostEntry {
+                host: check.host,
+                port: check.port,
+                algo: algo.clone(),
+                fingerprint: fingerprint.clone(),
+                added_at: crate::known_hosts::now_ms(),
+            };
+            match crate::known_hosts::record(&check.path, entry) {
+                Ok(()) => applog::emit(
+                    log::Level::Info,
+                    "ssh",
+                    ev::SSH_HOSTKEY_FINGERPRINT,
+                    Some(&self.sid),
+                    format!("主机密钥已信任并保存（{algo} {fingerprint}）"),
+                    None,
+                ),
+                Err(e) => applog::emit(
+                    log::Level::Error,
+                    "ssh",
+                    ev::SSH_HOSTKEY_RECORD_FAILED,
+                    Some(&self.sid),
+                    format!("无法保存主机密钥，下次连接将重新确认指纹: {e}"),
+                    Some(serde_json::json!({ "path": check.path.display().to_string() })),
+                ),
+            }
+        }
         Ok(true)
     }
 
@@ -353,9 +486,7 @@ impl client::Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         // 同步段：锁内 clone 出 binding（内含 Arc，clone 廉价）后立即放锁
-        let binding = self
-            .remote
-            .lookup(connected_address, connected_port as u16);
+        let binding = self.remote.lookup(connected_address, connected_port as u16);
         let global_conns = self.global_conns.clone();
         let bound = format!("{connected_address}:{connected_port}");
         async move {
@@ -423,20 +554,17 @@ async fn open_pty(
     cfg: &SessionConfig,
     sid: &str,
 ) -> Result<russh::Channel<client::Msg>, SshError> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| {
-            applog::emit(
-                log::Level::Error,
-                "ssh",
-                ev::SSH_SESSION_FAILED,
-                Some(sid),
-                "会话创建失败",
-                Some(serde_json::json!({ "stage": "channel", "err": e.to_string() })),
-            );
-            SshError::Channel(e.to_string())
-        })?;
+    let channel = handle.channel_open_session().await.map_err(|e| {
+        applog::emit(
+            log::Level::Error,
+            "ssh",
+            ev::SSH_SESSION_FAILED,
+            Some(sid),
+            "会话创建失败",
+            Some(serde_json::json!({ "stage": "channel", "err": e.to_string() })),
+        );
+        SshError::Channel(e.to_string())
+    })?;
     applog::emit(
         log::Level::Debug,
         "ssh",
@@ -446,15 +574,7 @@ async fn open_pty(
         Some(serde_json::json!({ "channel_id": format!("{:?}", channel.id()) })),
     );
     channel
-        .request_pty(
-            true,
-            TERM_TYPE,
-            cfg.cols.max(1),
-            cfg.rows.max(1),
-            0,
-            0,
-            &[],
-        )
+        .request_pty(true, TERM_TYPE, cfg.cols.max(1), cfg.rows.max(1), 0, 0, &[])
         .await
         .map_err(|e| {
             applog::emit(
@@ -612,20 +732,17 @@ async fn open_interactive(
         })),
     );
 
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|e| {
-            applog::emit(
-                log::Level::Error,
-                "ssh",
-                ev::SSH_SESSION_FAILED,
-                Some(sid),
-                "会话创建失败",
-                Some(serde_json::json!({ "stage": "shell", "err": e.to_string() })),
-            );
-            SshError::Channel(e.to_string())
-        })?;
+    channel.request_shell(true).await.map_err(|e| {
+        applog::emit(
+            log::Level::Error,
+            "ssh",
+            ev::SSH_SESSION_FAILED,
+            Some(sid),
+            "会话创建失败",
+            Some(serde_json::json!({ "stage": "shell", "err": e.to_string() })),
+        );
+        SshError::Channel(e.to_string())
+    })?;
     applog::emit(
         log::Level::Debug,
         "ssh",
@@ -794,11 +911,20 @@ pub(crate) async fn connect_and_auth(
         nodelay: true,
         ..Default::default()
     });
+    // 主机密钥校验：verdict 共享槽在连接主流程创建（复用 algo 槽手法），
+    // `check_server_key` 写入、下方握手失败分支读出做错误映射（§6.4）
+    let hk = Arc::new(StdMutex::new(None));
+    let hk_check = match &cfg.host_key {
+        super::HostKeyPolicy::Verify(check) => Some(check.clone()),
+        super::HostKeyPolicy::SkipForTests => None,
+    };
     let mut handle = match client::connect_stream(
         config,
         socket,
         ClientHandler {
             algo: algo.clone(),
+            hk: hk.clone(),
+            hk_check,
             sid: sid.to_string(),
             remote,
             global_conns,
@@ -831,6 +957,29 @@ pub(crate) async fn connect_and_auth(
                 "SSH 握手失败",
                 Some(serde_json::json!({ "err": e.to_string() })),
             );
+            // 主机密钥拒绝（check_server_key 返回 false 由 russh 中断握手）：
+            // 按 verdict 槽细分映射为协议前缀错误，否则维持普通连接失败（§6.4）
+            let verdict = hk.lock().unwrap().clone();
+            if let Some(v) =
+                verdict.filter(|v| !matches!(v.kind, VerdictKind::Trusted | VerdictKind::Match))
+            {
+                // payload 三段：`algo|fingerprint|pubkey`（pubkey 不含 `|`，可按 `|` 切）
+                let payload = format!("{}|{}|{}", v.algo, v.fingerprint, v.pubkey);
+                applog::emit(
+                    log::Level::Warn,
+                    "ssh",
+                    ev::SSH_HOSTKEY_FINGERPRINT,
+                    Some(sid),
+                    format!("主机密钥校验未通过（{:?}）", v.kind),
+                    Some(
+                        serde_json::json!({ "algo": v.algo, "fingerprint": v.fingerprint, "pubkey": v.pubkey }),
+                    ),
+                );
+                return Err(match v.kind {
+                    VerdictKind::Mismatch => SshError::HostKeyMismatch(payload),
+                    _ => SshError::HostKeyUnknown(payload),
+                });
+            }
             return Err(SshError::Connect(e.to_string()));
         }
     };
@@ -1002,7 +1151,10 @@ impl SshSession {
     /// 后台任务（读/合并/写）均挂在 `cancel` 上，`shutdown()` 即全部取消。
     ///
     /// `sid` 为会话标签（uuid 前 6 位），贯穿连接全生命周期日志事件。
-    pub async fn connect(cfg: SessionConfig, sid: &str) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SshError> {
+    pub async fn connect(
+        cfg: SessionConfig,
+        sid: &str,
+    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SshError> {
         let connect_start = Instant::now();
         let cancel = CancellationToken::new();
 
@@ -1054,7 +1206,9 @@ impl SshSession {
                         "ssh",
                         ev::SSH_SESSION_INIT_SCRIPT_FAILED,
                         Some(sid),
-                        format!("会话初始化脚本上传失败，CWD 同步/提示符/UTF-8 locale 自动配置跳过: {e}"),
+                        format!(
+                            "会话初始化脚本上传失败，CWD 同步/提示符/UTF-8 locale 自动配置跳过: {e}"
+                        ),
                         None,
                     );
                     None
@@ -1736,6 +1890,78 @@ async fn rtt_task(
 }
 
 #[cfg(test)]
+mod hostkey_decision_tests {
+    use super::{VerdictKind, evaluate_host_key};
+
+    const FP: &str = "SHA256:CUR";
+    const ALGO: &str = "ssh-ed25519";
+
+    fn stored(fp: &str) -> Option<(String, String)> {
+        Some((ALGO.into(), fp.into()))
+    }
+
+    /// 第 1 行：trust 重试命中 → Trusted（stored=None 首连 与 stored=Some(旧) 变更更新
+    /// 两态都必须落盘——该行对 stored 不作区分，mismatch「更新指纹并重连」依赖此序）
+    #[test]
+    fn trust_hit_passes_and_persists_for_both_stored_states() {
+        for stored in [None, stored("SHA256:OLD")] {
+            let (pass, kind) = evaluate_host_key(stored.as_ref(), true, Some(FP), FP);
+            assert!(pass, "stored={stored:?}");
+            assert_eq!(kind, VerdictKind::Trusted, "stored={stored:?}");
+        }
+    }
+
+    /// 第 2 行：确认指纹 ≠ 本次指纹（TOFU 竞态：二次握手密钥已变）→ Mismatch 拒绝
+    #[test]
+    fn trust_stale_fingerprint_is_mismatch() {
+        let (pass, kind) = evaluate_host_key(None, true, Some("SHA256:OTHER"), FP);
+        assert!(!pass);
+        assert_eq!(kind, VerdictKind::Mismatch);
+    }
+
+    /// 第 3 行：trust=true 但缺 trust_fp → 视同未确认，按 stored 比对走，绝不落盘
+    #[test]
+    fn trust_without_fingerprint_falls_back_to_stored_compare() {
+        // 无记录：落回第 6 行 Unknown
+        let (pass, kind) = evaluate_host_key(None, true, None, FP);
+        assert!(!pass);
+        assert_eq!(kind, VerdictKind::Unknown);
+        // 有记录且一致：落回第 4 行 Match
+        let (pass, kind) = evaluate_host_key(stored(FP).as_ref(), true, None, FP);
+        assert!(pass);
+        assert_eq!(kind, VerdictKind::Match);
+        // 有记录但不一致：落回第 5 行 Mismatch
+        let (pass, kind) = evaluate_host_key(stored("SHA256:OLD").as_ref(), true, None, FP);
+        assert!(!pass);
+        assert_eq!(kind, VerdictKind::Mismatch);
+    }
+
+    /// 第 4 行：磁盘记录一致 → Match
+    #[test]
+    fn stored_match_passes() {
+        let (pass, kind) = evaluate_host_key(stored(FP).as_ref(), false, None, FP);
+        assert!(pass);
+        assert_eq!(kind, VerdictKind::Match);
+    }
+
+    /// 第 5 行：密钥变更 → Mismatch
+    #[test]
+    fn stored_changed_is_mismatch() {
+        let (pass, kind) = evaluate_host_key(stored("SHA256:OLD").as_ref(), false, None, FP);
+        assert!(!pass);
+        assert_eq!(kind, VerdictKind::Mismatch);
+    }
+
+    /// 第 6 行：首连（无记录、未信任）→ Unknown
+    #[test]
+    fn first_connect_is_unknown() {
+        let (pass, kind) = evaluate_host_key(None, false, None, FP);
+        assert!(!pass);
+        assert_eq!(kind, VerdictKind::Unknown);
+    }
+}
+
+#[cfg(test)]
 mod gate_tests {
     use super::METRIC_EXEC_GATE;
 
@@ -1772,7 +1998,10 @@ mod env_export_tests {
             ("EDITOR".into(), "nvim".into()),
             ("PROXY_URL".into(), "http://127.0.0.1:7890".into()),
         ]);
-        assert_eq!(out, "export EDITOR='nvim'\nexport PROXY_URL='http://127.0.0.1:7890'\n");
+        assert_eq!(
+            out,
+            "export EDITOR='nvim'\nexport PROXY_URL='http://127.0.0.1:7890'\n"
+        );
     }
 
     #[test]
@@ -1785,30 +2014,33 @@ mod env_export_tests {
     #[test]
     fn illegal_keys_and_multiline_values_are_skipped() {
         let out = env_export_lines(&[
-            ("1BAD".into(), "v".into()),      // 数字开头
-            ("BAD KEY".into(), "v".into()),   // 含空格
-            ("BAD;KEY".into(), "v".into()),   // 注入面：分号
-            ("BAD-KEY".into(), "v".into()),   // 连字符
-            ("".into(), "v".into()),          // 空键
-            ("OK".into(), "a\nb".into()),     // 值含换行破坏脚本单行结构
-            ("OK".into(), "a\rb".into()),     // 值含回车
-            ("GOOD_1".into(), "v".into()),    // 合法：下划线+数字
-            ("_X".into(), "v".into()),        // 合法：下划线开头
+            ("1BAD".into(), "v".into()),    // 数字开头
+            ("BAD KEY".into(), "v".into()), // 含空格
+            ("BAD;KEY".into(), "v".into()), // 注入面：分号
+            ("BAD-KEY".into(), "v".into()), // 连字符
+            ("".into(), "v".into()),        // 空键
+            ("OK".into(), "a\nb".into()),   // 值含换行破坏脚本单行结构
+            ("OK".into(), "a\rb".into()),   // 值含回车
+            ("GOOD_1".into(), "v".into()),  // 合法：下划线+数字
+            ("_X".into(), "v".into()),      // 合法：下划线开头
         ]);
         assert_eq!(out, "export GOOD_1='v'\nexport _X='v'\n");
     }
 
     #[test]
     fn env_block_lands_after_clear_line_in_script() {
-        let script = init_script(
-            "/tmp/.ri-test",
-            false,
-            &[("EDITOR".into(), "nvim".into())],
-        );
-        let clear = script.find("printf '\\033[1A\\r\\033[2K'").expect("清行必须是第一行");
-        let env_line = script.find("export EDITOR='nvim'").expect("export 块应在脚本内");
+        let script = init_script("/tmp/.ri-test", false, &[("EDITOR".into(), "nvim".into())]);
+        let clear = script
+            .find("printf '\\033[1A\\r\\033[2K'")
+            .expect("清行必须是第一行");
+        let env_line = script
+            .find("export EDITOR='nvim'")
+            .expect("export 块应在脚本内");
         let hook = script.find("_rh_cwd_hook").expect("CWD 钩子应在脚本内");
-        assert!(clear < env_line && env_line < hook, "顺序应为 清行 → export → 钩子");
+        assert!(
+            clear < env_line && env_line < hook,
+            "顺序应为 清行 → export → 钩子"
+        );
         // color_prompt=false 时 export 之后不应有颜色块
         assert!(!script.contains("_rh_e"), "未开启提示符着色时不应有颜色块");
     }
@@ -1817,17 +2049,15 @@ mod env_export_tests {
     fn utf8_locale_fallback_block_present_before_user_env() {
         // vim 乱码回归守卫：init 脚本必须带 UTF-8 locale 候选探测 + LC_ALL
         // 保底，且整段位于用户自定义 env 之前（LC_ALL 优先级恒压其后注入的 LANG）
-        let script = init_script(
-            "/tmp/.ri-test",
-            false,
-            &[("EDITOR".into(), "nvim".into())],
-        );
+        let script = init_script("/tmp/.ri-test", false, &[("EDITOR".into(), "nvim".into())]);
 
         // 候选列表：C.UTF-8 系列优先（内置/语言中性），en_US 兜底旧版
         // CentOS/RHEL/Amazon Linux；两种拼写都试。顺序必须固定。
         let c_utf8 = script.find("C.UTF-8").expect("应有 C.UTF-8 候选");
         let c_utf8_lower = script.find("C.utf8").expect("应有 C.utf8 候选");
-        let en_us = script.find("en_US.UTF-8").expect("应有 en_US.UTF-8 候选（CentOS 兜底）");
+        let en_us = script
+            .find("en_US.UTF-8")
+            .expect("应有 en_US.UTF-8 候选（CentOS 兜底）");
         let en_us_lower = script.find("en_US.utf8").expect("应有 en_US.utf8 候选");
         assert!(
             c_utf8 < c_utf8_lower && c_utf8_lower < en_us && en_us < en_us_lower,
@@ -1835,30 +2065,42 @@ mod env_export_tests {
         );
 
         // charmap 判定放宽 UTF-?8（兼容输出 UTF8 的实现），且为实测 grep
-        assert!(script.contains("grep -qiE '^UTF-?8$'"), "charmap 应按 UTF-?8 实测匹配");
+        assert!(
+            script.contains("grep -qiE '^UTF-?8$'"),
+            "charmap 应按 UTF-?8 实测匹配"
+        );
 
         // 无 locale 命令 / 残损 busybox locale（charmap 无输出）两路兜底
-        assert!(script.contains("command -v locale"), "应覆盖无 locale 命令的系统");
+        assert!(
+            script.contains("command -v locale"),
+            "应覆盖无 locale 命令的系统"
+        );
         assert!(
             script.contains("[ -z \"$(locale charmap 2>/dev/null)\" ]"),
             "应覆盖有 locale 命令但 charmap 无输出的 busybox 残损实现"
         );
 
         // 保底经 _rh_l 变量 export LC_ALL，而非写死某个名字（候选可能落空）
-        let export_lc = script.find("export LC_ALL=\"$_rh_l\"")
+        let export_lc = script
+            .find("export LC_ALL=\"$_rh_l\"")
             .expect("应只在探测到可用 locale 后按 _rh_l export LC_ALL");
         let env_line = script.find("export EDITOR='nvim'").unwrap();
         assert!(export_lc < env_line, "locale 保底必须在用户 env 之前");
 
         // 探测整段只在「当前不是 UTF-8」时执行（外层 if ! ... grep UTF-?8）
         assert!(
-            script.contains("if ! printf '%s' \"$(locale charmap 2>/dev/null)\" | grep -qiE '^UTF-?8$'"),
+            script.contains(
+                "if ! printf '%s' \"$(locale charmap 2>/dev/null)\" | grep -qiE '^UTF-?8$'"
+            ),
             "外层必须是「当前非 UTF-8 才探测」，已是 UTF-8 时零改动"
         );
         // 绝不硬写 LANG（只统一字符类别，语言/地区偏好留给用户）
         assert!(!script.contains("export LANG="), "不应硬编码 LANG");
         // 不能出现把字符集名当 locale 名的错误用法
-        assert!(!script.contains("LC_ALL=UTF-8 "), "UTF-8 不是合法 locale 名，不能直接设");
+        assert!(
+            !script.contains("LC_ALL=UTF-8 "),
+            "UTF-8 不是合法 locale 名，不能直接设"
+        );
         // 临时变量用完即清
         assert!(script.contains("unset _rh_l _rh_c"), "应清理临时变量");
     }
@@ -1868,7 +2110,10 @@ mod env_export_tests {
         let cmd = locale_login_cmd("/bin/bash");
         // exec 路径复用同一候选探测（含 CentOS 兜底候选与放宽匹配）
         assert!(cmd.contains("en_US.UTF-8"), "exec 路径也应探测 en_US.UTF-8");
-        assert!(cmd.contains("grep -qiE '^UTF-?8$'"), "exec 路径应实测 charmap");
+        assert!(
+            cmd.contains("grep -qiE '^UTF-?8$'"),
+            "exec 路径应实测 charmap"
+        );
         // 命中：带 LC_ALL 前缀 exec；未命中：else 分支行首裸 exec（不塞无效 locale）
         assert!(
             cmd.contains("LC_ALL=\"$_rh_l\" exec '/bin/bash' -l"),
@@ -1880,7 +2125,10 @@ mod env_export_tests {
         );
         // shell 路径经单引号转义后安全内插
         let evil = locale_login_cmd("/tmp/x'bash");
-        assert!(evil.contains("'/tmp/x'\\''bash' -l"), "shell 单引号应被转义");
+        assert!(
+            evil.contains("'/tmp/x'\\''bash' -l"),
+            "shell 单引号应被转义"
+        );
         assert!(!evil.contains("LC_ALL=UTF-8 "), "不得把 UTF-8 当 locale 名");
     }
 }

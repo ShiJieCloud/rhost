@@ -9,6 +9,7 @@ import SettingsModal from './components/SettingsModal.vue'
 import GroupModal from './components/GroupModal.vue'
 import KeysModal from './components/KeysModal.vue'
 import PasswordModal from './components/PasswordModal.vue'
+import HostKeyModal from './components/HostKeyModal.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import AppToast from './components/AppToast.vue'
 import { appView, restoreSessions } from './stores/session'
@@ -76,6 +77,7 @@ onMounted(async () => {
     <GroupModal />
     <KeysModal />
     <PasswordModal />
+    <HostKeyModal />
     <ConfirmModal />
     <AppToast />
   </div>

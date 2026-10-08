@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import AppLogo from '../../components/AppLogo.vue'
 import { toast } from '../../composables/useToast'
 import { promptPassword } from '../../composables/usePasswordPrompt'
+import { confirmHostKey, parseHostKeyError, type HostKeyInfo } from '../../composables/useHostKeyPrompt'
 import { addHost, hosts } from '../../stores/hosts'
 import { openSession } from '../../stores/session'
 import { isTauri } from '../../lib/tauri'
@@ -293,6 +294,21 @@ function connect(raw?: string) {
   }
 }
 
+/** 弹指纹确认框；用户接受返回重试所需 (trust, fp, persist)，取消返回 null */
+async function askTrustHostKey(hk: { kind: HostKeyInfo['kind']; algo: string; fingerprint: string; pubkey: string }, host: Host) {
+  const action = await confirmHostKey({
+    kind: hk.kind,
+    host: host.ip,
+    port: host.port,
+    algo: hk.algo,
+    fingerprint: hk.fingerprint,
+    pubkey: hk.pubkey,
+  })
+  if (action === 'reject') return null // 用户取消/断开：不落盘、不重试，留在当前页
+  // save/update → 落盘；once → 仅本次连接（不落盘，下次连接重新确认）
+  return { trust: true, fp: hk.fingerprint, persist: action !== 'once' }
+}
+
 /** 密钥认证：先试无口令加载；私钥加密时弹口令框重试，口令错误可反复重试 */
 async function runKeyConnect(host: Host, keyPath: string) {
   // 非 Tauri 环境无后端，直接 mock 进入
@@ -303,6 +319,11 @@ async function runKeyConnect(host: Host, keyPath: string) {
   testing.value = true
   host.keyPath = keyPath
   let passphrase = ''
+  // 主机密钥 TOFU 二阶段（hostkey-verification-design.md §6.6）：
+  // 首次尝试未信任；弹窗确认后带确认指纹重试一次（仅本次连接不落盘）
+  let trust = false
+  let trustFp: string | undefined
+  let persist = true
   try {
     for (;;) {
       try {
@@ -315,6 +336,9 @@ async function runKeyConnect(host: Host, keyPath: string) {
             passphrase,
             cols: 0,
             rows: 0,
+            trustHostKey: trust,
+            trustFingerprint: trustFp,
+            trustHostKeyPersist: persist,
           },
         })
         // 测试通过：口令暂存到主机（重连免输），打开会话
@@ -333,6 +357,16 @@ async function runKeyConnect(host: Host, keyPath: string) {
           )
           if (pw == null) return // 用户取消
           passphrase = pw
+          continue
+        }
+        // 主机密钥未信任/变更：弹窗确认后带 trust 参数重试一次（once 不落盘）
+        const hk = parseHostKeyError(msg)
+        if (hk) {
+          const ans = await askTrustHostKey(hk, host)
+          if (!ans) return // 用户取消：不落盘、不重试，留在当前页
+          trust = ans.trust
+          trustFp = ans.fp
+          persist = ans.persist
           continue
         }
         // 其它失败：报错留在一键连接页，不跳转
@@ -354,8 +388,9 @@ async function runTestAndConnect(host: Host) {
     testing.value = false
     return // 用户取消
   }
-  try {
-    await invoke<{ latencyMs: number }>('test_ssh_connection', {
+  // 主机密钥 TOFU 二阶段：首次未信任；弹窗确认后带确认指纹重试一次（once 不落盘）
+  const doTest = (trust = false, trustFp?: string, persist = true) =>
+    invoke<{ latencyMs: number }>('test_ssh_connection', {
       payload: {
         host: host.ip,
         port: host.port,
@@ -363,8 +398,21 @@ async function runTestAndConnect(host: Host) {
         password,
         cols: 0,
         rows: 0,
+        trustHostKey: trust,
+        trustFingerprint: trustFp,
+        trustHostKeyPersist: persist,
       },
     })
+  try {
+    try {
+      await doTest()
+    } catch (e) {
+      const hk = parseHostKeyError(String(e))
+      if (!hk) throw e
+      const ans = await askTrustHostKey(hk, host)
+      if (!ans) return // 用户取消：不落盘、不重试，留在当前页
+      await doTest(ans.trust, ans.fp, ans.persist) // 重试一次；再失败按常规报错
+    }
   } catch (e) {
     // 测试失败：报错并留在一键连接页，不跳转
     toast(`连接失败：${String(e)}`, 'err', 3000)

@@ -4,6 +4,7 @@ mod config_io;
 mod config_migrate;
 mod fonts;
 mod ipc;
+mod known_hosts;
 mod localfs;
 mod metrics;
 mod motd;
@@ -13,7 +14,7 @@ mod sysmon;
 
 use applog::events as ev;
 use ssh::manager::SessionManager;
-use tauri::{webview::WebviewWindowBuilder, Manager, RunEvent, WebviewUrl};
+use tauri::{Manager, RunEvent, WebviewUrl, webview::WebviewWindowBuilder};
 
 /// 应用启动时刻（退出时计算 uptime_s）
 static BOOT_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

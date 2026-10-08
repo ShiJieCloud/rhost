@@ -7,6 +7,8 @@ import { clearSessionTunnels, handleTunnelFrame, restoreOnReconnect, startSavedO
 import { isTauri } from '../lib/tauri'
 import { getSnapshot, onConfigLoad, patchUiState } from './appConfig'
 import { promptPassword } from '../composables/usePasswordPrompt'
+import { confirmHostKey, parseHostKeyError } from '../composables/useHostKeyPrompt'
+import { toast } from '../composables/useToast'
 
 export type SessionState = 'idle' | 'connecting' | 'online' | 'reconnecting' | 'offline'
 export type AppView = 'home' | 'workbench'
@@ -597,8 +599,22 @@ interface ConnectResult {
   sessionId: string
 }
 
-/** 建立后端 SSH 连接：创建独立 Channel，invoke connect_ssh，帧流进 xterm */
-async function connectBackend(s: Session, cols: number, rows: number) {
+/**
+ * 建立后端 SSH 连接：创建独立 Channel，invoke connect_ssh，帧流进 xterm。
+ *
+ * 主机密钥 TOFU 两阶段确认（hostkey-verification-design.md §6.6）：
+ * 首连后端返回 HOSTKEY_UNKNOWN/HOSTKEY_MISMATCH 前缀错误 → 弹窗确认 →
+ * 以 trustHostKey=true + 用户确认的指纹重试一次（trustFp 只在本重试传）；
+ * 「仅本次连接」不写 known_hosts（trustPersist=false），下次连接重新确认。
+ */
+async function connectBackend(
+  s: Session,
+  cols: number,
+  rows: number,
+  trustHostKey = false,
+  trustFp?: string,
+  trustPersist = true,
+) {
   if (!isTauri) {
     deliver(s.id, textEncoder.encode('\x1b[33m[dev] 浏览器模式无 Tauri 后端，无法建立 SSH 连接\x1b[0m\r\n'))
     setSessionState(s.id, 'offline')
@@ -642,8 +658,13 @@ async function connectBackend(s: Session, cols: number, rows: number) {
         // 彩色提示符：后端在 PTY 开启后自动注入并 hold 初始化输出至脚本完成，
         // 前端首帧即着色 PS1 的最终画面，无需任何时序编排
         colorPrompt: savedSettings.colorPrompt,
-        // 环境变量：随 init 脚本 export 注入远端交互 shell（绕过 sshd AcceptEnv 限制）
+        // 环境变量：随 init 脚本 export 注入远端 shell（绕过 sshd AcceptEnv 限制）
         env: savedSettings.env.map(e => [e.key, e.value]),
+        // 主机密钥 TOFU 二阶段：重试时带用户确认的指纹（后端校验格式并比对本次握手）；
+        // 仅本次连接 trustPersist=false，后端跳过 known_hosts 落盘
+        trustHostKey,
+        trustFingerprint: trustFp,
+        trustHostKeyPersist: trustPersist,
       },
       channel,
     })
@@ -671,8 +692,43 @@ async function connectBackend(s: Session, cols: number, rows: number) {
   } catch (e) {
     // 代次失配：失败已无关当前状态（用户已断开或更新的连接在进行），静默丢弃
     if (gen !== connectGen.get(s.id)) return
+    const msg = String(e)
+    // ---- 主机密钥校验失败分流（HOSTKEY_UNKNOWN / HOSTKEY_MISMATCH，§6.6）----
+    const hk = parseHostKeyError(msg)
+    if (hk) {
+      const wasAutoReconnecting = reconnectAttemptMap.has(s.id)
+      // 终止自动重连循环：该分流先于 scheduleAutoReconnect 续试判断直接返回
+      clearReconnectTimer(s.id)
+      reconnectAttemptMap.delete(s.id)
+      // 错误信息只进浮层字段（状态点置 offline 即错误红 st-err，悬停可见全文），
+      // 不写入终端缓冲（保留断线前画面）
+      s.disconnectReason = `主机密钥校验失败：${hk.algo}|${hk.fingerprint}`
+      s.retryAt = null
+      setSessionState(s.id, 'offline')
+      if (wasAutoReconnecting) {
+        // 自动重连中：不弹窗（后台循环重试禁止打断用户），但不得只把信息藏在
+        // disconnectReason（否则服务器密钥变更表现为「反复掉线且无解释」）——
+        // 显性告知一次性 toast（本分流直接返回、循环已终止，天然只发一次）
+        toast('主机密钥校验失败，请手动重新连接完成指纹确认', 'err', 4000)
+        return
+      }
+      // 手动路径（首连/手动重连）：弹窗确认后带 trust 重试一次；取消维持失败态。
+      // save/update → 落盘；once → 仅本次连接（不落盘）
+      const action = await confirmHostKey({
+        kind: hk.kind,
+        host: s.host.ip,
+        port: s.host.port,
+        algo: hk.algo,
+        fingerprint: hk.fingerprint,
+        pubkey: hk.pubkey,
+      })
+      if (action !== 'reject') {
+        await connectBackend(s, cols, rows, true, hk.fingerprint, action !== 'once')
+      }
+      return
+    }
     // 错误信息只进浮层字段，不写入终端缓冲（保留断线前画面）
-    s.disconnectReason = `连接失败：${String(e)}`
+    s.disconnectReason = `连接失败：${msg}`
     s.retryAt = null
     setSessionState(s.id, 'offline')
     // 处于自动重连流程中（attemptMap 有记录）：失败后按退避策略续试；

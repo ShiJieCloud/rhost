@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
-use crate::ssh::sftp::TransferProgress;
 use crate::ssh::session::connect_and_auth;
-use crate::ssh::{AuthMethod, SessionConfig, SessionManager};
+use crate::ssh::sftp::TransferProgress;
+use crate::ssh::{AuthMethod, HostKeyCheck, HostKeyPolicy, SessionConfig, SessionManager};
 use crate::store::{self, StoredHost};
 
 use russh::Disconnect;
@@ -71,7 +71,6 @@ macro_rules! slow_span {
     };
 }
 
-
 /// 前端新建会话时提交的连接参数
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,6 +104,17 @@ pub struct ConnectPayload {
     /// 自定义 MOTD ASCII LOGO（多行文本）；空串使用内置 LOGO
     #[serde(default)]
     pub motd_logo: String,
+    /// 主机密钥 TOFU 二阶段重试：用户已在 UI 确认信任（缺省 false）
+    #[serde(default)]
+    pub trust_host_key: bool,
+    /// 用户确认的指纹（`SHA256:…`）；trust_host_key=true 时必须携带，
+    /// 缺省由后端决策表按未确认处理（hostkey-verification-design.md §6.4 第 3 行）
+    #[serde(default)]
+    pub trust_fingerprint: Option<String>,
+    /// 信任后是否写入 known_hosts：「仅本次连接」= false；
+    /// 缺省 true 保持既有「接受并保存」落盘行为（设计 §6.5）
+    #[serde(default = "default_true")]
+    pub trust_host_key_persist: bool,
 }
 
 /// serde 默认值：布尔开关缺省为 true
@@ -125,6 +135,51 @@ impl ConnectPayload {
     }
 }
 
+/// 校验 `trust_fingerprint`（不可信 IPC 输入，纵深防御 §6.3）：非空、`SHA256:`
+/// 前缀、主体仅 Base64 字符集且长度 ≥ 40（SHA256 无 padding 为 43 字符、
+/// 含 padding 44，均覆盖）。非法值在最外层拦截，绝不进入 `HostKeyCheck`。
+/// 纯函数，单测见下方 `hostkey_validate_tests`。
+fn validate_trust_fingerprint(fp: &str) -> Result<(), String> {
+    let body = fp
+        .strip_prefix("SHA256:")
+        .ok_or_else(|| "信任指纹格式非法：缺少 SHA256: 前缀".to_string())?;
+    if body.len() < 40 {
+        return Err(format!("信任指纹格式非法：主体长度 {} 不足 40", body.len()));
+    }
+    if !body
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        return Err("信任指纹格式非法：主体含非 Base64 字符".to_string());
+    }
+    Ok(())
+}
+
+/// 两条连接命令统一的主机密钥策略构造：lookup → `HostKeyPolicy::Verify`。
+/// 读失败按无记录处理（fail-closed，走首连确认）。
+fn host_key_policy(app: &AppHandle, payload: &ConnectPayload) -> Result<HostKeyPolicy, String> {
+    let path = crate::known_hosts::path(app)?;
+    // trust_fingerprint 是不可信输入：格式非法直接返回参数错误
+    let trust_fp = match payload.trust_fingerprint.as_deref() {
+        Some(fp) => {
+            validate_trust_fingerprint(fp)?;
+            Some(fp.to_string())
+        }
+        None => None,
+    };
+    let stored = crate::known_hosts::lookup(&path, &payload.host, payload.port)
+        .map(|e| (e.algo, e.fingerprint));
+    Ok(HostKeyPolicy::Verify(HostKeyCheck {
+        host: payload.host.clone(),
+        port: payload.port,
+        stored,
+        trust: payload.trust_host_key,
+        trust_fp,
+        persist: payload.trust_host_key_persist,
+        path,
+    }))
+}
+
 /// 连接成功返回：会话 ID（提示符注入由后端在 PTY 开启后自动完成，无需前端参与）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,9 +196,12 @@ pub struct ConnectResult {
 pub async fn connect_ssh(
     payload: ConnectPayload,
     channel: Channel<Vec<u8>>,
+    app: AppHandle,
     manager: State<'_, SessionManager>,
 ) -> Result<ConnectResult, String> {
     slow_span!("connect_ssh");
+    // 主机密钥校验：读取/写入 known_hosts 需 AppHandle（仅 ipc 层触及，设计 §6.3）
+    let host_key = host_key_policy(&app, &payload)?;
     // 先记录目标地址并取出认证方式（下面 payload 字段被 move 进 cfg）
     let target = format!("{}:{}", payload.host, payload.port);
     let auth = payload.into_auth();
@@ -160,8 +218,15 @@ pub async fn connect_ssh(
         color_prompt,
         env: payload.env,
         motd_logo: payload.motd_logo,
+        host_key,
     };
     let (session_id, mut frame_rx) = manager.create(cfg).await.map_err(|e| {
+        // 主机密钥协议错误（HOSTKEY_*:）原样透传：payload `algo|fp` 需被前端
+        // 精确解析，追加「（目标 …）」后缀会破坏切分；其余错误照常附加目标地址
+        let msg = e.to_string();
+        if msg.starts_with("HOSTKEY_") {
+            return msg;
+        }
         // 落盘日志（带目标地址），方便在 ~/Library/Logs/com.rhost.app/rhost.log 排查
         log::error!("connect_ssh 失败 [{target}]: {e}");
         format!("{e}（目标 {target}）")
@@ -298,13 +363,10 @@ pub async fn sftp_list_dir(
     manager: State<'_, SessionManager>,
 ) -> Result<crate::ssh::sftp::RemoteDirListing, String> {
     slow_span!("sftp_list_dir");
-    manager
-        .sftp_list_dir(session_id, path)
-        .await
-        .map_err(|e| {
-            log::error!("sftp_list_dir 失败 (session={session_id}): {e}");
-            e.to_string()
-        })
+    manager.sftp_list_dir(session_id, path).await.map_err(|e| {
+        log::error!("sftp_list_dir 失败 (session={session_id}): {e}");
+        e.to_string()
+    })
 }
 
 /// SFTP 创建目录（单层）。
@@ -315,13 +377,10 @@ pub async fn sftp_mkdir(
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     slow_span!("sftp_mkdir");
-    manager
-        .sftp_mkdir(session_id, path)
-        .await
-        .map_err(|e| {
-            log::error!("sftp_mkdir 失败 (session={session_id}): {e}");
-            e.to_string()
-        })
+    manager.sftp_mkdir(session_id, path).await.map_err(|e| {
+        log::error!("sftp_mkdir 失败 (session={session_id}): {e}");
+        e.to_string()
+    })
 }
 
 /// 上传单个文件。同名远端文件默认覆盖；进度经 IPC [`Channel`] 流式推送。
@@ -339,7 +398,15 @@ pub async fn sftp_upload(
     // 传输命令豁免慢调用统计：大文件传输天然长耗时，进度由 Channel 流式推送，
     // invoke 总时长不反映卡顿（且用户主动暂停期间 invoke 挂起会误报）。
     manager
-        .sftp_upload(session_id, task_id, local_path, remote_path, chunk_kb, resume, channel)
+        .sftp_upload(
+            session_id,
+            task_id,
+            local_path,
+            remote_path,
+            chunk_kb,
+            resume,
+            channel,
+        )
         .await
         .map_err(|e| {
             log::error!("sftp_upload 失败 (session={session_id}, task={task_id}): {e}");
@@ -361,7 +428,15 @@ pub async fn sftp_download(
 ) -> Result<(), String> {
     // 同 sftp_upload：豁免慢调用统计
     manager
-        .sftp_download(session_id, task_id, remote_path, local_path, chunk_kb, resume, channel)
+        .sftp_download(
+            session_id,
+            task_id,
+            remote_path,
+            local_path,
+            chunk_kb,
+            resume,
+            channel,
+        )
         .await
         .map_err(|e| {
             log::error!("sftp_download 失败 (session={session_id}, task={task_id}): {e}");
@@ -421,13 +496,10 @@ pub async fn sftp_remove(
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     slow_span!("sftp_remove");
-    manager
-        .sftp_remove(session_id, path)
-        .await
-        .map_err(|e| {
-            log::error!("sftp_remove 失败 (session={session_id}): {e}");
-            e.to_string()
-        })
+    manager.sftp_remove(session_id, path).await.map_err(|e| {
+        log::error!("sftp_remove 失败 (session={session_id}): {e}");
+        e.to_string()
+    })
 }
 
 /// 重命名/移动远端路径
@@ -474,13 +546,10 @@ pub async fn sftp_copy(
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
     slow_span!("sftp_copy");
-    manager
-        .sftp_copy(session_id, src, dst)
-        .await
-        .map_err(|e| {
-            log::error!("sftp_copy 失败 (session={session_id}): {e}");
-            e.to_string()
-        })
+    manager.sftp_copy(session_id, src, dst).await.map_err(|e| {
+        log::error!("sftp_copy 失败 (session={session_id}): {e}");
+        e.to_string()
+    })
 }
 
 /// 读取远端符号链接目标路径
@@ -555,10 +624,16 @@ pub struct TestResult {
 ///
 /// 与正式连接共用 [`connect_and_auth`]，保证认证行为完全一致；用 10s 超时包裹，
 /// 避免不可达主机让用户久等。错误直接转字符串返回，前端可区分"连不上/认证错/超时"，
-/// 私钥加密时错误以 KEY_ENCRYPTED 前缀返回，前端据此弹口令框重试。
+/// 私钥加密时错误以 KEY_ENCRYPTED 前缀返回，前端据此弹口令框重试；
+/// 主机密钥未信任/变更时以 HOSTKEY_UNKNOWN / HOSTKEY_MISMATCH 前缀返回（同样命中
+/// check_server_key，QuickConnect 门禁的重试必须能构造 HostKeyCheck，设计 §6.3）。
 #[tauri::command]
-pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, String> {
+pub async fn test_ssh_connection(
+    payload: ConnectPayload,
+    app: AppHandle,
+) -> Result<TestResult, String> {
     slow_span!("test_ssh_connection");
+    let host_key = host_key_policy(&app, &payload)?;
     let auth = payload.into_auth();
     let cfg = SessionConfig {
         host: payload.host,
@@ -572,6 +647,7 @@ pub async fn test_ssh_connection(payload: ConnectPayload) -> Result<TestResult, 
         color_prompt: false,
         env: Vec::new(),
         motd_logo: String::new(),
+        host_key,
     };
 
     let start = Instant::now();
@@ -678,10 +754,7 @@ use crate::applog::{self, HubConfig, LogBatch, LogConfigPayload, ReportAppLogInp
 /// 订阅应用日志：先推 replay（seq > sinceId；越界推全量并附 lost_because 元信息），
 /// 再持续推增量。多订阅者广播，前端释放 Channel 后后端 send 失败自动摘除订阅。
 #[tauri::command]
-pub fn subscribe_app_logs(
-    channel: Channel<LogBatch>,
-    since_id: Option<u64>,
-) -> Result<(), String> {
+pub fn subscribe_app_logs(channel: Channel<LogBatch>, since_id: Option<u64>) -> Result<(), String> {
     slow_span!("subscribe_app_logs");
     let Some(hub) = applog::try_hub() else {
         return Err("日志系统未初始化".to_string());
@@ -897,8 +970,7 @@ pub async fn export_config(
         .inspect_err(|e| emit_export_failed("assemble", e, started))?;
 
     // 读盘（原子 rename 保证不会读到半截文件；导出不需持写锁）
-    let hosts = store::load_hosts(&app)
-        .inspect_err(|e| emit_export_failed("read", e, started))?;
+    let hosts = store::load_hosts(&app).inspect_err(|e| emit_export_failed("read", e, started))?;
     let cfg_path = app_config_file(&app)?;
     let cfg = cfg_persisted::load_full(&cfg_path);
 
@@ -1230,4 +1302,58 @@ pub async fn reset_settings_config(
         })),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod hostkey_validate_tests {
+    use super::validate_trust_fingerprint;
+
+    /// 43 字符无 padding 样本（russh fingerprint(Sha256) 的实际输出形态）与
+    /// 44 字符含 padding 形态均必须放行（勿误拒，设计 §6.3）
+    #[test]
+    fn accepts_real_russh_fingerprint_shapes() {
+        let no_pad = format!("SHA256:{}", "A".repeat(43));
+        assert!(validate_trust_fingerprint(&no_pad).is_ok());
+        let padded = format!("SHA256:{}=", "A".repeat(43));
+        assert!(validate_trust_fingerprint(&padded).is_ok());
+        // 混合 Base64 字符（+/=）
+        assert!(
+            validate_trust_fingerprint("SHA256:AbCd+/9=AbCd+/9=AbCd+/9=AbCd+/9=AbCd+/9=").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_missing_prefix() {
+        assert!(validate_trust_fingerprint("").is_err(), "空串必须拒绝");
+        assert!(
+            validate_trust_fingerprint(&"A".repeat(43)).is_err(),
+            "缺 SHA256: 前缀必须拒绝"
+        );
+        assert!(
+            validate_trust_fingerprint("MD5:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_short_body_and_illegal_chars() {
+        assert!(
+            validate_trust_fingerprint("SHA256:AbC").is_err(),
+            "主体过短必须拒绝"
+        );
+        assert!(
+            validate_trust_fingerprint("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!")
+                .is_err(),
+            "主体含非法字符必须拒绝"
+        );
+        assert!(
+            validate_trust_fingerprint("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+                .is_err(),
+            "主体含冒号必须拒绝"
+        );
+        // 空格（注入面）必须拒绝
+        assert!(
+            validate_trust_fingerprint("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA A").is_err(),
+            "主体含空格必须拒绝"
+        );
+    }
 }

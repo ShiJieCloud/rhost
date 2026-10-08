@@ -183,7 +183,7 @@ rhost/
 - Rust 侧结构体一律 `#[serde(rename_all = "camelCase")]`，前端用 camelCase；
 - 例外：**帧内 JSON 指标字段保留 snake_case**（如 `swap_total`、`rx_rate`），TS 接口注释标注"与后端 xxx 对应，snake_case 保紧凑"；
 - 前端向 `write_terminal` 传 `Vec<u8>` 时必须 `Array.from(bytes)`（Uint8Array 会被 JSON 序列化成对象）；
-- 命令错误统一是字符串；**错误前缀即协议**：如私钥口令错误返回 `KEY_ENCRYPTED: …`，前端据此弹口令框并重试，不要改成普通文案。
+- 命令错误统一是字符串；**错误前缀即协议**：如私钥口令错误返回 `KEY_ENCRYPTED: …`，前端据此弹口令框并重试，不要改成普通文案。SSH 主机密钥校验新增两个前缀（hostkey-verification-design.md）：`HOSTKEY_UNKNOWN: {algo}|{fingerprint}|{pubkey}`（首连未信任，前端弹指纹确认后带 trust + persist 参数重试一次——「接受并保存」落盘、「仅本次连接」仅本次会话可信不落盘；`{pubkey}` 为 OpenSSH 格式完整公钥，弹窗「查看完整公钥」展开区展示）、`HOSTKEY_MISMATCH: {algo}|{fingerprint}|{pubkey}`（密钥变更，红色警告弹窗，提供「断开」与「更新指纹并重连」）；指纹持久化于 `app_data_dir/known_hosts.json`（JSON + version + 原子写）。
 
 ## 8. 核心数据流
 

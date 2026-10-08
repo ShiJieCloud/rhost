@@ -53,6 +53,8 @@ pub const SSH_HANDSHAKE_START: &str = "ssh.handshake.start";
 pub const SSH_HANDSHAKE_COMPLETE: &str = "ssh.handshake.complete";
 pub const SSH_HANDSHAKE_FAILED: &str = "ssh.handshake.failed";
 pub const SSH_HOSTKEY_FINGERPRINT: &str = "ssh.hostkey.fingerprint";
+/// 主机密钥指纹落盘失败（known_hosts.json 不可写）：会话不断开，下次连接重新确认
+pub const SSH_HOSTKEY_RECORD_FAILED: &str = "ssh.hostkey.record_failed";
 pub const SSH_AUTH_START: &str = "ssh.auth.start";
 pub const SSH_AUTH_SUCCESS: &str = "ssh.auth.success";
 pub const SSH_AUTH_FAILED: &str = "ssh.auth.failed";
@@ -136,43 +138,99 @@ mod tests {
     #[test]
     fn event_id_follows_naming_convention() {
         let all = [
-            APP_BOOT_START, APP_BOOT_CONFIG_LOADED, APP_BOOT_LOG_DIR_READY,
-            APP_BOOT_KEYCHAIN_READY, APP_BOOT_READY, APP_BOOT_FAILED,
-            APP_SHUTDOWN_START, APP_SHUTDOWN_SESSIONS_CLOSED, APP_SHUTDOWN_LOG_FLUSHED,
-            APP_EXIT, APP_SETTINGS_CHANGE, APP_LOG_CLEANUP, APP_LOG_PERSIST_FAILED,
-            APP_LOG_DROPPED, APP_LOG_CORRUPT_LINE, APP_LOG_CONFIG_PERSIST_FAILED,
-            APP_CLOCK_ROLLBACK, APP_PANIC,
-            APP_CONFIG_EXPORT, APP_CONFIG_EXPORT_FAILED, APP_CONFIG_IMPORT_START,
-            APP_CONFIG_IMPORT_COMPLETE, APP_CONFIG_IMPORT_FAILED,
+            APP_BOOT_START,
+            APP_BOOT_CONFIG_LOADED,
+            APP_BOOT_LOG_DIR_READY,
+            APP_BOOT_KEYCHAIN_READY,
+            APP_BOOT_READY,
+            APP_BOOT_FAILED,
+            APP_SHUTDOWN_START,
+            APP_SHUTDOWN_SESSIONS_CLOSED,
+            APP_SHUTDOWN_LOG_FLUSHED,
+            APP_EXIT,
+            APP_SETTINGS_CHANGE,
+            APP_LOG_CLEANUP,
+            APP_LOG_PERSIST_FAILED,
+            APP_LOG_DROPPED,
+            APP_LOG_CORRUPT_LINE,
+            APP_LOG_CONFIG_PERSIST_FAILED,
+            APP_CLOCK_ROLLBACK,
+            APP_PANIC,
+            APP_CONFIG_EXPORT,
+            APP_CONFIG_EXPORT_FAILED,
+            APP_CONFIG_IMPORT_START,
+            APP_CONFIG_IMPORT_COMPLETE,
+            APP_CONFIG_IMPORT_FAILED,
             APP_CONFIG_IMPORT_SECTION_SKIPPED,
-            APP_CONFIG_SETTINGS_RESET, APP_CONFIG_WRITE_REJECTED,
-            SSH_CONNECT_START, SSH_CONNECT_TCP, SSH_CONNECT_TCP_FAILED,
-            SSH_HANDSHAKE_START, SSH_HANDSHAKE_COMPLETE, SSH_HANDSHAKE_FAILED,
-            SSH_HOSTKEY_FINGERPRINT, SSH_AUTH_START, SSH_AUTH_SUCCESS, SSH_AUTH_FAILED,
-            SSH_SESSION_CREATE, SSH_SESSION_CHANNEL_OPEN, SSH_SESSION_PTY, SSH_SESSION_ENV,
-            SSH_SESSION_SHELL, SSH_SESSION_FAILED, SSH_SESSION_READY,
-            SSH_SESSION_INIT_SCRIPT_FAILED, SSH_DISCONNECT,
-            SSH_RECONNECT, SSH_SFTP_CHANNEL_OPEN, SSH_SFTP_CHANNEL_CLOSE,
-            SFTP_TRANSFER_ENQUEUE, SFTP_TRANSFER_START, SFTP_TRANSFER_COMPLETE,
-            SFTP_TRANSFER_FAILED, SFTP_TRANSFER_CANCEL, SFTP_TRANSFER_PAUSE,
-            SFTP_TRANSFER_RESUME, SFTP_TRANSFER_VERIFY_FAILED, SFTP_MANAGE_REMOVE,
-            SFTP_MANAGE_RENAME, SFTP_MANAGE_MKDIR, SFTP_MANAGE_COPY,
-            METRICS_COLLECT_START, METRICS_COLLECT_STOP, METRICS_COLLECT_DEGRADED,
-            IPC_SLOW_CALL, WEB_IPC_ERROR, WEB_UNHANDLED_ERROR, EXTERNAL_RAW_LOG,
-            TUNNEL_START, TUNNEL_START_FAILED, TUNNEL_STOP, TUNNEL_PORT_CONFLICT,
-            TUNNEL_SOCKS_HANDSHAKE_FAILED, TUNNEL_SOCKS_HANDSHAKE_TIMEOUT,
-            TUNNEL_REMOTE_DENIED, TUNNEL_REMOTE_READY, TUNNEL_STATUS_PUSH_FAILED,
-            TUNNEL_LISTENER_RETRY, TUNNEL_LISTENER_FAILED,
+            APP_CONFIG_SETTINGS_RESET,
+            APP_CONFIG_WRITE_REJECTED,
+            SSH_CONNECT_START,
+            SSH_CONNECT_TCP,
+            SSH_CONNECT_TCP_FAILED,
+            SSH_HANDSHAKE_START,
+            SSH_HANDSHAKE_COMPLETE,
+            SSH_HANDSHAKE_FAILED,
+            SSH_HOSTKEY_FINGERPRINT,
+            SSH_HOSTKEY_RECORD_FAILED,
+            SSH_AUTH_START,
+            SSH_AUTH_SUCCESS,
+            SSH_AUTH_FAILED,
+            SSH_SESSION_CREATE,
+            SSH_SESSION_CHANNEL_OPEN,
+            SSH_SESSION_PTY,
+            SSH_SESSION_ENV,
+            SSH_SESSION_SHELL,
+            SSH_SESSION_FAILED,
+            SSH_SESSION_READY,
+            SSH_SESSION_INIT_SCRIPT_FAILED,
+            SSH_DISCONNECT,
+            SSH_RECONNECT,
+            SSH_SFTP_CHANNEL_OPEN,
+            SSH_SFTP_CHANNEL_CLOSE,
+            SFTP_TRANSFER_ENQUEUE,
+            SFTP_TRANSFER_START,
+            SFTP_TRANSFER_COMPLETE,
+            SFTP_TRANSFER_FAILED,
+            SFTP_TRANSFER_CANCEL,
+            SFTP_TRANSFER_PAUSE,
+            SFTP_TRANSFER_RESUME,
+            SFTP_TRANSFER_VERIFY_FAILED,
+            SFTP_MANAGE_REMOVE,
+            SFTP_MANAGE_RENAME,
+            SFTP_MANAGE_MKDIR,
+            SFTP_MANAGE_COPY,
+            METRICS_COLLECT_START,
+            METRICS_COLLECT_STOP,
+            METRICS_COLLECT_DEGRADED,
+            IPC_SLOW_CALL,
+            WEB_IPC_ERROR,
+            WEB_UNHANDLED_ERROR,
+            EXTERNAL_RAW_LOG,
+            TUNNEL_START,
+            TUNNEL_START_FAILED,
+            TUNNEL_STOP,
+            TUNNEL_PORT_CONFLICT,
+            TUNNEL_SOCKS_HANDSHAKE_FAILED,
+            TUNNEL_SOCKS_HANDSHAKE_TIMEOUT,
+            TUNNEL_REMOTE_DENIED,
+            TUNNEL_REMOTE_READY,
+            TUNNEL_STATUS_PUSH_FAILED,
+            TUNNEL_LISTENER_RETRY,
+            TUNNEL_LISTENER_FAILED,
         ];
         for id in all {
             assert!(
-                id.chars().all(|c| c.is_ascii_lowercase() || c == '.' || c == '_'),
+                id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_'),
                 "event_id 必须全小写蛇形: {id}"
             );
             let mut parts = id.split('.');
             let domain = parts.next().unwrap();
             assert!(
-                ["app", "ssh", "sftp", "metrics", "ipc", "web", "external", "tunnel"].contains(&domain),
+                [
+                    "app", "ssh", "sftp", "metrics", "ipc", "web", "external", "tunnel"
+                ]
+                .contains(&domain),
                 "未知 domain: {id}"
             );
             assert!(parts.next().is_some(), "event_id 至少两段: {id}");

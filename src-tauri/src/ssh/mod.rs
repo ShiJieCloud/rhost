@@ -5,6 +5,8 @@
 //! - [`session`]：russh 连接、密码认证、PTY 读写、小包合并
 //! - [`manager`]：会话池（Arc<RwLock<HashMap>> + CancellationToken 生命周期管理）
 
+use std::path::PathBuf;
+
 pub mod frame;
 pub mod manager;
 pub mod session;
@@ -46,6 +48,41 @@ pub struct SessionConfig {
     pub env: Vec<(String, String)>,
     /// 用户自定义 MOTD ASCII LOGO（多行文本）；空串使用内置 LOGO
     pub motd_logo: String,
+    /// 服务器主机密钥校验策略（hostkey-verification-design.md）。
+    /// 非 `Option`：`None` 的缺省语义即「跳过校验」，属危险默认；
+    /// 枚举强制显式选择、漏填即编译错误，生产路径恒为 `Verify`。
+    pub host_key: HostKeyPolicy,
+}
+
+/// `check_server_key` 回调的校验输入（ipc 层构造，session 层消费）
+#[derive(Debug, Clone)]
+pub struct HostKeyCheck {
+    /// 主机地址（用户配置原样字符串，落盘键）
+    pub host: String,
+    /// 端口（落盘键）
+    pub port: u16,
+    /// 磁盘已存指纹 `(algo, fingerprint)`；None = 无记录（首连）
+    pub stored: Option<(String, String)>,
+    /// 用户已在 UI 确认信任（TOFU 二阶段重试时为 true）
+    pub trust: bool,
+    /// 用户确认的指纹（防重试竞态：弹窗确认的必须等于本次握手实际看到的才落盘）
+    pub trust_fp: Option<String>,
+    /// 信任后是否写入 known_hosts：「接受并保存」/「更新指纹并重连」= true；
+    /// 「仅本次连接」= false（本次会话可信但不落盘，下次新建会话重新首连确认）
+    pub persist: bool,
+    /// known_hosts 落盘路径（known_hosts 模块仅接收 PathBuf，不依赖 tauri）
+    pub path: PathBuf,
+}
+
+/// 主机密钥校验策略：两个显式变体强制作者做出选择，
+/// 杜绝「忘填 → 静默跳过校验」的 Option 缺省语义。
+#[derive(Debug, Clone)]
+pub enum HostKeyPolicy {
+    /// 校验恒开：ipc 两条连接命令（connect_ssh / test_ssh_connection）恒构造此变体
+    Verify(HostKeyCheck),
+    /// 仅 e2e 集成测试可达（doc(hidden) 防误用）：跳过校验，无条件接受服务器密钥
+    #[doc(hidden)]
+    SkipForTests,
 }
 
 /// SSH 模块统一错误类型（ipc 层转字符串返回前端）
@@ -72,4 +109,13 @@ pub enum SshError {
     /// `TUNNEL_LIMIT:`），前端据此分流 toast 文案与批量策略，不得改为普通文案
     #[error("{0}")]
     Tunnel(String),
+    /// 首连未知主机密钥（TOFU）：payload 格式 `{algo}|{fingerprint}`。
+    /// 前缀 HOSTKEY_UNKNOWN 是前后端约定的协议标记，前端据此弹指纹确认弹窗，
+    /// 不得改为普通文案
+    #[error("HOSTKEY_UNKNOWN: {0}")]
+    HostKeyUnknown(String),
+    /// 主机密钥变更（可能服务器重装，可能中间人攻击）：payload 格式同上。
+    /// 前缀 HOSTKEY_MISMATCH 前端据此弹红色警告弹窗，不得改为普通文案
+    #[error("HOSTKEY_MISMATCH: {0}")]
+    HostKeyMismatch(String),
 }

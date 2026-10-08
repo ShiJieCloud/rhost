@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use rhost_lib::ssh::frame::decode_frame;
 use rhost_lib::ssh::session::SshSession;
-use rhost_lib::ssh::{AuthMethod, SessionConfig};
+use rhost_lib::ssh::{AuthMethod, HostKeyCheck, HostKeyPolicy, SessionConfig};
 
 fn test_cfg() -> SessionConfig {
     SessionConfig {
@@ -32,6 +32,9 @@ fn test_cfg() -> SessionConfig {
         color_prompt: true,
         env: vec![],
         motd_logo: String::new(),
+        // 既有用例不关心主机密钥校验：显式跳过（doc(hidden)，仅测试可达）；
+        // 信任路径行为由下方 ssh_hostkey_tofu_trust_and_persist 专项覆盖
+        host_key: HostKeyPolicy::SkipForTests,
     }
 }
 
@@ -491,7 +494,10 @@ async fn wait_shell_echo(
             return;
         }
     }
-    panic!("未等到 shell 回显 {marker}，帧流: {:?}", String::from_utf8_lossy(&pty));
+    panic!(
+        "未等到 shell 回显 {marker}，帧流: {:?}",
+        String::from_utf8_lossy(&pty)
+    );
 }
 
 /// 正常退出（PTY 执行 exit）：sshd 先发送 ExitStatus，Exit 帧必须标记 lost=false，
@@ -570,6 +576,180 @@ async fn ssh_auth_failure() {
             eprintln!("跳过：测试容器不可用");
         }
     }
+}
+
+/// 主机密钥 TOFU 信任路径（hostkey-verification-design.md §8）：
+/// ① Verify + trust=false 首连 → 失败，错误串为 `HOSTKEY_UNKNOWN: {algo}|{fp}`
+///（端到端验证错误协议）；② 解析指纹后以 trust=true + 该指纹重试 → 成功；
+/// ③ 断言指纹已按 schema 落盘到临时文件路径。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_hostkey_tofu_trust_and_persist() {
+    // 独立临时 known_hosts，避免污染真实应用数据目录
+    let kh = std::env::temp_dir().join(format!("rhost-kh-e2e-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&kh);
+
+    let mut cfg = test_cfg();
+    cfg.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: None,
+        trust: false,
+        trust_fp: None,
+        persist: true,
+        path: kh.clone(),
+    });
+
+    // ① 首连：未信任指纹必须失败，且错误为协议前缀 + `algo|fp` payload
+    let first = match SshSession::connect(cfg.clone(), "e2e001").await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("首连未信任指纹不应成功（不存在静默接受路径）"),
+    };
+    if !first.starts_with("HOSTKEY_UNKNOWN:") {
+        // 非 HOSTKEY 错误 = 容器缺失等环境问题，跳过（不误报）
+        eprintln!("跳过：测试容器不可用（{first}）");
+        let _ = std::fs::remove_file(&kh);
+        return;
+    }
+    let payload = first["HOSTKEY_UNKNOWN:".len()..].trim();
+    // payload 三段：`algo|fingerprint|pubkey`（pubkey 含空格但不含 `|`）
+    let mut parts = payload.split('|');
+    let algo = parts.next().expect("payload 缺少 algo");
+    let fp = parts.next().expect("payload 缺少 fingerprint");
+    let _pubkey = parts.next().expect("payload 缺少 pubkey");
+    assert!(algo.starts_with("ssh-"), "算法名异常: {algo}");
+    assert!(fp.starts_with("SHA256:"), "指纹应为 SHA256 形态: {fp}");
+    assert!(
+        _pubkey.starts_with(&format!("{algo} ")),
+        "pubkey 应以 `{algo} ` 开头: {_pubkey}"
+    );
+    assert!(!kh.exists(), "首连拒绝时不得落盘");
+
+    // ② trust=true + 弹窗确认的指纹（= 第一次握手实际看到的）重试 → 成功
+    cfg.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: None,
+        trust: true,
+        trust_fp: Some(fp.to_string()),
+        persist: true,
+        path: kh.clone(),
+    });
+    let (session, _frame_rx) = match SshSession::connect(cfg, "e2e001").await {
+        Ok(v) => v,
+        Err(e) => panic!("信任重试应成功（fp={fp}）: {e}"),
+    };
+    session.shutdown();
+
+    // ③ 断言落盘：schema 字段齐全且指纹与确认值一致（确认的 = 落盘的）
+    let raw = std::fs::read_to_string(&kh).expect("信任成功后 known_hosts 应已落盘");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("落盘文件应为合法 JSON");
+    assert_eq!(v["version"], 1, "schema 版本应为 1: {raw}");
+    let entries = v["entries"].as_array().expect("entries 数组");
+    assert_eq!(entries.len(), 1, "应恰好一条记录: {raw}");
+    assert_eq!(entries[0]["host"], "127.0.0.1");
+    assert_eq!(entries[0]["port"], 2222);
+    assert_eq!(entries[0]["algo"], algo);
+    assert_eq!(
+        entries[0]["fingerprint"], fp,
+        "落盘指纹必须与确认值逐字一致"
+    );
+    assert!(
+        entries[0]["addedAt"].as_i64().is_some(),
+        "缺少 addedAt 时间戳"
+    );
+
+    // 收尾：再连一次（stored 命中路径）应无感通过，且不产生第二条记录
+    let mut cfg2 = test_cfg();
+    cfg2.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: Some((algo.to_string(), fp.to_string())),
+        trust: false,
+        trust_fp: None,
+        persist: true,
+        path: kh.clone(),
+    });
+    match SshSession::connect(cfg2, "e2e001").await {
+        Ok((session, _)) => session.shutdown(),
+        Err(e) => panic!("已存指纹命中路径应无感通过: {e}"),
+    }
+    let raw2 = std::fs::read_to_string(&kh).unwrap();
+    assert_eq!(raw, raw2, "Match 路径不得改写落盘文件");
+    let _ = std::fs::remove_file(&kh);
+}
+
+/// 「仅本次连接」路径（hostkey-verification-design.md §6.5）：
+/// trust=true + persist=false → 连接成功但绝不落盘；下次新建会话
+/// （trust=false、stored=None）仍重新进入首连确认。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_hostkey_trust_once_does_not_persist() {
+    // 独立临时 known_hosts，避免污染真实应用数据目录
+    let kh = std::env::temp_dir().join(format!("rhost-kh-once-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&kh);
+
+    // ① 首连拿一次指纹：未信任失败；非 HOSTKEY 错误 = 容器缺失，跳过
+    let mut cfg = test_cfg();
+    cfg.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: None,
+        trust: false,
+        trust_fp: None,
+        persist: true,
+        path: kh.clone(),
+    });
+    let first = match SshSession::connect(cfg, "e2e001").await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("首连未信任指纹不应成功（不存在静默接受路径）"),
+    };
+    if !first.starts_with("HOSTKEY_UNKNOWN:") {
+        eprintln!("跳过：测试容器不可用（{first}）");
+        return;
+    }
+    let (_algo, fp) = {
+        let payload = first["HOSTKEY_UNKNOWN:".len()..].trim();
+        let mut parts = payload.split('|');
+        let algo = parts.next().expect("payload 缺少 algo").to_string();
+        let fp = parts.next().expect("payload 缺少 fingerprint").to_string();
+        (algo, fp)
+    };
+
+    // ② 仅本次连接：trust=true + persist=false → 成功且不落盘
+    let mut cfg2 = test_cfg();
+    cfg2.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: None,
+        trust: true,
+        trust_fp: Some(fp.to_string()),
+        persist: false,
+        path: kh.clone(),
+    });
+    match SshSession::connect(cfg2, "e2e001").await {
+        Ok((session, _)) => session.shutdown(),
+        Err(e) => panic!("仅本次连接重试应成功: {e}"),
+    }
+    assert!(!kh.exists(), "persist=false 不得写入 known_hosts");
+
+    // ③ 下次新建会话（trust=false）应重新进入首连确认，而非命中记录
+    let mut cfg3 = test_cfg();
+    cfg3.host_key = HostKeyPolicy::Verify(HostKeyCheck {
+        host: "127.0.0.1".into(),
+        port: 2222,
+        stored: None,
+        trust: false,
+        trust_fp: None,
+        persist: true,
+        path: kh.clone(),
+    });
+    match SshSession::connect(cfg3, "e2e001").await {
+        Err(e) => assert!(
+            e.to_string().starts_with("HOSTKEY_UNKNOWN:"),
+            "应重新进入首连确认: {e}"
+        ),
+        Ok(_) => panic!("仅本次连接不应留下可命中的落盘记录"),
+    }
+    let _ = std::fs::remove_file(&kh);
 }
 
 /// 0x06 Metrics 帧 JSON（仅测试反序列化用）
@@ -1203,9 +1383,14 @@ async fn tunnel_local_forward_roundtrip_and_status_frame() {
         .await
         .expect("启动 -L 规则");
 
-    let st = wait_state(tunnel, "e2e-l1", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("规则应 Active");
+    let st = wait_state(
+        tunnel,
+        "e2e-l1",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
     assert_eq!(st.bound_port, 21001, "固定端口 bind 后 bound_port 应一致");
 
     // 0x0A 状态帧：JSON {"tunnels":[...]} 含 active 的 e2e-l1
@@ -1246,15 +1431,23 @@ async fn tunnel_local_forward_roundtrip_and_status_frame() {
 
     // 停止：Stopped + 端口释放
     tunnel.stop("e2e-l1").await.expect("停止规则");
-    wait_state(tunnel, "e2e-l1", TunnelState::Stopped, Duration::from_secs(5))
-        .await
-        .expect("规则应 Stopped");
+    wait_state(
+        tunnel,
+        "e2e-l1",
+        TunnelState::Stopped,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("规则应 Stopped");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21001)))
-            .await
-            .map(|r| r.is_err())
-            .unwrap_or(true),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", 21001))
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true),
         "停止后本地端口应已释放"
     );
 
@@ -1282,9 +1475,14 @@ async fn tunnel_local_forward_high_concurrency_gate() {
         )
         .await
         .expect("启动 -L 规则");
-    wait_state(tunnel, "e2e-c1", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("规则应 Active");
+    wait_state(
+        tunnel,
+        "e2e-c1",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
 
     const N: usize = 100;
     const EXPECT_OK: usize = 64;
@@ -1333,21 +1531,34 @@ async fn tunnel_dynamic_socks5_forward() {
     tunnel
         .start(
             socks_rule("e2e-d1", 21003),
-            StartOptions { dns_resolve: DnsResolve::Local, ..STOP_OPTS },
+            StartOptions {
+                dns_resolve: DnsResolve::Local,
+                ..STOP_OPTS
+            },
         )
         .await
         .expect("启动 -D(local) 规则");
-    wait_state(tunnel, "e2e-d1", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("规则应 Active");
+    wait_state(
+        tunnel,
+        "e2e-d1",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
     // remote 解析规则
     tunnel
         .start(socks_rule("e2e-d2", 21004), STOP_OPTS)
         .await
         .expect("启动 -D(remote) 规则");
-    wait_state(tunnel, "e2e-d2", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("规则应 Active");
+    wait_state(
+        tunnel,
+        "e2e-d2",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
 
     // (a) IPv4 ATYP → 容器内 sshd
     let (rep, data) = socks_connect(
@@ -1401,7 +1612,11 @@ async fn tunnel_dynamic_socks5_forward() {
         .unwrap();
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[1], 0x07, "BIND 应回命令不支持(0x07)，实际 {:#x}", reply[1]);
+    assert_eq!(
+        reply[1], 0x07,
+        "BIND 应回命令不支持(0x07)，实际 {:#x}",
+        reply[1]
+    );
 
     session.shutdown();
 }
@@ -1438,11 +1653,9 @@ async fn tunnel_remote_forward_curl_roundtrip_and_concurrency() {
                     BODY.len(),
                     BODY
                 );
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    sock.write_all(resp.as_bytes()),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), sock.write_all(resp.as_bytes()))
+                        .await;
             });
         }
     });
@@ -1455,14 +1668,22 @@ async fn tunnel_remote_forward_curl_roundtrip_and_concurrency() {
         )
         .await
         .expect("启动 -R 规则");
-    let st = wait_state(tunnel, "e2e-r1", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("规则应 Active");
+    let st = wait_state(
+        tunnel,
+        "e2e-r1",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
     assert_eq!(st.bound_port, 24001, "远端回报端口应与请求一致");
 
     // 单发：容器内 curl 经远端转发回源到本进程
     let out = session
-        .exec_collect("curl -s -m 5 http://127.0.0.1:24001/", Duration::from_secs(15))
+        .exec_collect(
+            "curl -s -m 5 http://127.0.0.1:24001/",
+            Duration::from_secs(15),
+        )
         .await
         .expect("容器内 curl 执行失败");
     assert!(
@@ -1486,13 +1707,13 @@ async fn tunnel_remote_forward_curl_roundtrip_and_concurrency() {
     tunnel.stop("e2e-r1").await.expect("停止规则");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let out = session
-        .exec_collect("curl -s -m 3 http://127.0.0.1:24001/ >/dev/null 2>&1; echo EXIT:$?", Duration::from_secs(10))
+        .exec_collect(
+            "curl -s -m 3 http://127.0.0.1:24001/ >/dev/null 2>&1; echo EXIT:$?",
+            Duration::from_secs(10),
+        )
         .await
         .expect("容器内 curl 探测执行失败");
-    assert!(
-        !out.contains("EXIT:0"),
-        "停止后远端端口仍可连接: {out}"
-    );
+    assert!(!out.contains("EXIT:0"), "停止后远端端口仍可连接: {out}");
 
     session.shutdown();
 }
@@ -1552,7 +1773,12 @@ async fn tunnel_next_policy_multi_rule_distinct_ports() {
     assert_eq!(sts.len(), ids.len(), "8 条规则均应入表");
     let mut ports: Vec<u16> = Vec::new();
     for s in &sts {
-        assert_eq!(s.state, TunnelState::Active, "规则 {} 未 Active: {s:?}", s.id);
+        assert_eq!(
+            s.state,
+            TunnelState::Active,
+            "规则 {} 未 Active: {s:?}",
+            s.id
+        );
         assert!(
             s.bound_port >= base && s.bound_port < base + 10,
             "顺延端口应落在 base..base+10: {}",
@@ -1587,10 +1813,18 @@ async fn tunnel_lifecycle_idempotent_and_release() {
     let tunnel = session.tunnel();
 
     let rule = fwd_rule("e2e-life", TunnelType::Local, 21006, 9); // 目标不可达：连接级失败不影响规则
-    tunnel.start(rule.clone(), STOP_OPTS).await.expect("首次启动");
-    wait_state(tunnel, "e2e-life", TunnelState::Active, Duration::from_secs(10))
+    tunnel
+        .start(rule.clone(), STOP_OPTS)
         .await
-        .expect("规则应 Active");
+        .expect("首次启动");
+    wait_state(
+        tunnel,
+        "e2e-life",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("规则应 Active");
 
     // 幂等：Active/Starting 重复 start → TUNNEL_RUNNING 错误前缀
     let err = tunnel
@@ -1604,32 +1838,48 @@ async fn tunnel_lifecycle_idempotent_and_release() {
 
     // 停止 → Stopped → 本地端口释放
     tunnel.stop("e2e-life").await.expect("停止");
-    wait_state(tunnel, "e2e-life", TunnelState::Stopped, Duration::from_secs(5))
-        .await
-        .expect("规则应 Stopped");
+    wait_state(
+        tunnel,
+        "e2e-life",
+        TunnelState::Stopped,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("规则应 Stopped");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21006)))
-            .await
-            .map(|r| r.is_err())
-            .unwrap_or(true),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", 21006))
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true),
         "停止后本地端口应已释放"
     );
 
     // Stopped 重新 start：真正的新任务
     tunnel.start(rule, STOP_OPTS).await.expect("重新启动");
-    wait_state(tunnel, "e2e-life", TunnelState::Active, Duration::from_secs(10))
-        .await
-        .expect("重启后应 Active");
+    wait_state(
+        tunnel,
+        "e2e-life",
+        TunnelState::Active,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("重启后应 Active");
 
     // 会话 shutdown：监听 socket 应随之释放
     session.shutdown();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(("127.0.0.1", 21006)))
-            .await
-            .map(|r| r.is_err())
-            .unwrap_or(true),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", 21006))
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true),
         "会话断开后监听端口应释放"
     );
 }

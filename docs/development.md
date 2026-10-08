@@ -145,7 +145,7 @@ docker run -d --name rhost-test-sshd-debian -p 2223:22 rhost-sshd-debian
 - 模块顶部写 `//!`：分层职责、存储/并发策略，复杂流程配数据流图（参考 `ssh/session.rs`、`ssh/sftp.rs`）；
 - 每个 `pub` 项与结构体字段写 `///`，重点解释**为什么、边界条件、单位**；魔数常量化并注释取值理由（如 `MERGE_BYTES = 4096`、64KB 分块、30s RTT）；
 - 业务错误在模块内定义 `thiserror` 枚举（如 `SshError`），`ipc.rs` 只负责 `.map_err(|e| e.to_string())`；
-- 跨层错误字符串前缀即协议（如 `KEY_ENCRYPTED:`），改动前先搜前端消费方；
+- 跨层错误字符串前缀即协议（如 `KEY_ENCRYPTED:`），改动前先搜前端消费方；既有前缀清单见 `architecture.md` §7.3（含主机密钥的 `HOSTKEY_UNKNOWN:` / `HOSTKEY_MISMATCH:`，payload 三段 `{algo}|{fingerprint}|{pubkey}`，`{pubkey}` 为 OpenSSH 格式完整公钥）；
 - 异步铁律：
   - russh 是纯异步，**禁止用 `spawn_blocking` 包 SSH 读写**；
   - 会话池访问统一"clone Arc → 立即释放锁 → 再 await"，不持锁 await；

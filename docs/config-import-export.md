@@ -4,7 +4,7 @@
 > 日期：2026-10-06
 > 范围：Rhost 全量应用配置（主机连接、应用设置、SSH 密钥元数据、分组、UI 状态等）的导出为文件与从文件恢复
 > 关联代码：`src-tauri/src/store.rs`、`src-tauri/src/applog/persisted.rs`、`src-tauri/src/ipc.rs`、`frontend/src/stores/settings.ts`、`frontend/src/stores/hosts.ts`、`frontend/src/stores/keys.ts`、`frontend/src/stores/groups.ts`、`frontend/src/stores/session.ts`、`frontend/src/components/SettingsModal.vue`
-> 边界：**本文档只覆盖应用配置**（可复现运行环境所需的数据与设置）。终端会话录制文件、日志文件、SFTP 传输历史等体积大或时效性强的数据不纳入导出范围。
+> 边界：**本文档只覆盖应用配置**（可复现运行环境所需的数据与设置）。终端会话录制文件、日志文件、SFTP 传输历史等体积大或时效性强的数据不纳入导出范围。**主机密钥信任库 `known_hosts.json` 也不纳入**（本机 TOFU 运行态数据，换机后应重新首连确认，见 §5 与 `hostkey-verification-design.md` §4）。
 
 ---
 
@@ -242,6 +242,7 @@
 | 私钥文件内容与路径 | **不导出**。密钥 `privatePath` 与连接 `keyPath` 一并剔除（路径泄漏本机目录结构，跨设备无意义）。 | 导入后 `privatePath` / `keyPath` 为空，密钥元数据（指纹/公钥/备注）与连接其余字段保留；用户需重新选择私钥文件完成绑定。 |
 | SSH 密钥元数据 | 导出公钥、指纹、注释等（`privatePath` 剔除，见上行）。 | 直接恢复元数据列表。 |
 | 日志配置（`logs` 节，含 `logStoragePath`） | **不参与导入导出**——日志路径是设备本地配置，跨设备无意义。 | 导入端忽略 `logs` 节（即使文件中存在也不写入）。 |
+| 主机密钥信任库（`app_data_dir/known_hosts.json`） | **不参与导入导出**——TOFU 指纹是本机当面核对后建立的信任，导出到他机会绕过该机用户的首连确认；换机/重装后重新弹首连确认即为正确安全语义。 | 不在导出 Schema 中；导入端即使遇到该节也忽略。文件独立于 `connections.json` / `app_config.json`，导入全程不读取、不写入。 |
 
 ### 5.1 密码加密导出（P1 可选功能）
 
