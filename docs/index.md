@@ -4,6 +4,9 @@ layout: home
 hero:
   name: Rhost
   text: 跨平台 SSH 远程主机管理器
+  image:
+    src: /logo.svg
+    alt: Rhost
   tagline: Tauri 2 · Rust · Vue 3 —— 多标签终端、SFTP 文件管理、服务器监控
   actions:
     - theme: brand

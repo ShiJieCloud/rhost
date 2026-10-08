@@ -98,16 +98,14 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// 获取本机主机名（meta.hostname，仅用于识别导出来源；失败返回空串）
+/// 获取本机主机名（meta.hostname，仅用于识别导出来源；失败返回空串）。
+///
+/// 使用 sysinfo 提供的跨平台实现：Unix 走 `gethostname`，Windows 走
+/// `GetComputerNameExW`，避免直接依赖各平台 libc 符号。
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // gethostname 成功返回 0；buf 不一定 NUL 结尾（恰好填满时），按 NUL 位置截断
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return String::new();
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..len]).trim().to_string()
+    sysinfo::System::host_name()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 组装后的导出文档

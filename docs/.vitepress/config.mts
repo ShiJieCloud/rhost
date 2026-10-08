@@ -20,6 +20,10 @@ export default defineConfig({
   ],
 
   themeConfig: {
+    // 站点 LOGO：取自前端 AppLogo（终端窗口 + 命令提示符），
+    // 配色沿用 QuickConnectView 中 .qc-mark 的 --green:#3ddc84，在浅/深模式下均可见
+    logo: '/logo.svg',
+
     nav: [
       { text: '指南', link: '/development', activeMatch: '/development' },
       { text: '架构', link: '/architecture', activeMatch: '/architecture' },
