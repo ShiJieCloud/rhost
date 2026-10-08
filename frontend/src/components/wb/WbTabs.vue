@@ -159,6 +159,8 @@ function onDragStart(e: MouseEvent) {
   if (e.button !== 0) return
   const el = scrollEl.value
   if (!el) return
+  // 无溢出时禁用拖拽：标签不超出视窗时拖拽无意义，且不应显示 grab 光标
+  if (!canScroll.value) return
   // 关闭钮与重命名输入框上不启动拖拽，避免点关闭 / 编辑变成拖视窗
   const t = e.target as HTMLElement
   if (t.closest('.close, .rename-input')) return
@@ -424,7 +426,7 @@ watch(activeSessionId, () => {
     >‹</button>
 
     <div class="tabs-viewport">
-      <div ref="scrollEl" class="tabs-scroll">
+      <div ref="scrollEl" class="tabs-scroll" :class="{ scrollable: canScroll }">
         <div class="tabs-track">
           <div
             v-for="s in sessions"
