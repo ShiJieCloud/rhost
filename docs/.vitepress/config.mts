@@ -25,7 +25,7 @@ export default defineConfig({
       { text: '架构', link: '/architecture', activeMatch: '/architecture' },
       {
         text: '设计',
-        activeMatch: '/(metrics-design|applog-design|config-import-export|splash-design|tab-context-menu-design|tab-scroll-design|tunnel-design|tunnel-dev-plan|hostkey-verification-design|explanation)/',
+        activeMatch: '/(metrics-design|applog-design|config-import-export|splash-design|tab-context-menu-design|tab-scroll-design|tunnel-design|tunnel-dev-plan|hostkey-verification-design|ci-release-design|explanation)/',
         items: [
           { text: '主机指标采集', link: '/metrics-design' },
           { text: '应用日志', link: '/applog-design' },
@@ -37,6 +37,7 @@ export default defineConfig({
           { text: 'SSH 端口转发', link: '/explanation/design/tunnel-design' },
           { text: 'SSH 端口转发开发计划', link: '/explanation/design/tunnel-dev-plan' },
           { text: 'SSH 主机密钥校验', link: '/explanation/design/hostkey-verification-design' },
+          { text: 'CI 三平台打包与发布', link: '/explanation/design/ci-release-design' },
           { text: '文档规范', link: '/explanation/design/docs-spec' },
         ],
       },
@@ -56,6 +57,7 @@ export default defineConfig({
         items: [
           { text: '开发指南', link: '/development' },
           { text: '架构与通信协议', link: '/architecture' },
+          { text: '发版 Release notes 模板', link: '/guides/release-notes-template' },
         ],
       },
       {
@@ -71,6 +73,7 @@ export default defineConfig({
           { text: 'SSH 端口转发', link: '/explanation/design/tunnel-design' },
           { text: 'SSH 端口转发开发计划', link: '/explanation/design/tunnel-dev-plan' },
           { text: 'SSH 主机密钥校验', link: '/explanation/design/hostkey-verification-design' },
+          { text: 'CI 三平台打包与发布', link: '/explanation/design/ci-release-design' },
           { text: '文档规范', link: '/explanation/design/docs-spec' },
         ],
       },
