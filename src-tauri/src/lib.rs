@@ -19,6 +19,22 @@ use tauri::{Manager, RunEvent, WebviewUrl, webview::WebviewWindowBuilder};
 /// 应用启动时刻（退出时计算 uptime_s）
 static BOOT_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// 构造 prevent-default 插件：关闭 WebView 原生右键菜单（Reload/Inspect Element 等），
+/// 防止其叠加在自定义 ContextMenu 之上；同时禁用浏览器默认快捷键（F3/Ctrl+J 等）。
+/// - dev 构建：保留 DEV_TOOLS（F12）与 RELOAD（Ctrl+R）便于调试
+/// - release 构建：禁用全部默认快捷键
+#[cfg(debug_assertions)]
+fn prevent_default_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_prevent_default::Flags;
+    tauri_plugin_prevent_default::Builder::new()
+        .with_flags(Flags::all().difference(Flags::DEV_TOOLS | Flags::RELOAD))
+        .build()
+}
+#[cfg(not(debug_assertions))]
+fn prevent_default_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri_plugin_prevent_default::init()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = BOOT_INSTANT.set(std::time::Instant::now());
@@ -32,6 +48,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // 配置导入后提示「立即重启」：relaunch()
         .plugin(tauri_plugin_process::init())
+        // 关闭 WebView 原生右键菜单与浏览器默认快捷键（详见 prevent_default_plugin）
+        .plugin(prevent_default_plugin())
         // 全局配置写锁：串行化 app_config.json + connections.json 的所有写操作
         // （节写穿 / 连接增删 / 导入 / 重置），必须在 setup 与命令注册前挂载
         .manage(applog::persisted::ConfigWriteLock::new())

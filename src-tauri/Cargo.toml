@@ -35,6 +35,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
 libc = "0.2"
 tauri-plugin-clipboard-manager = "2.4.1"
+# 关闭 WebView 原生右键菜单与浏览器默认快捷键（F3/Ctrl+J 等），
+# 防止原生右键叠加在自定义 ContextMenu 之上
+tauri-plugin-prevent-default = "6"
 font-kit = "0.14"
 sha2 = "0.10"
 # 配置文件密码加密导出（§5.1）：PBKDF2-SHA256 派生 + AES-256-GCM
