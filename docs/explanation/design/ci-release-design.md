@@ -4,7 +4,7 @@
 
 > description: GitHub Actions 用 tauri-action 产出 macOS/Windows/Linux 安装包、softprops/action-gh-release 发布 Release 草稿的流水线设计
 > 创建时间：2026-10-08 09:28:16
-> 更新时间：2026-10-08 10:30:00
+> 更新时间：2026-10-08 16:10:24
 > 作者：
 
 ---
@@ -91,7 +91,7 @@ dispatch ────┘                 │
 
 ```yaml
 # 三平台打包与发布：tag v* → Release 草稿；手动触发 → 仅产物（无 Release）
-# 产物未签名（ad-hoc）：macOS 首次打开需右键 → 打开，Windows/Linux 有 SmartScreen/未知来源提示
+# 产物未签名（ad-hoc）：macOS 从浏览器下载的 dmg 装好后若提示「"rhost" 已损坏，无法打开」，运行 xattr -dr com.apple.quarantine 移除隔离属性后再打开（右键打开对此错误无效）；Windows/Linux 有 SmartScreen/未知来源提示
 name: Build & Release
 
 on:
@@ -206,7 +206,7 @@ jobs:
             bundles/**/*.AppImage
           body: |
             ## 安装须知（产物未签名）
-            - **macOS**：首次打开「右键 → 打开」绕过 Gatekeeper
+            - **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
             - **Windows**：SmartScreen 选「仍要运行」
             - **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
 
@@ -284,7 +284,7 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 
 - 权限最小化：workflow 级 `contents: write` 是创建 Release 的必要权限；未申请 `packages`/`id-token` 等；
 - 无自定义 secrets：仅用内置 `GITHUB_TOKEN`，无泄漏面；签名体系接入前不引入任何密钥；
-- 产物未签名的用户侧影响（写入 Release 说明模板）：macOS 首次打开「右键 → 打开」绕过 Gatekeeper；Windows SmartScreen 选「仍要运行」；签名/公证为后续独立事项；
+- 产物未签名的用户侧影响（写入 Release 说明模板）：macOS 从浏览器下载的 `.dmg` 装好后若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）；Windows SmartScreen 选「仍要运行」；签名/公证为后续独立事项；
 - 构建失败：`fail-fast: false` 保证其余平台 build 产物仍上传 artifact；release job `needs: build` 要求三平台全绿才执行，单平台失败时**不会创建 Release 草稿**，无半成品草稿风险；单平台失败先查该 runner 的系统依赖与 Rust 缓存，必要时 `rust-cache` 加 `cache-all-crates` 或清理重跑；
 - 超时降级：build `timeout-minutes: 60`、release `timeout-minutes: 10`，卡死时自动取消不堆积 runner。
 
@@ -356,7 +356,7 @@ CHANGELOG 自动生成依赖 conventional commits 规范（`feat`/`fix`/`docs`/`
 
 ```markdown
 ## 安装须知（产物未签名）
-- **macOS**：首次打开「右键 → 打开」绕过 Gatekeeper
+- **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
 - **Windows**：SmartScreen 选「仍要运行」
 - **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
 

@@ -4,7 +4,7 @@
 
 > description: 如何通过推送 v* tag 或手动触发 GitHub Actions release.yml 完成三平台打包、Release 草稿生成与发布的完整操作步骤
 > 创建时间：2026-10-08 15:48:47
-> 更新时间：2026-10-08 15:48:47
+> 更新时间：2026-10-08 16:10:24
 > 作者：
 
 ---
@@ -193,7 +193,7 @@ prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, 
 
 ## 8. 注意事项
 
-- **产物未签名**：macOS 首次打开需右键 → 打开；Windows 有 SmartScreen 提示；Linux AppImage 需 `chmod +x`。详见 [release-notes-template.md](release-notes-template.md) 安装须知段；
+- **产物未签名**：macOS 从浏览器下载的 `.dmg` 装好后若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（右键 → 打开对此错误无效）；Windows 有 SmartScreen 提示；Linux AppImage 需 `chmod +x`。详见 [release-notes-template.md](release-notes-template.md) 安装须知段；
 - **并发控制**：同 tag/dispatch 排队不取消（`cancel-in-progress: false`），避免半成品 artifact；
 - **commit 规范**：仓库已配 commitlint + husky，不规范 commit 本地即被拦截，changelog 也会有内容；
 - **版本号三处一致**：`frontend/package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`，发版前必须同步；

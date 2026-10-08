@@ -4,7 +4,7 @@
 
 > description: 发版时编写 GitHub Release body 的完整模板与字段说明，含 rhost 产物下载表、SHA256 校验、未签名提示与流水线自动段说明
 > 创建时间：2026-10-08 10:58:02
-> 更新时间：2026-10-08 11:20:00
+> 更新时间：2026-10-08 16:10:24
 > 作者：
 
 ---
@@ -58,7 +58,7 @@
 
 ## 📦 下载与安装
 
-> **产物未签名**：macOS 首次打开「右键 → 打开」绕过 Gatekeeper；Windows SmartScreen 选「仍要运行」；Linux AppImage 需 `chmod +x` 后运行，deb/rpm 用对应包管理器安装。签名/公证为后续独立事项，详见设计文档 §7。
+> **产物未签名**：macOS 从浏览器下载的 `.dmg` 装好后若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（右键 → 打开对此错误无效）；Windows SmartScreen 选「仍要运行」；Linux AppImage 需 `chmod +x` 后运行，deb/rpm 用对应包管理器安装。签名/公证为后续独立事项，详见设计文档 §7。
 
 从下方 **Assets** 区域下载对应平台安装包（SHA256 落地后从 Assets 的 `checksums.txt` 比对）：
 
@@ -131,7 +131,7 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 
 ```markdown
 ## 安装须知（产物未签名）
-- **macOS**：首次打开「右键 → 打开」绕过 Gatekeeper
+- **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
 - **Windows**：SmartScreen 选「仍要运行」
 - **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
 
