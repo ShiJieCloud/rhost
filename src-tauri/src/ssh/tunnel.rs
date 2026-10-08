@@ -30,8 +30,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::frame::{FrameType, encode_frame};
 use super::SshError;
+use super::frame::{FrameType, encode_frame};
 
 /* =========================================================
  * 常量（魔数集中定义，注释写理由；不开放配置）
@@ -500,8 +500,8 @@ impl TunnelManager {
     /// 建立条目（Starting）入表并推快照 → 按类型启动 → 失败置 Error 并推帧。
     pub async fn start(&self, rule: TunnelRule, opts: StartOptions) -> Result<(), SshError> {
         // 1. 校验：非法返回 TUNNEL_BAD_RULE；bind_host 空串归一化 127.0.0.1
-        let rule = validate_rule(&rule)
-            .map_err(|e| SshError::Tunnel(format!("TUNNEL_BAD_RULE: {e}")))?;
+        let rule =
+            validate_rule(&rule).map_err(|e| SshError::Tunnel(format!("TUNNEL_BAD_RULE: {e}")))?;
 
         // 2. 幂等：相同 id 已在 Active/Starting 返回 TUNNEL_RUNNING（前端按成功处理，
         //    不改变现有后台重试任务）；仅 Stopped/Error 会真正启动新任务
@@ -564,7 +564,10 @@ impl TunnelManager {
                 "tunnel",
                 events::TUNNEL_START,
                 None,
-                format!("隧道 {} 启动成功（{}:{}）", rule.id, rule.bind_host, rule.bind_port),
+                format!(
+                    "隧道 {} 启动成功（{}:{}）",
+                    rule.id, rule.bind_host, rule.bind_port
+                ),
                 Some(serde_json::json!({
                     "rule_id": rule.id,
                     "kind": format!("{:?}", rule.kind),
@@ -618,7 +621,8 @@ impl TunnelManager {
         loop {
             let res = {
                 let h = self.handle.lock().await;
-                h.tcpip_forward(&rule.bind_host, rule.bind_port as u32).await
+                h.tcpip_forward(&rule.bind_host, rule.bind_port as u32)
+                    .await
             };
             match res {
                 Ok(bound) => {
@@ -651,7 +655,10 @@ impl TunnelManager {
                         "tunnel",
                         events::TUNNEL_REMOTE_READY,
                         None,
-                        format!("远程转发 {} 已就绪，监听 {}:{}", rule.id, rule.bind_host, bound),
+                        format!(
+                            "远程转发 {} 已就绪，监听 {}:{}",
+                            rule.id, rule.bind_host, bound
+                        ),
                         Some(serde_json::json!({
                             "rule_id": rule.id,
                             "bind_host": rule.bind_host,
@@ -782,8 +789,10 @@ impl TunnelManager {
                     .cancel_tcpip_forward(entry.rule.bind_host.as_str(), bound as u32)
                     .await;
             }
-            self.remote
-                .remove(&entry.rule.bind_host, entry.bound_port.load(Ordering::Relaxed));
+            self.remote.remove(
+                &entry.rule.bind_host,
+                entry.bound_port.load(Ordering::Relaxed),
+            );
         }
         // 2. 取消单规则令牌：-L/-D 停 accept；-R 回调查表已删，新回调 reject
         entry.rule_cancel.cancel();
@@ -829,10 +838,7 @@ impl TunnelManager {
     /// 惰性启动 1s 节流状态推送任务（整个 manager 生命周期仅 spawn 一次）：
     /// 每秒醒来检查全部规则的脏标记，有变化才推全量快照（无变化不推）。
     fn ensure_status_task(&self) {
-        if self
-            .status_task_started
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.status_task_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let tunnels = self.tunnels.clone();
@@ -964,27 +970,27 @@ async fn supervise_listen(entry: Arc<TunnelEntry>, ctx: Arc<ListenCtx>, listener
             match TcpListener::bind((entry.rule.bind_host.as_str(), bind_port)).await {
                 Ok(l) => l,
                 Err(e) => {
-                failures += 1;
-                emit(
-                    log::Level::Warn,
-                    "tunnel",
-                    events::TUNNEL_LISTENER_RETRY,
-                    None,
-                    format!("隧道 {} 监听器重启 bind 失败（第 {failures} 次）: {e}", entry.rule.id),
-                    Some(serde_json::json!({
-                        "rule_id": entry.rule.id,
-                        "failures": failures,
-                        "error": e.to_string(),
-                    })),
-                );
-                if failures > SUPERVISOR_MAX_RETRIES {
-                    entry.set_state(
-                        TunnelState::Error,
-                        Some(format!("监听器重启失败: {e}")),
+                    failures += 1;
+                    emit(
+                        log::Level::Warn,
+                        "tunnel",
+                        events::TUNNEL_LISTENER_RETRY,
+                        None,
+                        format!(
+                            "隧道 {} 监听器重启 bind 失败（第 {failures} 次）: {e}",
+                            entry.rule.id
+                        ),
+                        Some(serde_json::json!({
+                            "rule_id": entry.rule.id,
+                            "failures": failures,
+                            "error": e.to_string(),
+                        })),
                     );
-                    push_tunnels_frame(&ctx.frame_tx, &ctx.tunnels).await;
-                    return;
-                }
+                    if failures > SUPERVISOR_MAX_RETRIES {
+                        entry.set_state(TunnelState::Error, Some(format!("监听器重启失败: {e}")));
+                        push_tunnels_frame(&ctx.frame_tx, &ctx.tunnels).await;
+                        return;
+                    }
                     continue;
                 }
             }
@@ -1000,17 +1006,17 @@ async fn supervise_listen(entry: Arc<TunnelEntry>, ctx: Arc<ListenCtx>, listener
                         "tunnel",
                         events::TUNNEL_LISTENER_FAILED,
                         None,
-                        format!("隧道 {} accept 系统错误（连续 {failures} 次，标记为错误）: {e}", entry.rule.id),
+                        format!(
+                            "隧道 {} accept 系统错误（连续 {failures} 次，标记为错误）: {e}",
+                            entry.rule.id
+                        ),
                         Some(serde_json::json!({
                             "rule_id": entry.rule.id,
                             "failures": failures,
                             "error": e.to_string(),
                         })),
                     );
-                    entry.set_state(
-                        TunnelState::Error,
-                        Some(format!("监听器连续失败: {e}")),
-                    );
+                    entry.set_state(TunnelState::Error, Some(format!("监听器连续失败: {e}")));
                     push_tunnels_frame(&ctx.frame_tx, &ctx.tunnels).await;
                     return;
                 }
@@ -1019,7 +1025,11 @@ async fn supervise_listen(entry: Arc<TunnelEntry>, ctx: Arc<ListenCtx>, listener
                     "tunnel",
                     events::TUNNEL_LISTENER_RETRY,
                     None,
-                    format!("隧道 {} accept 系统错误（第 {failures} 次，{}ms 后重启）: {e}", entry.rule.id, supervisor_backoff(failures).as_millis()),
+                    format!(
+                        "隧道 {} accept 系统错误（第 {failures} 次，{}ms 后重启）: {e}",
+                        entry.rule.id,
+                        supervisor_backoff(failures).as_millis()
+                    ),
                     Some(serde_json::json!({
                         "rule_id": entry.rule.id,
                         "failures": failures,
@@ -1054,14 +1064,16 @@ async fn accept_loop(
                 }
                 // 闸门 2/3：单规则 + 全局信号量硬上限（OwnedSemaphorePermit
                 // 即 RAII 守卫，连接任务任何退出路径都自动归还）
-                let (rule_permit, global_permit) =
-                    match (entry.rule_conns.clone().try_acquire_owned(), ctx.global_conns.clone().try_acquire_owned()) {
-                        (Ok(a), Ok(b)) => (a, b),
-                        (a, b) => {
-                            drop((a, b, tcp));
-                            continue;
-                        }
-                    };
+                let (rule_permit, global_permit) = match (
+                    entry.rule_conns.clone().try_acquire_owned(),
+                    ctx.global_conns.clone().try_acquire_owned(),
+                ) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    (a, b) => {
+                        drop((a, b, tcp));
+                        continue;
+                    }
+                };
                 tokio::spawn(handle_local_conn(
                     tcp,
                     peer,
@@ -1229,7 +1241,9 @@ async fn relay_channel_tcp(
                     if tcp_w.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                    counters_down.bytes_down.fetch_add(n as u64, Ordering::Relaxed);
+                    counters_down
+                        .bytes_down
+                        .fetch_add(n as u64, Ordering::Relaxed);
                     dirty_down.store(true, Ordering::Relaxed);
                 }
             }

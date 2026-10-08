@@ -585,7 +585,10 @@ mod tests {
     fn custom_logo_caps_lines_and_width() {
         let v = HashMap::new();
         // 超行数截断到 30 行，且后续布局完整（空行 + Welcome）
-        let long = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let long = (0..40)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let cmds = build_cmds(&v, &long);
         let pos = cmds
             .iter()

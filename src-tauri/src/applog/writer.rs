@@ -227,7 +227,11 @@ pub fn current_file_name(rotate: RotateStrategy, now: DateTime<Local>) -> String
     current_file_name_reclock(rotate, now, false)
 }
 
-fn current_file_name_reclock(rotate: RotateStrategy, now: DateTime<Local>, reclock: bool) -> String {
+fn current_file_name_reclock(
+    rotate: RotateStrategy,
+    now: DateTime<Local>,
+    reclock: bool,
+) -> String {
     let base = match rotate {
         RotateStrategy::Daily => format!("rhost_app_{}.log", now.format("%Y%m%d")),
         RotateStrategy::Weekly => {
@@ -372,7 +376,10 @@ mod tests {
         assert_eq!(v["seq"], 1024);
         assert_eq!(v["event_id"], "ssh.connect.start");
         assert_eq!(v["sid"], "a1b2c3");
-        assert!(v.get("_truncated").is_none(), "未截断时不应有 _truncated 键");
+        assert!(
+            v.get("_truncated").is_none(),
+            "未截断时不应有 _truncated 键"
+        );
     }
 
     #[test]
@@ -411,7 +418,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).expect("截断后 JSON 仍合法");
         assert_eq!(v["_truncated"], true, "_truncated 必须是顶层字段");
         assert!(
-            v.get("kv").map(|k| k.get("_truncated").is_none()).unwrap_or(true),
+            v.get("kv")
+                .map(|k| k.get("_truncated").is_none())
+                .unwrap_or(true),
             "_truncated 不得出现在 kv 内"
         );
     }

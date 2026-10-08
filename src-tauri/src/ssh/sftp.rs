@@ -28,12 +28,12 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::watch;
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::session::{ClientHandler, SshSession};
 use super::SshError;
+use super::session::{ClientHandler, SshSession};
 
 /// 默认单块传输大小：64KB（SFTP v3 规定服务端必须接受 ≥32KB，64KB 在多数服务端吞吐更优，
 /// 且远小于整文件，保证流式不占内存）。前端可通过全局设置覆盖（8KB ~ 1MB）
@@ -81,12 +81,11 @@ async fn open_sftp(
             .channel_open_session()
             .await
             .map_err(|e| SshError::Channel(format!("打开 SFTP 通道失败: {e}")))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| {
-                SshError::Channel(format!("远端拒绝 SFTP 子系统（sftp-server 可能未启用）: {e}"))
-            })?;
+        channel.request_subsystem(true, "sftp").await.map_err(|e| {
+            SshError::Channel(format!(
+                "远端拒绝 SFTP 子系统（sftp-server 可能未启用）: {e}"
+            ))
+        })?;
         channel
     };
     let sftp = RawSftpSession::new(channel.into_stream());
@@ -283,10 +282,7 @@ impl SshSession {
         }
     }
 
-    async fn list_remote(
-        &self,
-        path: &Option<String>,
-    ) -> Result<RemoteDirListing, SshError> {
+    async fn list_remote(&self, path: &Option<String>) -> Result<RemoteDirListing, SshError> {
         let sftp = self.sftp.get(&self.handle).await?;
         let fut = async {
             let dir = match path {
@@ -316,13 +312,11 @@ impl SshSession {
             let read_result = loop {
                 match sftp.readdir(handle.as_str()).await {
                     Ok(name) => files.extend(name.files),
-                    Err(SftpError::Status(status))
-                        if status.status_code == StatusCode::Eof =>
-                    {
-                        break Ok::<_, SshError>(())
+                    Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                        break Ok::<_, SshError>(());
                     }
                     Err(e) => {
-                        break Err(SshError::Channel(format!("读取远端目录 {dir} 失败: {e}")))
+                        break Err(SshError::Channel(format!("读取远端目录 {dir} 失败: {e}")));
                     }
                 }
             };
@@ -390,7 +384,10 @@ impl SshSession {
         resume: Option<bool>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
-        let chunk = chunk_kb.unwrap_or((DEFAULT_CHUNK / 1024) as u32).clamp(8, 1024) as usize * 1024;
+        let chunk = chunk_kb
+            .unwrap_or((DEFAULT_CHUNK / 1024) as u32)
+            .clamp(8, 1024) as usize
+            * 1024;
         let resume = resume.unwrap_or(true);
         let cancel = self.child_cancel();
         let (paused_tx, mut paused_rx) = watch::channel(false);
@@ -413,13 +410,23 @@ impl SshSession {
                 .await
                 .map_err(|e| (e, 0u64, 0u64))?;
             let local = expand_tilde(&local_path);
-            let mut src = File::open(&local)
-                .await
-                .map_err(|e| (SshError::Channel(format!("打开本地文件 {local} 失败: {e}")), 0, 0))?;
+            let mut src = File::open(&local).await.map_err(|e| {
+                (
+                    SshError::Channel(format!("打开本地文件 {local} 失败: {e}")),
+                    0,
+                    0,
+                )
+            })?;
             let total = src
                 .metadata()
                 .await
-                .map_err(|e| (SshError::Channel(format!("读取本地文件大小失败: {e}")), 0, 0))?
+                .map_err(|e| {
+                    (
+                        SshError::Channel(format!("读取本地文件大小失败: {e}")),
+                        0,
+                        0,
+                    )
+                })?
                 .len();
 
             // 断点续传：探测远端已有大小，决定续写起点
@@ -431,7 +438,7 @@ impl SshSession {
                         SshError::Channel(format!("探测远端文件 {remote_path} 失败: {e}")),
                         0,
                         total,
-                    ))
+                    ));
                 }
             };
             let offset = if !resume {
@@ -444,9 +451,13 @@ impl SshSession {
                 0 // 远端比本地大（源文件变更），截断重传
             };
             if offset > 0 {
-                src.seek(SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| (SshError::Channel(format!("定位本地文件偏移失败: {e}")), 0, total))?;
+                src.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+                    (
+                        SshError::Channel(format!("定位本地文件偏移失败: {e}")),
+                        0,
+                        total,
+                    )
+                })?;
             }
 
             // 续传时不带 TRUNCATE 保留已有内容；从头传时 TRUNCATE 清除残留
@@ -484,16 +495,13 @@ impl SshSession {
                 if cancel.is_cancelled() {
                     return Err((SshError::Cancelled, transferred, total));
                 }
-                let n = src
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| {
-                        (
-                            SshError::Channel(format!("读取本地文件失败: {e}")),
-                            transferred,
-                            total,
-                        )
-                    })?;
+                let n = src.read(&mut buf).await.map_err(|e| {
+                    (
+                        SshError::Channel(format!("读取本地文件失败: {e}")),
+                        transferred,
+                        total,
+                    )
+                })?;
                 if n == 0 {
                     return Ok((transferred, total));
                 }
@@ -545,7 +553,10 @@ impl SshSession {
         resume: Option<bool>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
-        let chunk = chunk_kb.unwrap_or((DEFAULT_CHUNK / 1024) as u32).clamp(8, 1024) as usize * 1024;
+        let chunk = chunk_kb
+            .unwrap_or((DEFAULT_CHUNK / 1024) as u32)
+            .clamp(8, 1024) as usize
+            * 1024;
         let resume = resume.unwrap_or(true);
         let cancel = self.child_cancel();
         let (paused_tx, mut paused_rx) = watch::channel(false);
@@ -586,7 +597,10 @@ impl SshSession {
             let total = attrs.size.unwrap_or(0);
 
             // 断点续传：探测本地已有大小，决定续写起点
-            let local_size = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
+            let local_size = tokio::fs::metadata(&local)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             let offset = if !resume {
                 0 // 关闭断点续传：一律截断全量重传
             } else if local_size == total {
@@ -666,15 +680,13 @@ impl SshSession {
                 if data.is_empty() {
                     return Ok((transferred, total));
                 }
-                dst.write_all(&data)
-                    .await
-                    .map_err(|e| {
-                        (
-                            SshError::Channel(format!("写入本地文件失败: {e}")),
-                            transferred,
-                            total,
-                        )
-                    })?;
+                dst.write_all(&data).await.map_err(|e| {
+                    (
+                        SshError::Channel(format!("写入本地文件失败: {e}")),
+                        transferred,
+                        total,
+                    )
+                })?;
                 offset += data.len() as u64;
                 transferred += data.len() as u64;
 
@@ -764,11 +776,7 @@ impl SshSession {
     /// 远端复制（同主机内）。目录递归复制；符号链接复制为指向同目标的新软链
     /// （不跟随）；文件经同一 SFTP 会话 64KB 流式 read+write，不落地本地磁盘。
     /// 整个操作持管理锁。
-    pub(crate) async fn sftp_copy_path(
-        &self,
-        src: String,
-        dst: String,
-    ) -> Result<(), SshError> {
+    pub(crate) async fn sftp_copy_path(&self, src: String, dst: String) -> Result<(), SshError> {
         let _g = self.sftp.manage.lock().await;
         let sftp = self.sftp.get(&self.handle).await?;
         copy_recursive(&sftp, &src, &dst).await
@@ -829,11 +837,9 @@ async fn list_children(
                 }
             }
             Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
-                break Ok::<_, SshError>(())
+                break Ok::<_, SshError>(());
             }
-            Err(e) => {
-                break Err(SshError::Channel(format!("读取目录 {dir} 失败: {e}")))
-            }
+            Err(e) => break Err(SshError::Channel(format!("读取目录 {dir} 失败: {e}"))),
         }
     };
     let _ = sftp.close(handle.as_str()).await;
@@ -883,11 +889,7 @@ async fn posix_rename(
 
 /// 单文件同会话流式复制：固定 64KB read→write，两端句柄用完即关，
 /// 不落地本地磁盘、不占整文件内存。
-async fn copy_file_stream(
-    sftp: &RawSftpSession,
-    src: &str,
-    dst: &str,
-) -> Result<(), SshError> {
+async fn copy_file_stream(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(), SshError> {
     let rhandle = sftp
         .open(src, OpenFlags::READ, FileAttributes::default())
         .await
@@ -905,7 +907,10 @@ async fn copy_file_stream(
 
     let mut offset = 0u64;
     let result = loop {
-        match sftp.read(rhandle.as_str(), offset, DEFAULT_CHUNK as u32).await {
+        match sftp
+            .read(rhandle.as_str(), offset, DEFAULT_CHUNK as u32)
+            .await
+        {
             Ok(d) => {
                 if d.data.is_empty() {
                     break Ok::<_, SshError>(());
@@ -916,9 +921,7 @@ async fn copy_file_stream(
                 }
                 offset += n;
             }
-            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
-                break Ok(())
-            }
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break Ok(()),
             Err(e) => break Err(SshError::Channel(format!("读取源 {src} 失败: {e}"))),
         }
     };
@@ -929,11 +932,7 @@ async fn copy_file_stream(
 
 /// 递归复制：软链 → readlink 后在目标位置建同指向软链（不跟随）；
 /// 目录 → mkdir 后逐项递归；文件 → 同会话流式复制。
-async fn copy_recursive(
-    sftp: &RawSftpSession,
-    src: &str,
-    dst: &str,
-) -> Result<(), SshError> {
+async fn copy_recursive(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(), SshError> {
     // lstat 不跟随软链，保证链接复制为链接
     let attrs = sftp
         .lstat(src)

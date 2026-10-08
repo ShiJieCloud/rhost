@@ -90,7 +90,11 @@ impl SessionManager {
     }
 
     /// 停止一条端口转发规则（幂等：规则不存在视为成功）
-    pub(crate) async fn tunnel_stop(&self, session_id: &str, rule_id: &str) -> Result<(), SshError> {
+    pub(crate) async fn tunnel_stop(
+        &self,
+        session_id: &str,
+        rule_id: &str,
+    ) -> Result<(), SshError> {
         let session = {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).cloned()
@@ -157,11 +161,7 @@ impl SessionManager {
     }
 
     /// SFTP 创建目录
-    pub(crate) async fn sftp_mkdir(
-        &self,
-        session_id: &str,
-        path: String,
-    ) -> Result<(), SshError> {
+    pub(crate) async fn sftp_mkdir(&self, session_id: &str, path: String) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
             Some(s) => s.sftp_mkdir(path).await,
@@ -182,7 +182,10 @@ impl SessionManager {
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
-            Some(s) => s.upload_file(task_id, local_path, remote_path, chunk_kb, resume, channel).await,
+            Some(s) => {
+                s.upload_file(task_id, local_path, remote_path, chunk_kb, resume, channel)
+                    .await
+            }
             None => Err(SshError::NotFound),
         }
     }
@@ -200,7 +203,10 @@ impl SessionManager {
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
-            Some(s) => s.download_file(task_id, remote_path, local_path, chunk_kb, resume, channel).await,
+            Some(s) => {
+                s.download_file(task_id, remote_path, local_path, chunk_kb, resume, channel)
+                    .await
+            }
             None => Err(SshError::NotFound),
         }
     }
@@ -219,11 +225,7 @@ impl SessionManager {
     }
 
     /// SFTP 删除文件/目录（目录递归）
-    pub(crate) async fn sftp_remove(
-        &self,
-        session_id: &str,
-        path: String,
-    ) -> Result<(), SshError> {
+    pub(crate) async fn sftp_remove(&self, session_id: &str, path: String) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
             Some(s) => s.sftp_remove_path(path).await,

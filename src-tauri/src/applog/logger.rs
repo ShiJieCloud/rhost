@@ -6,8 +6,8 @@
 
 use log::{Metadata, Record};
 
-use super::{events, try_hub};
 use super::hub::{AppLogEntry, current_level_filter};
+use super::{events, try_hub};
 
 /// 全局静态 logger 实例（set_logger 需要 &'static）
 pub static APP_LOGGER: AppLogger = AppLogger;

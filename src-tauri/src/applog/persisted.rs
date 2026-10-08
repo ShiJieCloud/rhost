@@ -617,8 +617,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn save_then_load_roundtrip_custom_logs() {
         let dir = unique_dir("roundtrip");
@@ -638,8 +636,7 @@ mod tests {
 
         // 原子写不留临时文件；顶层带 version
         assert!(!dir.join("nested/.app_config.json.tmp").exists());
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(raw["version"], 1);
         assert!(raw["logs"].is_object());
     }
@@ -649,8 +646,11 @@ mod tests {
         let dir = unique_dir("partial");
         let f = dir.join(APP_CONFIG_FILE_NAME);
         // 旧版本文件：logs 节只有两个字段
-        std::fs::write(&f, r#"{"version":1,"logs":{"persist":false,"storage_path":"/var/log/x"}}"#)
-            .unwrap();
+        std::fs::write(
+            &f,
+            r#"{"version":1,"logs":{"persist":false,"storage_path":"/var/log/x"}}"#,
+        )
+        .unwrap();
         let cfg = load_full(&f).logs_config();
         assert!(!cfg.persist);
         assert_eq!(cfg.storage_path, "/var/log/x");
@@ -699,8 +699,7 @@ mod tests {
 
         save_logs(&f, &custom_logs()).unwrap();
 
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
         // 未知顶层节原样保留（前向兼容：旧版读改写不丢新版配置）
         assert_eq!(raw["terminal"]["fontSize"], 14);
         assert_eq!(raw["ui"]["theme"], "dark");
@@ -796,15 +795,13 @@ mod tests {
         save_section(&f, "keys", json!([])).unwrap();
 
         // 注入未知顶层节与节内未知字段，再写另一节，均不得丢
-        let mut raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
         raw["future_top"] = json!({"x": 1});
         raw["settings"]["futureField"] = json!(99);
         std::fs::write(&f, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
 
         save_section(&f, "groups", json!([{"name": "g2", "color": "green"}])).unwrap();
-        let after: Value =
-            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(after["future_top"]["x"], 1);
         assert_eq!(after["settings"]["futureField"], 99);
         assert_eq!(after["settings"]["uiTheme"], "dark");
@@ -845,7 +842,12 @@ mod tests {
     fn replace_settings_default_resets_only_settings() {
         let dir = unique_dir("reset_settings");
         let f = dir.join(APP_CONFIG_FILE_NAME);
-        save_section(&f, "settings", json!({"uiTheme": "light", "accent": "#000000"})).unwrap();
+        save_section(
+            &f,
+            "settings",
+            json!({"uiTheme": "light", "accent": "#000000"}),
+        )
+        .unwrap();
         save_section(&f, "groups", json!([{"name": "g", "color": "red"}])).unwrap();
 
         replace_settings_default(&f).unwrap();

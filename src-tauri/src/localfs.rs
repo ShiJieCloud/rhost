@@ -53,9 +53,15 @@ fn fmt_perm(md: &std::fs::Metadata) -> String {
     let mode = md.permissions().mode();
     let mut s = String::with_capacity(9);
     for (bit, chr) in [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ] {
         s.push(if mode & bit != 0 { chr } else { '-' });
     }
@@ -329,4 +335,3 @@ fn open_terminal(dir: &std::path::Path) -> Result<(), String> {
 fn open_terminal(_dir: &std::path::Path) -> Result<(), String> {
     Err("当前平台暂不支持在系统终端打开".to_string())
 }
-

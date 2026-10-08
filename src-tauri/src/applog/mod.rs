@@ -169,8 +169,10 @@ fn append_panic_entry(info: &std::panic::PanicHookInfo<'_>) {
         .unwrap_or("unnamed")
         .to_string();
     // force_capture 无视 RUST_BACKTRACE；release 下符号可能不全但保留地址栈
-    let backtrace =
-        truncate_at_char_boundary(&std::backtrace::Backtrace::force_capture().to_string(), 4096);
+    let backtrace = truncate_at_char_boundary(
+        &std::backtrace::Backtrace::force_capture().to_string(),
+        4096,
+    );
 
     let entry = AppLogEntry {
         // seq 仍从全局原子分配：panic 行与管线内 seq 不冲突（仅文件内可能因旁路
@@ -273,14 +275,13 @@ mod tests {
         assert_eq!(v["level"], "error");
         assert_eq!(v["target"], "app");
         assert!(v["seq"].as_u64().is_some_and(|n| n >= 1));
-        assert!(v["msg"]
-            .as_str()
-            .unwrap()
-            .contains("panic hook 测试探针"));
-        assert!(v["kv"]["location"]
-            .as_str()
-            .unwrap()
-            .contains("applog/mod.rs"));
+        assert!(v["msg"].as_str().unwrap().contains("panic hook 测试探针"));
+        assert!(
+            v["kv"]["location"]
+                .as_str()
+                .unwrap()
+                .contains("applog/mod.rs")
+        );
         assert!(v["kv"]["backtrace"].is_string());
         assert!(v["kv"]["thread"].is_string());
 

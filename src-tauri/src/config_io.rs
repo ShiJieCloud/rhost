@@ -82,8 +82,8 @@ pub fn canonicalize_json(value: &Value) -> Value {
 
 /// 计算 data 节规范序列化字节的 SHA-256（小写 hex）
 pub fn data_sha256(data: &Value) -> Result<String, String> {
-    let bytes =
-        serde_json::to_vec(&canonicalize_json(data)).map_err(|e| format!("data 序列化失败: {e}"))?;
+    let bytes = serde_json::to_vec(&canonicalize_json(data))
+        .map_err(|e| format!("data 序列化失败: {e}"))?;
     let digest = Sha256::digest(bytes);
     Ok(hex_lower(&digest))
 }
@@ -257,7 +257,8 @@ pub fn write_export_file(path: &Path, json: &str) -> Result<usize, String> {
     }
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建导出临时文件失败: {e}"))?;
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("创建导出临时文件失败: {e}"))?;
         f.write_all(json.as_bytes())
             .map_err(|e| format!("写入导出临时文件失败: {e}"))?;
         f.sync_all().ok();
@@ -378,11 +379,10 @@ pub fn prepare_import(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let doc = if encrypted {
-        let pw = password.ok_or_else(|| {
-            ImportError::stage("decrypt", "该配置文件已加密，请输入密码")
-        })?;
-        let plain = crate::config_crypto::open_envelope(payload, pw)
-            .map_err(ImportError::decrypt)?;
+        let pw = password
+            .ok_or_else(|| ImportError::stage("decrypt", "该配置文件已加密，请输入密码"))?;
+        let plain =
+            crate::config_crypto::open_envelope(payload, pw).map_err(ImportError::decrypt)?;
         serde_json::from_str::<Value>(&plain)
             .map_err(|e| ImportError::stage("parse", format!("解密后的配置格式错误: {e}")))?
     } else {
@@ -405,7 +405,10 @@ pub fn prepare_import(
         .cloned()
         .ok_or_else(|| ImportError::stage("parse", "配置文件格式错误：缺少 data 节"))?;
     if !data.is_object() {
-        return Err(ImportError::stage("parse", "配置文件格式错误：data 必须是对象"));
+        return Err(ImportError::stage(
+            "parse",
+            "配置文件格式错误：data 必须是对象",
+        ));
     }
 
     // 4. 版本校验（MVP 仅相等；migrate_to_current 负责三分支守门）
@@ -419,10 +422,7 @@ pub fn prepare_import(
         let actual = data_sha256(&data)
             .map_err(|e| ImportError::stage("hash", format!("校验值计算失败: {e}")))?;
         if !expected.eq_ignore_ascii_case(&actual) {
-            return Err(ImportError::stage(
-                "hash",
-                "文件校验失败，可能被篡改或损坏",
-            ));
+            return Err(ImportError::stage("hash", "文件校验失败，可能被篡改或损坏"));
         }
     }
 
@@ -442,9 +442,9 @@ pub fn prepare_import(
     let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut final_ids: Option<std::collections::HashSet<String>> = None;
     if let Some(conn_v) = data.get("connections") {
-        let arr = conn_v.as_array().ok_or_else(|| {
-            ImportError::parse("connections", "connections 节必须是数组")
-        })?;
+        let arr = conn_v
+            .as_array()
+            .ok_or_else(|| ImportError::parse("connections", "connections 节必须是数组"))?;
         let mut incoming = Vec::with_capacity(arr.len());
         for (i, item) in arr.iter().cloned().enumerate() {
             let h = serde_json::from_value::<StoredHost>(item).map_err(|e| {
@@ -464,9 +464,8 @@ pub fn prepare_import(
 
     // 5.2 分组（关键；import_config 与 import_hosts 均消费）
     if let Some(groups_v) = data.get("groups") {
-        let merged_groups = merge_groups(&out_cfg.groups, groups_v).map_err(|e| {
-            ImportError::parse("groups", e)
-        })?;
+        let merged_groups =
+            merge_groups(&out_cfg.groups, groups_v).map_err(|e| ImportError::parse("groups", e))?;
         summary.groups_added = merged_groups.added;
         out_cfg.groups = merged_groups.value;
     }
@@ -731,7 +730,6 @@ fn merge_history(existing: &Value, incoming: &Value) -> Result<Value, String> {
     Ok(Value::Array(all))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,8 +936,7 @@ mod tests {
     #[test]
     fn import_full_roundtrip_merges_every_section_and_remaps_refs() {
         let mut existing = cfg_with_keys();
-        existing.ui_state =
-            serde_json::json!({"homeView": "hosts", "sessions": ["h1", "gone"]});
+        existing.ui_state = serde_json::json!({"homeView": "hosts", "sessions": ["h1", "gone"]});
         existing.settings = serde_json::json!({"uiTheme": "dark"});
 
         let data = serde_json::json!({
@@ -957,7 +954,14 @@ mod tests {
             "quick_connect_history": [{"host": "10.0.0.9", "timestamp": 200}],
             "logs": {"level": "trace"}
         });
-        let p = prepare_import(&import_doc(data), &[sample_host("h1")], &existing, false, None).unwrap();
+        let p = prepare_import(
+            &import_doc(data),
+            &[sample_host("h1")],
+            &existing,
+            false,
+            None,
+        )
+        .unwrap();
 
         // 连接
         let hosts = p.hosts.as_ref().unwrap();
@@ -1023,8 +1027,14 @@ mod tests {
         // 顶层非对象 / 缺 version
         let err = prepare_import("[]", &[], &AppConfigFile::default(), false, None).unwrap_err();
         assert_eq!(err.stage, "parse");
-        let err = prepare_import(r#"{"data":{}}"#, &[], &AppConfigFile::default(), false, None)
-            .unwrap_err();
+        let err = prepare_import(
+            r#"{"data":{}}"#,
+            &[],
+            &AppConfigFile::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.stage, "parse");
     }
 
@@ -1096,8 +1106,7 @@ mod tests {
     #[test]
     fn import_hosts_only_consumes_connections_groups_and_preserves_local_sessions() {
         let mut existing = cfg_with_keys();
-        existing.ui_state =
-            serde_json::json!({"homeView": "hosts", "sessions": ["h1", "ghost"]});
+        existing.ui_state = serde_json::json!({"homeView": "hosts", "sessions": ["h1", "ghost"]});
         existing.settings = serde_json::json!({"uiTheme": "dark"});
 
         let data = serde_json::json!({
@@ -1110,7 +1119,14 @@ mod tests {
             "keys": [{"id": "k9", "name": "n", "type": "RSA"}],
             "ui_state": {"homeView": "sftp"},
         });
-        let p = prepare_import(&import_doc(data), &[sample_host("h1")], &existing, true, None).unwrap();
+        let p = prepare_import(
+            &import_doc(data),
+            &[sample_host("h1")],
+            &existing,
+            true,
+            None,
+        )
+        .unwrap();
 
         let hosts = p.hosts.as_ref().unwrap();
         assert_eq!(hosts.len(), 3);
@@ -1133,22 +1149,14 @@ mod tests {
     #[test]
     fn import_history_is_appended_sorted_desc_and_capped_at_50() {
         let mut existing = AppConfigFile::default();
-        existing.quick_connect_history =
-            serde_json::json!([{"host": "old", "timestamp": 100}]);
+        existing.quick_connect_history = serde_json::json!([{"host": "old", "timestamp": 100}]);
         let mut incoming: Vec<Value> = (0..60)
             .map(|i| serde_json::json!({"host": format!("n{i}"), "timestamp": 1000 - i}))
             .collect();
         // 追加一个更早的，验证排序后沉底被截断
         incoming.push(serde_json::json!({"host": "early", "timestamp": 1}));
         let data = serde_json::json!({"quick_connect_history": incoming});
-        let p = prepare_import(
-            &import_doc(data),
-            &[],
-            &existing,
-            false,
-            None,
-        )
-        .unwrap();
+        let p = prepare_import(&import_doc(data), &[], &existing, false, None).unwrap();
         let hist = p.app_config.quick_connect_history.as_array().unwrap();
         assert_eq!(hist.len(), 50);
         assert_eq!(hist[0]["timestamp"], 1000);
@@ -1184,10 +1192,11 @@ mod tests {
         assert_eq!(err.stage, "decrypt");
         assert_eq!(err.reason, Some("bad_password"));
         assert_eq!(err.error, "密码错误或文件损坏");
-        assert!(err
-            .log_error
-            .as_deref()
-            .is_some_and(|m| m.contains("密码错误")));
+        assert!(
+            err.log_error
+                .as_deref()
+                .is_some_and(|m| m.contains("密码错误"))
+        );
 
         // 结构被破坏（salt 长度非法：8 字节零的 base64）→ decrypt / corrupted
         let mut broken: Value = serde_json::from_str(&envelope).unwrap();
@@ -1202,10 +1211,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.stage, "decrypt");
         assert_eq!(err.reason, Some("corrupted"));
-        assert!(err
-            .log_error
-            .as_deref()
-            .is_some_and(|m| m.contains("文件损坏")));
+        assert!(
+            err.log_error
+                .as_deref()
+                .is_some_and(|m| m.contains("文件损坏"))
+        );
 
         // 正确密码 → 标准合并流程
         let p = prepare_import(

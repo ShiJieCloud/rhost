@@ -16,10 +16,10 @@
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use pbkdf2::pbkdf2_hmac_array;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::fmt;
 use zeroize::Zeroizing;
@@ -171,8 +171,8 @@ pub fn seal_envelope(plain_json: &str, password: &str) -> Result<String, String>
 /// - 面向用户的统一/具体文案（[`DecryptError::user_message`]，IPC 直接透传）；
 /// - 失败类别（[`DecryptFail`]），调用方仅用于本地日志细分，不返回前端。
 pub fn open_envelope(envelope_json: &str, password: &str) -> Result<String, DecryptError> {
-    let doc: Value = serde_json::from_str(envelope_json)
-        .map_err(|e| format!("加密文件格式错误: {e}"))?;
+    let doc: Value =
+        serde_json::from_str(envelope_json).map_err(|e| format!("加密文件格式错误: {e}"))?;
     let meta = doc
         .get("meta")
         .and_then(Value::as_object)
@@ -203,9 +203,7 @@ pub fn open_envelope(envelope_json: &str, password: &str) -> Result<String, Decr
 
     let salt = b64_decode(meta_str(meta, "salt")?)?;
     if salt.len() != SALT_LEN {
-        return Err(DecryptError::corrupted(
-            "加密文件格式错误：salt 长度非法",
-        ));
+        return Err(DecryptError::corrupted("加密文件格式错误：salt 长度非法"));
     }
     let iv = b64_decode(meta_str(meta, "iv")?)?;
     if iv.len() != NONCE_LEN {
@@ -223,9 +221,8 @@ pub fn open_envelope(envelope_json: &str, password: &str) -> Result<String, Decr
         .decrypt(Nonce::from_slice(&iv), ciphertext.as_slice())
         .map_err(|_| DecryptError::bad_password())?;
 
-    String::from_utf8(plain).map_err(|e| {
-        DecryptError::corrupted(format!("解密内容不是合法 UTF-8 文本: {e}"))
-    })
+    String::from_utf8(plain)
+        .map_err(|e| DecryptError::corrupted(format!("解密内容不是合法 UTF-8 文本: {e}")))
 }
 
 fn meta_str<'a>(meta: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str, String> {

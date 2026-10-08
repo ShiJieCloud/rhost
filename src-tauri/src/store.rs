@@ -382,7 +382,10 @@ mod merge_tests {
         assert_eq!(r.hosts.len(), 3);
         assert_eq!(r.added, 2);
         assert_eq!(r.renamed, 0);
-        assert_eq!(r.id_map, vec![("b".into(), "b".into()), ("c".into(), "c".into())]);
+        assert_eq!(
+            r.id_map,
+            vec![("b".into(), "b".into()), ("c".into(), "c".into())]
+        );
         // 导入项 keyPath 强制清空（存量项在另一个用例验证）
         assert!(r.hosts[1..].iter().all(|h| h.key_path.is_none()));
     }

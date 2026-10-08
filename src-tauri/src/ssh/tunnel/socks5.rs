@@ -252,7 +252,11 @@ pub(crate) async fn negotiate(
         match tokio::net::lookup_host((host.as_str(), request.port)).await {
             Ok(addrs) => {
                 let addrs: Vec<_> = addrs.collect();
-                match addrs.iter().find(|sa| sa.is_ipv4()).or_else(|| addrs.first()) {
+                match addrs
+                    .iter()
+                    .find(|sa| sa.is_ipv4())
+                    .or_else(|| addrs.first())
+                {
                     Some(sa) => request.host = sa.ip().to_string(),
                     None => return Err(c.reject(reply::HOST_UNREACHABLE).await),
                 }

@@ -372,7 +372,12 @@ impl Hub {
         }
         let msg = truncate_chars(&input.msg, PANEL_MSG_MAX_BYTES);
         // target 与 event_id domain 同源（§4：domain 与 target 同源）
-        let target = input.event_id.split('.').next().unwrap_or("web").to_string();
+        let target = input
+            .event_id
+            .split('.')
+            .next()
+            .unwrap_or("web")
+            .to_string();
         self.log(AppLogEntry {
             seq: 0,
             ts: String::new(),
@@ -446,7 +451,9 @@ impl Hub {
             lost_because: None,
             from_seq: None,
         };
-        state.subscribers.retain(|sub| sub.send(batch.clone()).is_ok());
+        state
+            .subscribers
+            .retain(|sub| sub.send(batch.clone()).is_ok());
     }
 
     /// 三级背压落盘（§3 决策 4）
@@ -496,7 +503,12 @@ impl Hub {
         }
         *count += 1;
         drop(limiter);
-        eprintln!("[{}] [{}] {}", entry.level.to_uppercase(), entry.target, entry.msg);
+        eprintln!(
+            "[{}] [{}] {}",
+            entry.level.to_uppercase(),
+            entry.target,
+            entry.msg
+        );
     }
 
     /// janitor 5s 定时器回调：dropped 计数非零即产出 app.log.dropped
@@ -586,7 +598,11 @@ impl Hub {
 
         // 逐字段对比日志相关键，产出变更事件（配置键均非敏感，仍统一查表）
         let changes: Vec<(&str, String)> = [
-            ("logCollect", old.collect != new_cfg.collect, new_cfg.collect.to_string()),
+            (
+                "logCollect",
+                old.collect != new_cfg.collect,
+                new_cfg.collect.to_string(),
+            ),
             (
                 "logLevel",
                 old.level != new_cfg.level,
@@ -597,7 +613,11 @@ impl Hub {
                 old.max_lines != new_cfg.max_lines,
                 new_cfg.max_lines.to_string(),
             ),
-            ("logPersist", old.persist != new_cfg.persist, new_cfg.persist.to_string()),
+            (
+                "logPersist",
+                old.persist != new_cfg.persist,
+                new_cfg.persist.to_string(),
+            ),
             (
                 "logRotate",
                 old.rotate != new_cfg.rotate,

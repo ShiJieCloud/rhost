@@ -21,7 +21,15 @@ fn rule_port_out_of_range_rejected() {
     assert!(validate_rule(&rule("a", TunnelType::Local, 0, Some(("localhost", 80)))).is_err());
     // u16 上限即 65535 合法；>65535 由 u16 类型天然拒绝，此处验证下界
     assert!(validate_rule(&rule("b", TunnelType::Local, 1, Some(("localhost", 80)))).is_ok());
-    assert!(validate_rule(&rule("c", TunnelType::Local, 65535, Some(("localhost", 80)))).is_ok());
+    assert!(
+        validate_rule(&rule(
+            "c",
+            TunnelType::Local,
+            65535,
+            Some(("localhost", 80))
+        ))
+        .is_ok()
+    );
     // target 端口越界
     assert!(validate_rule(&rule("d", TunnelType::Local, 8080, Some(("localhost", 0)))).is_err());
 }
@@ -52,7 +60,13 @@ fn rule_illegal_host_chars_rejected() {
 fn rule_dynamic_must_not_carry_target() {
     assert!(validate_rule(&rule("a", TunnelType::Dynamic, 1080, None)).is_ok());
     assert!(
-        validate_rule(&rule("b", TunnelType::Dynamic, 1080, Some(("localhost", 80)))).is_err()
+        validate_rule(&rule(
+            "b",
+            TunnelType::Dynamic,
+            1080,
+            Some(("localhost", 80))
+        ))
+        .is_err()
     );
 }
 
