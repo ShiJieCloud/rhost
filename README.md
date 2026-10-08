@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/public/logo.svg" alt="Rhost Logo" width="160" />
+  <img src="https://cdn.jsdelivr.net/gh/ShiJieCloud/rhost@main/docs/public/logo.svg" alt="Rhost Logo" width="160" />
 </div>
 
 # Rhost
