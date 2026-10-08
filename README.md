@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="docs/public/logo.svg" alt="Rhost Logo" width="160" />
+</div>
+
 # Rhost
 > Cross-platform High-performance Remote Host Manager
 > 跨平台高性能远程主机管理器（SSH终端 + SFTP + 端口转发）
