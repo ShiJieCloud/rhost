@@ -62,6 +62,7 @@ export default defineConfig({
           { text: '开发指南', link: '/development' },
           { text: '架构与通信协议', link: '/architecture' },
           { text: '发版 Release notes 模板', link: '/guides/release-notes-template' },
+          { text: '触发发版流水线', link: '/guides/release-trigger' },
         ],
       },
       {

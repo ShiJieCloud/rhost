@@ -29,12 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v5 是最小 node24 major：v6 把 credentials 移出 .git/config，v7 默认阻止 fork-PR checkout，不越级
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0 # lastUpdated 依赖 git 提交历史
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        # v5 默认启用 package-manager cache，已用 cache: npm 显式指定不受影响
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm

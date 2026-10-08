@@ -27,7 +27,8 @@ jobs:
     timeout-minutes: 60  # 首次无缓存构建可能 30-60min，卡死时及时止损
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v5 是最小 node24 major：v6 把 credentials 移出 .git/config，v7 默认阻止 fork-PR checkout，不越级
+        uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -38,7 +39,8 @@ jobs:
           workspaces: src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        # v5 默认启用 package-manager cache，已用 cache: npm 显式指定不受影响
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -66,8 +68,9 @@ jobs:
           includeUpdaterJson: false
 
       # build 产物上传 workflow artifact；tag 触发时由 release job 下载后统一挂载到 Release
+      # upload-artifact 必须用 v6：v5 仍声明 node20，会被强制跑 Node 24 并报警告
       - name: Upload bundle artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bundles-${{ matrix.os }}
           path: |
@@ -90,21 +93,22 @@ jobs:
     steps:
       # 需完整历史供 conventional-changelog 解析 commit
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       # 为 npx conventional-changelog-cli 提供运行时；version 取自 frontend/package.json
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       # 下载所有平台 artifact，按 artifact 名解压到 <name>/ 子目录
+      # download-artifact 必须用 v7：与 upload-artifact v6 配对，v5 改变了单 artifact 下载路径
       - name: Download all bundle artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: bundles
           pattern: bundles-*
