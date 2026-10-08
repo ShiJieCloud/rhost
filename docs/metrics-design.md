@@ -268,7 +268,7 @@ const activeMetrics = computed(() => metricsMap.value.get(activeSessionId.value)
 2. **零新增攻击面**：复用已认证加密 SSH 通道，不开新端口、不存新凭据、不需要 sudo；所有数据源（procfs、df、nvidia-smi）均为普通用户只读。
 3. **零远端写入/残留**：脚本经 exec argv 传入（不像 `.ri-xxx` 需要落 /tmp），无临时文件；单次执行退出，sshd 回收；断连 channel close → SIGHUP/SIGPIPE，远端零残留（需 e2e 验证 `pgrep` 为空）。
 4. **防 argv 泄密**：进程名只取内核 comm，不读 `/proc/pid/cmdline`（`mysql -pxxx` 一类密钥不会出现在侧栏）。
-5. **渲染安全**：Vue `{{ }}` 插值自动转义，远端字符串（发行版名/挂载点/进程名）一律不使用 v-html。
+5. **渲染安全**：Vue <code v-pre>{{ }}</code> 插值自动转义，远端字符串（发行版名/挂载点/进程名）一律不使用 v-html。
 6. **信息出口**：指标只含系统统计；日志仅记录采集计数与耗时，不打 payload；错误不回显远端原始敏感内容。
 7. **自限反冲**：单飞 + 信号量 + 3s 超时 + 心跳 + CancellationToken 五重边界，慢主机/异常 sshd 不会拖垮 Rhost 或耗尽 fd。
 

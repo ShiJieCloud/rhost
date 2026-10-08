@@ -1,3 +1,5 @@
+::: v-pre
+
 # CI 三平台打包与发布设计方案
 
 > description: GitHub Actions 用 tauri-action 产出 macOS/Windows/Linux 安装包、softprops/action-gh-release 发布 Release 草稿的流水线设计
@@ -407,3 +409,5 @@ release job 的 `Create release draft` step 前加一步构建 body，并改用 
 - conventional-changelog 解析失败（commit 不规范）→ 生成空段，Release body 仅含「安装须知」前缀；回退：临时恢复 `generate_release_notes: true`；
 - 阶段 2 上线后若 changelog 质量差，可一键回滚 `release.yml` 到阶段 1 状态（git revert）；
 - `body_path` 与 `body` 不可同时生效（softprops v2 优先 `body_path`），切换时务必删旧 `body`。
+
+:::

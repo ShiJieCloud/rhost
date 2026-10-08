@@ -1,3 +1,5 @@
+::: v-pre
+
 # 发版 Release notes 模板
 
 > description: 发版时编写 GitHub Release body 的完整模板与字段说明，含 rhost 产物下载表、SHA256 校验、未签名提示与流水线自动段说明
@@ -168,3 +170,5 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 - Sigstore / cosign 制品签名：与 macOS/Windows 代码签名同属"未签名"现状，见 [ci-release-design.md §9](../explanation/design/ci-release-design.md) 签名/公证未决项；
 - macOS Intel (x86_64) 产物未提供，见 [ci-release-design.md §9](../explanation/design/ci-release-design.md)；
 - Homebrew / Scoop / cargo-binstall 等包管理器分发渠道未接入，待用户诉求后评估。
+
+:::
