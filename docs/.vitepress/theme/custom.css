@@ -1,0 +1,71 @@
+:root {
+  /* 项目主题色：终端绿（取自 logo.svg 与 QuickConnectView .qc-mark） */
+  --rhost-green: #3ddc84;
+  --rhost-green-rgb: 61, 220, 132;
+}
+
+/* 首页 hero logo：
+   1) 直接给 img 加 drop-shadow，沿 SVG 线条发光；
+   2) ::before 伪元素叠加径向光晕，强化"背后发光"视觉；
+   3) 呼吸动画：光晕强度循环变化，营造"心跳"质感 */
+.VPHero .image-container .VPImage,
+.VPHero .image-container img {
+  filter: drop-shadow(0 0 4px rgba(var(--rhost-green-rgb), 0.8));
+  animation: rhost-logo-breathe 3.6s ease-in-out infinite;
+}
+
+.VPHero .image-container {
+  position: relative;
+}
+
+.VPHero .image-container > * {
+  z-index: 1;
+}
+
+/* ::before 伪元素：径向光晕背景，跟随呼吸节奏同步脉动 */
+.VPHero .image-container::before {
+  content: "";
+  position: absolute;
+  inset: -12% -8%;
+  z-index: 0;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(var(--rhost-green-rgb), 0.35) 0%,
+    rgba(var(--rhost-green-rgb), 0.12) 10%,
+    transparent 70%
+  );
+  filter: blur(8px);
+  animation: rhost-logo-glow 3.6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes rhost-logo-breathe {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 4px rgba(var(--rhost-green-rgb), 0.5));
+  }
+  50% {
+    filter: drop-shadow(0 0 10px rgba(var(--rhost-green-rgb), 0.95));
+  }
+}
+
+@keyframes rhost-logo-glow {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+}
+
+/* 尊重无动画偏好 */
+@media (prefers-reduced-motion: reduce) {
+  .VPHero .image-container .VPImage,
+  .VPHero .image-container img,
+  .VPHero .image-container::before {
+    animation: none;
+  }
+}
