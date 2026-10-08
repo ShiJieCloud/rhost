@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macos%20%7C%20windows%20%7C%20linux-green)]()
-[![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)]()
+[![Rust](https://img.shields.io/badge/rust-1.90+-orange.svg)]()
 [![Tauri](https://img.shields.io/badge/tauri-2.0-purple.svg)]()
 
 **Rhost** 是一款基于 Rust + Tauri 2 开发的开源桌面远程主机管理工具，对标 FinalShell。
@@ -14,14 +14,14 @@
 - 🖥️ **多标签SSH终端**：同时打开多个远程会话，独立会话隔离管理
 - 📁 **内置SFTP文件管理器**：浏览目录、上传/下载、拖拽传输、修改文件权限
 - 🔗 **SSH跳板机 & 端口转发**：支持跳转主机、本地端口转发
-- 🔐 **安全凭证存储**：密码/私钥口令存入系统密钥环（Mac钥匙串 / Windows凭据管理器 / Linux密钥环），配置信息本地Sled持久化
+- 🔐 **安全凭证存储**：密码/私钥口令存入系统密钥环（Mac钥匙串 / Windows凭据管理器 / Linux密钥环），配置信息本地 JSON 文件持久化（`app_config.json` / `connections.json`）
 - 📂 **服务器分组管理**：主机分组、备注、快速连接、连接状态监控
 - ♻️ **连接保活 & 断线重连**：自动心跳检测，网络恢复自动重连
 - ⚡ **高性能二进制流**：Tauri IPC Channel 直接传输原始字节流，**无JSON、无Base64编码损耗**，UI永不阻塞
 - 🎨 **原生跨平台桌面**：基于Tauri，体积小、内存占用低，支持macOS / Windows / Linux
 
 ## 📐 技术架构
-- **后端**：Rust + Tokio + ssh2 + sled + tauri-plugin-keyring
+- **后端**：Rust + Tokio + russh + russh-sftp + keyring crate
   - 所有SSH阻塞IO全部放入`spawn_blocking`线程池，避免阻塞UI
   - 每个SSH会话绑定独立IPC Channel，数据流完全隔离
   - Rust层统一会话生命周期管理，防止内存泄漏
@@ -79,10 +79,10 @@ rhost/
 │   │   ├── ssh/          # SSH连接、PTY、保活
 │   │   ├── sftp/         # SFTP文件操作
 │   │   ├── tunnel/       # 跳板、端口转发
-│   │   ├── storage/      # Sled本地存储
+│   │   ├── storage/      # 本地配置与连接持久化
 │   │   ├── crypto/       # 系统密钥环封装
 │   │   └── utils/        # 通用工具与错误定义
-└── .github/workflows/    # CI自动打包脚本
+└── .github/workflows/    # CI 三平台打包与发布（release.yml）
 ```
 
 ## 📖 开发文档
