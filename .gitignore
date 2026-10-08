@@ -22,3 +22,6 @@ docs/.vitepress/cache
 .vscode/
 .trae/
 *.swp
+
+# Husky（_. 由 prepare 脚本生成，不入库）
+.husky/_/

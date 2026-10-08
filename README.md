@@ -99,6 +99,13 @@ rhost/
 4. 推送分支：`git push origin feature/xxx`
 5. 提交Pull Request
 
+### 📝 Commit 规范
+本项目采用 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/v1.0.0/) 规范，提交信息格式为 `type[(scope)]: description`：
+- `feat` 新功能 / `fix` 修复 / `docs` 文档 / `refactor` 重构 / `perf` 性能 / `test` 测试 / `chore` 杂务 / `style` 格式
+- description 用简明中文或英文，示例：`feat(tunnel): 支持实时流量统计`、`fix(ssh): 修复断线端口泄漏`
+
+仓库已配置 `commitlint` + `husky` 钩子，`git commit` 时自动校验 `commit-msg`，不符合规范会被拒绝；`CHANGELOG.md` 由 `conventional-changelog` 据此自动生成。
+
 ## ⚠️ 注意事项
 - 本项目为开源学习项目，**不提供任何担保**，生产环境使用请自行评估风险。
 - 服务器密码不会明文保存在本地数据库，全部交由操作系统密钥环安全存储。
