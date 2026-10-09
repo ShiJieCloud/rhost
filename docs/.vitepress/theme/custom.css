@@ -69,3 +69,44 @@
     animation: none;
   }
 }
+
+/* 首页「界面预览」截图展示区 */
+.screenshot-main {
+  margin: 16px 0 24px;
+  text-align: center;
+}
+.screenshot-main img,
+.screenshot-row img {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--vp-border-color);
+  transition: border-color 0.25s;
+}
+.screenshot-main img:hover,
+.screenshot-row img:hover {
+  border-color: rgba(var(--rhost-green-rgb), 0.6);
+}
+.screenshot-main p,
+.screenshot-row .shot p {
+  margin: 0;
+}
+.screenshot-main p:not(:has(img)),
+.screenshot-row .shot p:not(:has(img)) {
+  margin-top: 10px;
+  color: var(--vp-text-color-2);
+  font-size: 0.9em;
+}
+.screenshot-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+  margin-bottom: 24px;
+}
+.screenshot-row .shot {
+  text-align: center;
+}
+@media (max-width: 768px) {
+  .screenshot-row {
+    grid-template-columns: 1fr;
+  }
+}
