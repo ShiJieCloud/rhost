@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="#-快速开始">快速开始</a> · <a href="docs/index.md">文档</a> · <a href="CHANGELOG.md">更新日志</a>
+  <a href="https://shijiecloud.github.io/rhost/" target="_blank">📖 在线文档</a> · <a href="#-快速开始">快速开始</a> · <a href="CHANGELOG.md">更新日志</a>
 </p>
 
 ---
