@@ -147,13 +147,6 @@ rhost/
 │       ├── release.yml            #   三平台打包与发布
 │       └── docs.yml               #   文档站构建与部署
 ├── docs/                          # VitePress 文档站
-│   ├── .vitepress/                #   配置、主题、缓存与产物
-│   ├── public/                    #   静态资源（logo）
-│   ├── explanation/design/        #   设计方案与架构决策
-│   ├── guides/                    #   操作指南
-│   ├── architecture.md            #   架构与通信协议
-│   ├── development.md             #   开发指南与编码规范
-│   └── ...                        #   各功能模块设计文档
 ├── docker/
 │   └── debian-sshd/               # MOTD 全功能测试容器（端口 2223）
 ├── frontend/                      # Vue 3 前端
