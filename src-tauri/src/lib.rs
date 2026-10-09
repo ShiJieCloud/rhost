@@ -94,6 +94,9 @@ pub fn run() {
             // - Windows/Linux：decorations(false) 无边框，由前端在标题栏右侧自绘窗口控制按钮。
             //   title_bar_style / hidden_title / traffic_light_position 均为 macOS 专属 API，
             //   须 #[cfg] 隔离以免他平台编译失败。
+            // macOS 专属 cfg 块内会对 builder 重新赋值，仅该平台需要 mut；
+            // 非 macOS 平台不重赋值，须压制 unused_mut 警告
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut window_builder = WebviewWindowBuilder::new(
                 app,
                 "main",
