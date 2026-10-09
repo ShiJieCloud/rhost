@@ -1,6 +1,9 @@
 ## 安装须知（产物未签名）
-- **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
-- **Windows**：SmartScreen 选「仍要运行」
-- **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
+> ⚠️ **重要说明**：当前版本所有发布产物均未做代码签名与公证，部分系统会触发安全拦截。签名/公证优化为后续迭代事项，详见设计文档 §7。
 
-签名/公证为后续独立事项，详见设计文档 §7。
+| 运行平台 | 安装包格式 | 常见问题 | 解决方案 / 安装命令 |
+| ---- | ---- | ---- | ---- |
+| **macOS** | .dmg | 提示「"rhost" 已损坏，无法打开」，右键打开无效 | `xattr -dr com.apple.quarantine /Applications/rhost.app`<br>执行命令移除系统隔离属性后即可正常启动 |
+| **Windows** | .zip / .exe | SmartScreen 安全拦截弹窗 | 弹窗中选择「仍要运行」即可正常安装/运行 |
+| **Linux** | AppImage | 无法双击运行、权限不足 | `chmod +x 文件名.AppImage` 赋予可执行权限后运行 |
+| **Linux** | .deb / .rpm | 无默认安装方式 | 使用系统对应包管理器常规安装即可 |

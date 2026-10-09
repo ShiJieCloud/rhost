@@ -4,7 +4,7 @@
 
 > description: GitHub Actions 用 tauri-action 产出 macOS/Windows/Linux 安装包、softprops/action-gh-release 发布 Release 草稿的流水线设计
 > 创建时间：2026-10-08 09:28:16
-> 更新时间：2026-10-08 16:10:24
+> 更新时间：2026-10-09 09:23:07
 > 作者：
 
 ---
@@ -26,7 +26,7 @@
 必须遵守的既有项目约束：
 
 - 前端包管理器为 **npm**（`frontend/package-lock.json` 为准；根目录 `pnpm-workspace.yaml` 仅是 `allowBuilds` 残留，忽略）；
-- `tauri.conf.json` 的 `bundle.targets: "all"`、`version: "0.1.0"`；根 `package.json` 是 docs 站点专用，与构建无关；
+- `tauri.conf.json` 的 `bundle.targets: "all"`、`version: "1.0.0"`；根 `package.json` 是 docs 站点专用，与构建无关；
 - 窗口由 `lib.rs` 代码创建（`WebviewWindowBuilder`），CI 无头环境可正常构建；
 - 当前为 ad-hoc 签名（无签名 identity），CI 产物同样未签名——见 §7 与非目标。
 
@@ -92,6 +92,7 @@ dispatch ────┘                 │
 ```yaml
 # 三平台打包与发布：tag v* → Release 草稿；手动触发 → 仅产物（无 Release）
 # 产物未签名（ad-hoc）：macOS 从浏览器下载的 dmg 装好后若提示「"rhost" 已损坏，无法打开」，运行 xattr -dr com.apple.quarantine 移除隔离属性后再打开（右键打开对此错误无效）；Windows/Linux 有 SmartScreen/未知来源提示
+# Release body 由 release-body-prefix.md（安装须知）+ conventional-changelog 最新段拼接，关闭 generate_release_notes（ci-release-design §10 阶段2）
 name: Build & Release
 
 on:
@@ -118,7 +119,8 @@ jobs:
     timeout-minutes: 60  # 首次无缓存构建可能 30-60min，卡死时及时止损
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v5 是最小 node24 major：v6 把 credentials 移出 .git/config，v7 默认阻止 fork-PR checkout，不越级
+        uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -129,7 +131,8 @@ jobs:
           workspaces: src-tauri
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        # v5 默认启用 package-manager cache，已用 cache: npm 显式指定不受影响
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -157,8 +160,9 @@ jobs:
           includeUpdaterJson: false
 
       # build 产物上传 workflow artifact；tag 触发时由 release job 下载后统一挂载到 Release
+      # upload-artifact 必须用 v6：v5 仍声明 node20，会被强制跑 Node 24 并报警告
       - name: Upload bundle artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bundles-${{ matrix.os }}
           path: |
@@ -171,32 +175,58 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: warn
 
-  # 仅 tag 触发执行：等三平台 build 全绿后下载全部 artifact 并创建 Release 草稿
+  # 仅 tag 触发执行：等三平台 build 全绿后下载全部 artifact，
+  # 用 conventional-changelog 最新段 + 安装须知前缀拼接 Release body，创建草稿
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # 需完整历史供 conventional-changelog 解析 commit
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # 为 npx conventional-changelog-cli 提供运行时；version 取自 frontend/package.json
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       # 下载所有平台 artifact，按 artifact 名解压到 <name>/ 子目录
+      # download-artifact 必须用 v7：与 upload-artifact v6 配对，v5 改变了单 artifact 下载路径
       - name: Download all bundle artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: bundles
           pattern: bundles-*
 
+      # 拼接 Release body：安装须知前缀 + 分隔线 + CHANGELOG 最新段
+      # --pkg frontend/package.json 让版本号取 1.0.0；--tag-prefix v 按 v* tag 切段
+      - name: Build release body
+        run: |
+          npx --yes conventional-changelog-cli@latest -p angular \
+            --pkg frontend/package.json --tag-prefix 'v' --release-count 1 \
+            -o changelog-latest.md
+          cat .github/release-body-prefix.md > release-body.md
+          printf '\n---\n\n' >> release-body.md
+          cat changelog-latest.md >> release-body.md
+          echo '--- release-body.md ---'
+          cat release-body.md
+
       # 统一创建 Release 草稿，glob 挂载分发产物（.app 目录不挂载，用户应下 dmg）
-      # body 写"安装须知"前缀；generate_release_notes 让 GitHub 自动追加 changelog（上次 tag → 本次 tag 的 PR/commit diff）
+      # softprops v2 优先 body_path；不再使用 generate_release_notes 与 body
       - name: Create release draft
         uses: softprops/action-gh-release@v2
         with:
           name: Rhost ${{ github.ref_name }}
           draft: true
           prerelease: false
-          generate_release_notes: true
+          body_path: release-body.md
           files: |
             bundles/**/*.dmg
             bundles/**/*.msi
@@ -204,15 +234,6 @@ jobs:
             bundles/**/*.deb
             bundles/**/*.rpm
             bundles/**/*.AppImage
-          body: |
-            ## 安装须知（产物未签名）
-            - **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
-            - **Windows**：SmartScreen 选「仍要运行」
-            - **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
-
-            签名/公证为后续独立事项，详见设计文档 §7。
-
-            ---
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -227,8 +248,10 @@ jobs:
 | `projectPath: src-tauri` | action 以该目录定位 `tauri.conf.json`；`beforeBuildCommand` 的 `cwd: ../frontend` 相对解析不变 |
 | build → release 两段式 | build 仅构建+上传 artifact；release `needs: build` 全绿后才创建草稿，避免单平台失败导致草稿只挂部分产物被误判为"全部就绪" |
 | build `tagName: ''` | 空串让 tauri-action 跳过内置发布步骤，发布权交给 release job 的 `softprops/action-gh-release@v2`，单一职责 |
-| `softprops/action-gh-release@v2` | 比 tauri-action 内置发布更可控；`files` 用 glob 只挂分发产物（dmg/msi/exe/deb/rpm/AppImage），排除 `.app` 目录 |
-| `generate_release_notes: true` | 调 GitHub API 自动生成 changelog（上次 tag → 本次 tag 的 PR/commit diff），追加到 body 之后；维护者无需手写说明，首次发版（无上一个 tag）会从首个 commit 生成 |
+| `softprops/action-gh-release@v2` | 比 tauri-action 内置发布更可控；`files` 用 glob 只挂分发产物（dmg/msi/exe/deb/rpm/AppImage），排除 `.app` 目录；`body_path` 指向拼接好的 release-body.md |
+| `body_path` + conventional-changelog | Release body 由 `.github/release-body-prefix.md`（安装须知）+ conventional-changelog 最新段拼接，单一来源；关闭 `generate_release_notes` 避免与 CHANGELOG.md 重复（详见 §10） |
+| release job `fetch-depth: 0` | 需完整 git 历史供 conventional-changelog 解析 commit message |
+| action 版本（checkout@v5 / setup-node@v5 / upload@v6 / download@v7） | v5 为最小 node24 major；upload v6/download v7 配对，v5 改变了单 artifact 下载路径 |
 | `concurrency: release-${{ github.ref }}` | 同一 tag/dispatch 不并发；dispatch 排队不取消，避免产物半成品；与 docs.yml 的 concurrency 风格一致 |
 | build `timeout-minutes: 60` | 首次无缓存构建可能 30-60min，卡死时及时止损，避免长时间占用 runner |
 | release `timeout-minutes: 10` | 仅下载+创建草稿，10min 足够 |
@@ -236,8 +259,8 @@ jobs:
 
 ### 6.3 产物与版本
 
-- 版本号来源于 `tauri.conf.json` 的 `version`（当前 `0.1.0`），文件名形如 `rhost_0.1.0_aarch64.dmg`、`rhost_0.1.0_x64-setup.exe`、`rhost_0.1.0_amd64.deb`；
-- 发版流程：三处 version 对齐 → 提交 → `git tag v0.1.0 && git push origin v0.1.0` → Actions 生成草稿 → 人工补说明发布；
+- 版本号来源于 `tauri.conf.json` 的 `version`（当前 `1.0.0`），文件名形如 `rhost_1.0.0_aarch64.dmg`、`rhost_1.0.0_x64-setup.exe`、`rhost_1.0.0_amd64.deb`；
+- 发版流程：三处 version 对齐 → 提交 → `git tag v1.0.0 && git push origin v1.0.0` → Actions 生成草稿 → 人工核对发布；
 - tag 与 `tauri.conf.json` version 不一致时以 conf 为准（产物名按 conf 版本），发布前人工核对。
 
 ### 6.4 产物命名规范
@@ -249,30 +272,30 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 | 字段 | 来源 | 取值 | 备注 |
 |---|---|---|---|
 | 产品名段 | `tauri.conf.json` → `productName` | `rhost`（全小写） | 已固化，禁止改为 `Rhost`/`RHOST`，否则所有产物名连带变更 |
-| 版本段 | `tauri.conf.json` → `version` | `0.1.0`（语义化版本） | 禁止从 tag 字符串解析版本号；tag 必须与 conf 对齐（见 §6.3） |
+| 版本段 | `tauri.conf.json` → `version` | `1.0.0`（语义化版本） | 禁止从 tag 字符串解析版本号；tag 必须与 conf 对齐（见 §6.3） |
 | 架构段 | Tauri 按 runner 自动注入 | `aarch64` / `x64` / `amd64` / `x86_64` | 各平台格式不同，见下表 |
 | OS 段 | 不注入 | — | dmg/msi/exe/deb/rpm/AppImage 后缀已天然区分 OS，无需再追加 OS 段 |
 
 **各平台产物命名（Tauri 默认，不可重命名）：**
 
-| 平台 | 格式 | 示例（v0.1.0, arm64/x64） | Release 是否挂载 |
+| 平台 | 格式 | 示例（v1.0.0, arm64/x64） | Release 是否挂载 |
 |---|---|---|---|
-| macOS | DMG | `rhost_0.1.0_aarch64.dmg` / `rhost_0.1.0_x64.dmg` | ✅ |
+| macOS | DMG | `rhost_1.0.0_aarch64.dmg` / `rhost_1.0.0_x64.dmg` | ✅ |
 | macOS | App bundle | `rhost.app`（目录，无版本/架构） | ❌（仅本地构建产物，release job 显式排除） |
-| Windows | NSIS | `rhost_0.1.0_x64-setup.exe` | ✅ |
-| Windows | MSI | `rhost_0.1.0_x64_en-US.msi` | ✅ |
-| Linux | Deb | `rhost_0.1.0_amd64.deb` | ✅ |
-| Linux | Rpm | `rhost_0.1.0.x86_64.rpm` | ✅ |
-| Linux | AppImage | `rhost_0.1.0_x64.AppImage` | ✅ |
+| Windows | NSIS | `rhost_1.0.0_x64-setup.exe` | ✅ |
+| Windows | MSI | `rhost_1.0.0_x64_en-US.msi` | ✅ |
+| Linux | Deb | `rhost_1.0.0_amd64.deb` | ✅ |
+| Linux | Rpm | `rhost_1.0.0.x86_64.rpm` | ✅ |
+| Linux | AppImage | `rhost_1.0.0_x64.AppImage` | ✅ |
 
 > 注：rpm 用 `.` 分隔版本与架构、deb 用 `amd64` 表示 x64、MSI 含语言段 `en-US`——均为 Tauri/bundler 默认行为，**不得手动重命名**。
 
 **Release 资产展示规则：**
 
 - Release 资产名保持 Tauri 默认输出，**禁止在 workflow 中重命名**；
-- Release 标题：`Rhost v0.1.0`（与 §6.1 release job 的 `name` 字段一致）；
-- Release body：前缀"安装须知（产物未签名）"由 workflow 写入，后缀 changelog 由 `generate_release_notes: true` 调 GitHub API 自动生成（基于上次 tag → 本次 tag 的 PR/commit diff）；维护者核对后直接发布，无需手写说明；
-- 预发布（pre-release）用 `v0.1.0-rc.1` 形式，conf `version` 同步为 `0.1.0-rc.1`，产物文件名随之变化。
+- Release 标题：`Rhost v1.0.0`（与 §6.1 release job 的 `name` 字段一致）；
+- Release body：由 `.github/release-body-prefix.md`（安装须知前缀）+ conventional-changelog 最新段拼接为 `release-body.md`，经 `body_path` 注入；维护者核对后直接发布，无需手写说明；
+- 预发布（pre-release）用 `v1.0.0-rc.1` 形式，conf `version` 同步为 `1.0.0-rc.1`，产物文件名随之变化。
 
 **命名规范的非目标：**
 
@@ -292,7 +315,7 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 
 - 语法与触发验证：workflow YAML 本地可用 `actionlint`（若有）或推送后看 Actions 解析结果；
 - 手动触发一轮：`workflow_dispatch` → 三平台 build job 全绿 → 下载 `bundles-*` artifact，核对三平台产物齐全（dispatch 不触发 release job，无 Release 草稿）；
-- tag 验证：打 `v0.1.0` → build 全绿 → release job 创建草稿、挂载 6-7 个分发产物（不含 `.app`）、自动生成 changelog → 维护者核对后直接发布；
+- tag 验证：打 `v1.0.0` → build 全绿 → release job 创建草稿、挂载 6-7 个分发产物（不含 `.app`）、body 含安装须知 + CHANGELOG 最新段 → 维护者核对后直接发布；
 - 冒烟：下载产物在本机安装启动（macOS arm64 可真机验证；Windows/Linux 产物至少确认文件完整可解包）。
 
 ## 9. 未决问题
@@ -301,12 +324,10 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 - macOS 签名/公证、Windows Authenticode：需要开发者账号与证书 secrets，发布对外正式版前评估；
 - e2e 测试入 CI（ubuntu runner 起 docker/debian-sshd 容器跑 `cargo test --test ssh_e2e`）与 PR 快速检查 job（`cargo check` + `vue-tsc`）——待构建流水线稳定后追加；
 - tauri-updater 自动更新通道（`autoUpdate`/`updateChannel` 设置项已预留但后端未实现）——另立设计；
-- README 措辞修订：`README.md` 第 85 行目录注释「.github/workflows/ CI 自动打包脚本」在流水线落地后改为准确表述（如「CI 三平台打包与发布」），避免与事实不符；
-- CHANGELOG.md 引入：见 §10 规划方案，落地后从本节移除。
 
-## 10. CHANGELOG.md 引入方案（规划）
+## 10. CHANGELOG.md 引入方案
 
-> 状态：规划中，未落地。本节展开 CHANGELOG.md 未决项，给出可执行方案与分阶段落地步骤；落地后此章即生效，§9 对应未决项关闭。
+> 状态：已落地。`CHANGELOG.md` 入库，`release.yml` release job 用 conventional-changelog 最新段 + `.github/release-body-prefix.md` 拼接 `body_path`，`generate_release_notes` 已关闭；§9 对应未决项已移除。
 
 ### 10.1 目标与非目标
 
@@ -396,13 +417,13 @@ release job 的 `Create release draft` step 前加一步构建 body，并改用 
 
 ### 10.6 落地检查清单
 
-- [ ] 根 `package.json` 加 `commitlint` + `husky`；
-- [ ] README 补 commit 规范说明；
-- [ ] 首次 `npx conventional-changelog -p angular -i CHANGELOG.md -s` 生成历史档案并提交；
-- [ ] 新增 `.github/release-body-prefix.md`；
-- [ ] `release.yml` release job 加 §10.5 阶段 2 步骤，改用 `body_path`；
-- [ ] 删除 `generate_release_notes: true` 与原 `body` 字段；
-- [ ] 验证：打测试 tag → 草稿 body 含「安装须知」+ CHANGELOG 最新段。
+- [x] 根 `package.json` 加 `commitlint` + `husky`；
+- [x] README 补 commit 规范说明；
+- [x] 首次 `npx conventional-changelog -p angular -i CHANGELOG.md -s` 生成历史档案并提交；
+- [x] 新增 `.github/release-body-prefix.md`；
+- [x] `release.yml` release job 加 §10.5 阶段 2 步骤，改用 `body_path`；
+- [x] 删除 `generate_release_notes: true` 与原 `body` 字段；
+- [x] 验证：打测试 tag → 草稿 body 含「安装须知」+ CHANGELOG 最新段。
 
 ### 10.7 风险与回退
 
