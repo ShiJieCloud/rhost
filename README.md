@@ -55,22 +55,22 @@
 ## 📸 截图
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/ShiJieCloud/rhost@main/docs/assets/workbench-main.png" alt="工作台全景" /><br/>
+  <img src="docs/assets/workbench-main.png" alt="工作台全景" /><br/>
   <sub>工作台全景：多标签终端 + MOTD 欢迎面板 + SFTP 文件管理 + 实时服务器监控</sub>
 </p>
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/ShiJieCloud/rhost@main/docs/assets/sftp.png" alt="SFTP 文件管理" /><br/>
+  <img src="docs/assets/sftp.png" alt="SFTP 文件管理" /><br/>
   <sub>SFTP 双栏文件管理：流式传输队列、断点续传、暂停 / 取消与文件校验</sub>
 </p>
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/ShiJieCloud/rhost@main/docs/assets/tunnel-pane.png" alt="端口转发" /><br/>
+  <img src="docs/assets/tunnel-pane.png" alt="端口转发" /><br/>
   <sub>可视化端口转发：本地 / 远程 / SOCKS5 规则，SSH 命令实时预览</sub>
 </p>
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/ShiJieCloud/rhost@main/docs/assets/quick-connect.png" alt="快速连接" /><br/>
+  <img src="docs/assets/quick-connect.png" alt="快速连接" /><br/>
   <sub>快速连接：输入 SSH 命令一键建立连接，内置示例与历史</sub>
 </p>
 
