@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { appWindow } from '../../lib/tauri'
+import { appWindow, detectPlatform } from '../../lib/tauri'
 import AppLogo from '../AppLogo.vue'
 import { showNewConn } from '../../stores/hosts'
 import { showSettings } from '../../stores/settings'
@@ -8,6 +8,9 @@ import {
   appView, dockVisible, inspectorVisible, openDock, searchTick, sidebarVisible, toggleDock,
 } from '../../stores/session'
 
+// macOS 由原生 Overlay 红绿灯渲染（左侧安全区）；Windows/Linux 前端自绘右侧窗口按钮
+const showWinCtrl = detectPlatform() !== 'macos'
+
 async function onClose() {
   ;(await appWindow())?.close()
 }
@@ -15,7 +18,8 @@ async function onMinimize() {
   ;(await appWindow())?.minimize()
 }
 async function onMaximize() {
-  ;(await appWindow())?.toggleMaximize()
+  const w = await appWindow()
+  await w?.toggleMaximize()
 }
 
 function onNew() {
@@ -51,14 +55,8 @@ function onSettings() {
 
 <template>
   <header class="titlebar wb" data-tauri-drag-region>
-    <!-- macOS 交通灯 -->
-    <div class="traffic">
-      <i class="t-red" title="关闭" @click="onClose"></i>
-      <i class="t-yellow" title="最小化" @click="onMinimize"></i>
-      <i class="t-green" title="最大化" @click="onMaximize"></i>
-    </div>
-
-    <!-- 品牌（点击返回首页；不参与窗口拖拽以接收点击） -->
+    <!-- 品牌（点击返回首页；不参与窗口拖拽以接收点击）。
+         macOS 下左侧安全区由 CSS 预留，避免与原生 Overlay 红绿灯重叠。 -->
     <div class="logo" title="返回首页" @click="goHome">
       <AppLogo />
       <span>Rhost</span>
@@ -127,5 +125,18 @@ function onSettings() {
     <button class="tb-btn" title="设置" @click="onSettings">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
     </button>
+
+    <!-- Windows/Linux：前端自绘窗口控制按钮（macOS 由原生 Overlay 红绿灯渲染） -->
+    <div v-if="showWinCtrl" class="winctl">
+      <button class="wc-btn" title="最小化" @click="onMinimize">
+        <svg viewBox="0 0 10 10"><path d="M0 5h10"/></svg>
+      </button>
+      <button class="wc-btn" title="最大化" @click="onMaximize">
+        <svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" fill="none"/></svg>
+      </button>
+      <button class="wc-btn wc-close" title="关闭" @click="onClose">
+        <svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg>
+      </button>
+    </div>
   </header>
 </template>

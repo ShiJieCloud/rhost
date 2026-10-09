@@ -78,10 +78,23 @@ pub fn run() {
                 .unwrap_or(true);
             let boot_script = format!(
                 "window.__RHOST_BOOT__={};",
-                serde_json::json!({ "splashTransparent": splash_transparent })
+                serde_json::json!({
+                    "splashTransparent": splash_transparent,
+                    // 同步注入运行平台（前端据此切换标题栏安全区与窗口控件渲染），
+                    // 取 std::env::consts::OS：macos / windows / linux
+                    "platform": std::env::consts::OS,
+                })
             );
             // 属性与原静态窗口定义保持一致；label 固定 "main"（capabilities/default.json 按此授权）
-            WebviewWindowBuilder::new(
+            // 跨平台标题栏策略：
+            // - macOS：decorations(true) + Overlay 标题栏样式 + hidden_title，原生红绿灯浮于
+            //   前端标题栏左侧；hidden_title 隐藏系统标题文字，避免与前端 logo 的 "Rhost"
+            //   重影。需 macOSPrivateApi(true)（tauri.conf.json）+ transparent 才能让标题栏
+            //   区域与内容融合（backdrop-filter 毛玻璃生效）。前端预留左侧安全区。
+            // - Windows/Linux：decorations(false) 无边框，由前端在标题栏右侧自绘窗口控制按钮。
+            //   title_bar_style / hidden_title / traffic_light_position 均为 macOS 专属 API，
+            //   须 #[cfg] 隔离以免他平台编译失败。
+            let mut window_builder = WebviewWindowBuilder::new(
                 app,
                 "main",
                 WebviewUrl::App("index.html".into()),
@@ -90,10 +103,20 @@ pub fn run() {
             .inner_size(1200.0, 760.0)
             .min_inner_size(940.0, 600.0)
             .resizable(true)
-            .decorations(false)
-            .transparent(true)
-            .initialization_script(&boot_script)
-            .build()?;
+            .decorations(cfg!(target_os = "macos"))
+            .transparent(cfg!(target_os = "macos"))
+            .initialization_script(&boot_script);
+
+            #[cfg(target_os = "macos")]
+            {
+                window_builder = window_builder
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    // 红绿灯位置：x 左边距，y 顶部偏移（逻辑像素）；y=0 紧贴顶部，越大越往下
+                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 24.0));
+            }
+
+            window_builder.build()?;
 
             // Hub 在窗口创建之后初始化：建窗不产生 applog，boot.start 仍是全局第一条日志
             let log_dir = match applog::init(app_cfg.logs_config(), app_config_file.clone()) {

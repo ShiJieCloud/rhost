@@ -46,34 +46,48 @@ body{
 }
 ::-webkit-scrollbar-thumb:hover{background:#2a3a4d;background-clip:content-box}
 /* ---------- 应用外壳 ---------- */
-.app{height:100vh;display:flex;flex-direction:column}
+.app{
+    height:100vh;display:flex;flex-direction:column;
+    /* 标题栏原生控件安全区：macOS 左侧为原生 Overlay 红绿灯预留；
+       Windows/Linux 右侧为自绘窗口按钮留出内边距。未知平台取常规内边距。 */
+    --tb-safe-left:14px;
+    --tb-safe-right:14px;
+}
+.app.platform-macos{--tb-safe-left:80px}
+.app.platform-windows,
+.app.platform-linux{--tb-safe-right:8px}
 /* ---------- 标题栏 ---------- */
 .titlebar{
-    height:46px;flex-shrink:0;
-    display:flex;align-items:center;padding:0 14px;
+    height:42px;flex-shrink:0;
+    display:flex;align-items:center;
+    padding:0 var(--tb-safe-right) 0 var(--tb-safe-left);
     background:rgba(11,16,23,.92);
     border-bottom:1px solid var(--border);
     backdrop-filter:blur(16px);
     position:relative;user-select:none;
 }
-.traffic{
-    display:flex;gap:8px;
-    position:absolute;left:14px;top:50%;
-    transform:translateY(-50%);z-index:2;
-}
-.traffic i{
-    width:11px;height:11px;border-radius:50%;
-    display:block;cursor:pointer;transition:filter .15s;
-}
-.traffic i:hover{filter:brightness(1.4)}
-.t-red{background:#ff5f57}
-.t-yellow{background:#febc2e}
-.t-green{background:#28c840}
 .titlebar h1{
     font-size:12.5px;font-weight:500;color:var(--text);
     text-align:center;flex:1;letter-spacing:.4px;
 }
 .titlebar h1 em{color:var(--green);font-style:normal;font-weight:600}
+/* Windows/Linux 前端自绘窗口控制按钮（macOS 由原生红绿灯渲染，不渲染此组） */
+.winctl{
+    display:flex;align-items:stretch;height:100%;flex-shrink:0;margin-left:4px;
+}
+.wc-btn{
+    width:46px;display:inline-flex;align-items:center;justify-content:center;
+    background:transparent;border:none;color:var(--text);
+    cursor:pointer;transition:background .12s,color .12s;
+}
+.wc-btn svg{
+    width:10px;height:10px;stroke:currentColor;fill:none;
+    stroke-width:1;stroke-linecap:round;stroke-linejoin:round;
+}
+.wc-btn:hover{background:rgba(255,255,255,.08)}
+.wc-btn:active{background:rgba(255,255,255,.14)}
+.wc-btn.wc-close:hover{background:#e81123;color:#fff}
+.wc-btn.wc-close:active{background:#c42b1c;color:#fff}
 /* ---------- 主体 ---------- */
 .workbench-root{display:flex;flex-direction:column;flex:1;min-height:0}
 .body{flex:1;display:flex;min-height:0}
@@ -1221,10 +1235,9 @@ body{
 .titlebar.wb{
     height:42px;
     gap:2px;
-    padding:0 10px;
 }
-.titlebar.wb .traffic{
-    position:static;transform:none;margin-right:8px;
+.titlebar.wb .winctl{
+    margin-left:6px;
 }
 .logo{
     display:flex;align-items:center;gap:8px;flex-shrink:0;

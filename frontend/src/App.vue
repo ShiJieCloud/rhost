@@ -17,6 +17,12 @@ import { loadHosts } from './stores/hosts'
 import { savedSettings } from './stores/settings'
 import { loadAppConfig } from './stores/appConfig'
 import { initGlobalErrorReporting, syncLogConfig } from './stores/applog'
+import { detectPlatform } from './lib/tauri'
+
+// 标题栏跨平台策略：根节点按平台挂 class，CSS 据此切换安全区方向
+// - platform-macos：左侧为原生红绿灯预留安全区（Overlay 模式）
+// - platform-windows / platform-linux：右侧渲染前端自绘窗口控制按钮
+const platformClass = `platform-${detectPlatform()}`
 
 // 工作台挂载闩锁：一旦进入过工作台就永久保持挂载（v-show 保活终端状态），
 // 即使关闭全部会话停留在空态也不卸载
@@ -66,7 +72,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="platformClass">
     <TitleBar v-if="appView === 'home'" />
     <WbTitleBar v-else />
     <HomeView v-show="appView === 'home'" />
