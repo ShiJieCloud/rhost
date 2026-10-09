@@ -1,10 +1,10 @@
 # 应用日志排查手册
 
-> 状态：与 `applog-design.md` 配套
+> status: 与 `applog-design.md` 配套
+>
 > 面向：开发者、测试、高级用户
+>
 > 前提：已按 `applog-design.md` 落地下文所述事件
-
----
 
 ## 1. 排查基础
 

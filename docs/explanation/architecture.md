@@ -1,11 +1,12 @@
 # Rhost 架构与通信协议
 
-> 状态：与 main 分支当前实现一致（2026-10-05）
-> 读者：首次接触本项目、需要快速理解系统如何运转的开发者
-> 范围：整体分层、前后端模块职责、IPC 协议、核心数据流、持久化与安全
-> 配套文档：环境搭建与编码规范见 [development.md](./development.md)；指标采集细节见 [metrics-design.md](./metrics-design.md)
-
----
+> status: 与 main 分支当前实现一致（2026-10-05）
+>
+> audience: 首次接触本项目、需要快速理解系统如何运转的开发者
+>
+> scope: 整体分层、前后端模块职责、IPC 协议、核心数据流、持久化与安全
+>
+> related: 环境搭建与编码规范见 [development.md](../guides/development.md)；指标采集细节见 [metrics-design.md](./design/metrics-design.md)
 
 ## 1. 项目简介
 

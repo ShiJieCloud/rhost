@@ -1,10 +1,10 @@
 # Rhost 文档规范
 
 > description: 约定 docs/ 四类文档分类、目录结构、命名、写作格式、模板与代码同步维护要求
-> 创建时间：2026-10-06 22:05:00
-> 更新时间：2026-10-06 23:34:18
-
----
+>
+> created: 2026-10-06 22:05:00
+>
+> updated: 2026-10-06 23:34:18
 
 ## 1. 目的
 
@@ -83,9 +83,12 @@ docs/
 # 应用日志（App Log）设计方案与规范
 
 > description: 应用日志的采集、缓冲、面板输出、持久化与轮转设计
-> 创建时间：2026-10-05 14:30:00
-> 更新时间：2026-10-05 14:30:00
-> 作者：
+>
+> created: 2026-10-05 14:30:00
+>
+> updated: 2026-10-05 14:30:00
+>
+> author:
 ```
 
 补充约定：
@@ -121,7 +124,7 @@ docs/
 8. **测试与验证**——单测、e2e、手工验证各自覆盖什么；
 9. **未决问题**——没有则显式写"无"；遗留项不得静默。
 
-可参考已落地的范例：[applog-design.md](../../applog-design.md)、[metrics-design.md](../../metrics-design.md)、[config-import-export.md](../../config-import-export.md)。
+可参考已落地的范例：[applog-design.md](./applog-design.md)、[metrics-design.md](./metrics-design.md)、[config-import-export-design.md](./config-import-export-design.md)。
 
 ## 8. ADR 架构决策记录
 
@@ -132,9 +135,11 @@ docs/
 ```markdown
 # ADR-NNN: 决策标题
 
-> 状态：提议 / 已采纳 / 已废弃 / 已被 ADR-NNN 替代
-> 创建时间：YYYY-MM-DD HH:mm:ss
-> 作者：
+> status: 提议 / 已采纳 / 已废弃 / 已被 ADR-NNN 替代
+>
+> created: YYYY-MM-DD HH:mm:ss
+>
+> author:
 
 ## 背景
 要解决的问题、约束条件、触发原因。

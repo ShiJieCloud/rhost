@@ -1,11 +1,12 @@
 # 右侧栏主机指标采集设计方案
 
-> 状态：P0–P4 已全部落地（2026-10-03）；100 会话压测、断连清理、Darwin 式无 procfs 降级均已 e2e/单测验证
+> status: P0–P4 已全部落地（2026-10-03）；100 会话压测、断连清理、Darwin 式无 procfs 降级均已 e2e/单测验证
+>
 > 日期：2026-10-03
-> 范围：工作台右侧栏（Inspector）全部远程主机指标的采集、传输、渲染与生命周期管理
+>
+> scope: 工作台右侧栏（Inspector）全部远程主机指标的采集、传输、渲染与生命周期管理
+>
 > 关联代码：`src-tauri/src/ssh/{session,frame,manager}.rs`、`src-tauri/src/motd/mod.rs`、`frontend/src/components/wb/Inspector.vue`、`frontend/src/stores/session.ts`
-
----
 
 ## 1. 设计目标与硬约束
 

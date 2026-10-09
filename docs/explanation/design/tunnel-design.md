@@ -1,19 +1,20 @@
 # SSH 端口转发设计方案
 
 > description: 本地转发 -L、远程转发 -R、动态转发 SOCKS5 -D 的引擎、持久化、状态协议与会话内管理界面设计
-> 创建时间：2026-10-07 18:37:33
-> 更新时间：2026-10-07 23:22:03
-> 作者：
+>
+> created: 2026-10-07 18:37:33
+>
+> updated: 2026-10-07 23:22:03
+>
+> author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
 ---
 
 章节目录：1. 设计目标与硬约束 · 2. 既有项目约束 · 3. 现状盘点与差距 · 4. 目标与非目标 · 5. 总体架构 · 6. 详细设计（规则模型 / 三模式引擎 / 状态帧 / IPC / 前端 / 重连 / 设置矩阵） · 7. 安全与降级 · 8. 测试与验证 · 9. 未决问题
 
----
-
 ## 1. 设计目标与硬约束
 
-> 范围：本文覆盖 SSH 端口转发三种模式——本地转发（`-L`）、远程转发（`-R`）、动态转发（`-D`，本地 SOCKS5 代理）——的后端转发引擎、规则持久化链路、前后端状态协议、会话内管理 UI、设置项消费与断线重连联动。
+> scope: 本文覆盖 SSH 端口转发三种模式——本地转发（`-L`）、远程转发（`-R`）、动态转发（`-D`，本地 SOCKS5 代理）——的后端转发引擎、规则持久化链路、前后端状态协议、会话内管理 UI、设置项消费与断线重连联动。
 > 边界：不覆盖跳板机（ProxyJump）、HTTP/SOCKS5 **外连代理**（连接 SSH 服务器本身时走的代理）、X11 转发、Unix domain socket（streamlocal）转发。
 > 术语约定：**面向用户的界面文案统一称「端口转发」**（主机配置卡片、设置分组、Dock 页签），与 RFC 4254 "TCP/IP Port Forwarding" 及 OpenSSH `-L/-R/-D` 术语一致；「隧道」仅作为搜索关键词与口语保留。代码标识符沿用英文 `tunnel`（`ssh/tunnel.rs`、`stores/tunnels.ts`、`tunnel*` 设置 key、帧常量），不做改名以免配置 schema 迁移。
 > 关联代码：新增 `src-tauri/src/ssh/tunnel.rs`；改 `src-tauri/src/ssh/{session.rs,manager.rs,mod.rs,frame.rs}`、`src-tauri/src/{ipc.rs,lib.rs}`；改 `frontend/src/stores/session.ts`、新增 `frontend/src/stores/tunnels.ts`、改 `frontend/src/components/wb/DockPanel.vue`、`frontend/src/style.css`。**前端规则编辑与持久化（`NewConnectionModal.vue`、`types.ts`、`hosts.ts`）已就绪，不在改动范围**。
@@ -36,14 +37,14 @@
 ## 2. 必须遵守的既有项目约束
 
 - `ssh/` 模块除 manager 外**不依赖 tauri**（`src-tauri/src/ssh/mod.rs` 头注释），转发引擎只使用 russh + tokio，可脱离 Tauri 单测/e2e；
-- 高频字节流走每会话独立 Channel 的自定义二进制帧，低频控制走 invoke/JSON；**禁止全局 Event 广播**（见 [architecture.md](../../architecture.md) §7）；
+- 高频字节流走每会话独立 Channel 的自定义二进制帧，低频控制走 invoke/JSON；**禁止全局 Event 广播**（见 [architecture.md](../architecture.md) §7）；
 - `ipc.rs` 是薄层：只做参数校验与转发，业务逻辑放 `ssh/`；新增 invoke 命令必须在 `src-tauri/src/lib.rs` 的 `invoke_handler!` 登记；
 - 前端组件不直接 invoke SSH 业务，统一经 stores 封装；高频整帧替换数据用 `shallowRef(new Map())` + `triggerRef`；
 - 后台任务全部挂 `CancellationToken`；共享数据一律 clone `Arc` 后释放锁，**禁止持锁 await**；
 - Rust 结构体 `#[serde(rename_all = "camelCase")]`；错误前缀即协议（如 `KEY_ENCRYPTED:`），不得改成普通文案；
 - **russh 错误判断必须基于 `russh::Error` 枚举变体匹配，禁止解析错误字符串做分支**——版本升级会改变错误文本，字符串匹配将导致重试/降级逻辑静默失效（§6.10 给出枚举白名单）；
 - 密码/私钥口令仅入系统钥匙串，绝不进入 `connections.json`、extra、日志；
-- 新增二进制帧类型必须同步 `frame.rs`、`stores/session.ts` 的 `FRAME_*`、[architecture.md](../../architecture.md) §7.2 帧表三处。
+- 新增二进制帧类型必须同步 `frame.rs`、`stores/session.ts` 的 `FRAME_*`、[architecture.md](../architecture.md) §7.2 帧表三处。
 
 ## 3. 现状盘点与差距
 
@@ -158,7 +159,7 @@ stores/session.ts 收帧 ──► tunnels.ts 快照 Map ──► DockPanel tun
 | `remote` 远程转发 | 远端监听 | 本地可达目标 | `ssh -R bindHost:bindPort:targetHost:targetPort` |
 | `dynamic` 动态转发 | 本地 SOCKS5 监听 | 无（按 SOCKS 请求动态决定） | `ssh -D bindHost:bindPort` |
 
-注意：表单 UI **允许同一端口配置多条规则**（如不同 bindHost），编辑器不做去重；端口冲突统一由引擎在启动时按 `tunnelPortConflict` 策略处理，见 §6.3。配置导入导出无需改动——`connections.json` 整体已在导出范围（见 [config-import-export.md](../../config-import-export.md) §5）。
+注意：表单 UI **允许同一端口配置多条规则**（如不同 bindHost），编辑器不做去重；端口冲突统一由引擎在启动时按 `tunnelPortConflict` 策略处理，见 §6.3。配置导入导出无需改动——`connections.json` 整体已在导出范围（见 [config-import-export-design.md](./config-import-export-design.md) §5）。
 
 ### 6.2 后端模块 `ssh/tunnel.rs`
 
@@ -362,7 +363,7 @@ loop {
 |---|---|---|---|
 | `0x0A` | Tunnel | JSON `{"tunnels":[TunnelStatus,...]}`，**全量快照** | **状态跃迁**（Starting→Active/Error/Stopped）即时推送，不做节流；仅**活动连接数 / 流量数值**变化走 1s 节流合并 |
 
-推送双通道：**状态跃迁**（start/stop/error 路径）在操作点直接推帧，即时到达；**连接数/流量**变化只置脏标记，由 `TunnelManager` 内的状态任务 `tokio::time::interval(STATUS_THROTTLE)` 醒来检查，有脏则清标记并推全量快照，无变化不推。规则总数上限 32，全量 JSON 成本可忽略，换取前端无合并逻辑。前端 `stores/session.ts` 增加 `FRAME_TUNNEL = 0x0A` 分发到 `stores/tunnels.ts` 的 `handleTunnelFrame(sessionId, json)`，以 `shallowRef(new Map())` 整帧替换。实现时同步登记 [architecture.md](../../architecture.md) §7.2 帧表。
+推送双通道：**状态跃迁**（start/stop/error 路径）在操作点直接推帧，即时到达；**连接数/流量**变化只置脏标记，由 `TunnelManager` 内的状态任务 `tokio::time::interval(STATUS_THROTTLE)` 醒来检查，有脏则清标记并推全量快照，无变化不推。规则总数上限 32，全量 JSON 成本可忽略，换取前端无合并逻辑。前端 `stores/session.ts` 增加 `FRAME_TUNNEL = 0x0A` 分发到 `stores/tunnels.ts` 的 `handleTunnelFrame(sessionId, json)`，以 `shallowRef(new Map())` 整帧替换。实现时同步登记 [architecture.md](../architecture.md) §7.2 帧表。
 
 会话断开时前端清空该会话快照（与 metrics 等会话态处理一致）。
 

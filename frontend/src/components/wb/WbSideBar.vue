@@ -39,7 +39,6 @@ const groups = computed(() => {
           :class="{ active: activeSession?.host.id === h.id }"
           @click="openSession(h.id)"
         >
-          <span class="dot" :class="h.status === 'offline' ? 'offline' : h.status === 'warn' ? 'warn' : 'online'"></span>
           <div class="host-info">
             <div class="host-name">{{ h.id }}</div>
             <div class="host-meta">{{ h.user }}@{{ h.ip }}:{{ h.port }}</div>

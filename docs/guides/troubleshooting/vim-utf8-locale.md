@@ -1,10 +1,10 @@
 # Vim 中文显示 / 保存编码问题排查与修复
 
-> 状态：已落地（2026-10-06）
+> status: 已落地（2026-10-06）
+>
 > 面向：开发者、测试、遇到远端编辑器中文乱码的高级用户
+>
 > 涉及代码：`src-tauri/src/ssh/session.rs`、`frontend/src/stores/settings.ts`
-
----
 
 ## 1. 问题现象
 

@@ -3,15 +3,16 @@
 # CI 三平台打包与发布设计方案
 
 > description: GitHub Actions 用 tauri-action 产出 macOS/Windows/Linux 安装包、softprops/action-gh-release 发布 Release 草稿的流水线设计
-> 创建时间：2026-10-08 09:28:16
-> 更新时间：2026-10-09 09:23:07
-> 作者：
-
----
+>
+> created: 2026-10-08 09:28:16
+>
+> updated: 2026-10-09 09:23:07
+>
+> author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
 ## 1. 设计目标与硬约束
 
-> 范围：本文覆盖 GitHub Actions 构建流水线——三平台安装包产物、tag 触发的 Release 发布、手动触发产物下载。
+> scope: 本文覆盖 GitHub Actions 构建流水线——三平台安装包产物、tag 触发的 Release 发布、手动触发产物下载。
 > 边界：不覆盖代码签名与公证（macOS Developer ID / Windows 证书）、自动更新（tauri-updater）、e2e 测试入 CI、PR 触发的快速检查 job（后续可选）。
 > 关联代码：`.github/workflows/release.yml`（新建）、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`frontend/package.json`、`.github/workflows/docs.yml`（写法参考）
 
@@ -327,7 +328,7 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 
 ## 10. CHANGELOG.md 引入方案
 
-> 状态：已落地。`CHANGELOG.md` 入库，`release.yml` release job 用 conventional-changelog 最新段 + `.github/release-body-prefix.md` 拼接 `body_path`，`generate_release_notes` 已关闭；§9 对应未决项已移除。
+> status: 已落地。`CHANGELOG.md` 入库，`release.yml` release job 用 conventional-changelog 最新段 + `.github/release-body-prefix.md` 拼接 `body_path`，`generate_release_notes` 已关闭；§9 对应未决项已移除。
 
 ### 10.1 目标与非目标
 

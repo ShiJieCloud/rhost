@@ -1,12 +1,14 @@
 # 应用配置导入导出设计方案
 
-> 状态：设计定稿，待落地
+> status: 设计定稿，待落地
+>
 > 日期：2026-10-06
-> 范围：Rhost 全量应用配置（主机连接、应用设置、SSH 密钥元数据、分组、UI 状态等）的导出为文件与从文件恢复
+>
+> scope: Rhost 全量应用配置（主机连接、应用设置、SSH 密钥元数据、分组、UI 状态等）的导出为文件与从文件恢复
+>
 > 关联代码：`src-tauri/src/store.rs`、`src-tauri/src/applog/persisted.rs`、`src-tauri/src/ipc.rs`、`frontend/src/stores/settings.ts`、`frontend/src/stores/hosts.ts`、`frontend/src/stores/keys.ts`、`frontend/src/stores/groups.ts`、`frontend/src/stores/session.ts`、`frontend/src/components/SettingsModal.vue`
+>
 > 边界：**本文档只覆盖应用配置**（可复现运行环境所需的数据与设置）。终端会话录制文件、日志文件、SFTP 传输历史等体积大或时效性强的数据不纳入导出范围。**主机密钥信任库 `known_hosts.json` 也不纳入**（本机 TOFU 运行态数据，换机后应重新首连确认，见 §5 与 `hostkey-verification-design.md` §4）。
-
----
 
 ## 1. 设计目标与约束
 

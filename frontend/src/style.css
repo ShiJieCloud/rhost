@@ -54,6 +54,8 @@ body{
     --tb-safe-right:14px;
 }
 .app.platform-macos{--tb-safe-left:80px}
+/* macOS 原生全屏后红绿灯隐藏，取消左侧预留避免 logo 前留白 */
+.app.platform-macos.is-fullscreen{--tb-safe-left:14px}
 .app.platform-windows,
 .app.platform-linux{--tb-safe-right:8px}
 /* ---------- 标题栏 ---------- */
@@ -384,19 +386,6 @@ body{
     font-size:10px;color:var(--muted-2);
     margin-top:3px;letter-spacing:.2px;
 }
-.view-card .proj-status{
-    display:flex;align-items:center;gap:6px;
-    font-size:9.5px;color:var(--muted);flex-shrink:0;
-}
-.view-card .proj-status .sdot{
-    width:6px;height:6px;border-radius:50%;
-    background:var(--green);box-shadow:0 0 7px rgba(61,220,132,.65);
-}
-.view-card .proj-status.offline .sdot{background:#37424f;box-shadow:none}
-.view-card .proj-status.idle .sdot{background:#42505f;box-shadow:none}
-.view-card .proj-status.warn .sdot{
-    background:var(--yellow);box-shadow:0 0 7px rgba(229,181,103,.55);
-}
 .view-card .proj-divider{height:1px;background:var(--border-soft);margin:0 0 11px}
 .view-card .proj-kv{
     display:flex;justify-content:space-between;gap:10px;
@@ -458,16 +447,6 @@ body{
     font-size:9.5px;color:var(--muted-2);
     margin-top:3px;letter-spacing:.2px;
 }
-.view-grid .proj-status{
-    position:absolute;top:9px;right:9px;
-    width:6px;height:6px;border-radius:50%;
-    background:var(--green);box-shadow:0 0 7px rgba(61,220,132,.65);
-}
-.view-grid .proj-status.offline{background:#37424f;box-shadow:none}
-.view-grid .proj-status.idle{background:#42505f;box-shadow:none}
-.view-grid .proj-status.warn{
-    background:var(--yellow);box-shadow:0 0 7px rgba(229,181,103,.55);
-}
 .view-grid .proj-actions{
     display:none;
     position:absolute;top:5px;right:5px;z-index:2;
@@ -476,7 +455,6 @@ body{
     backdrop-filter:blur(4px);
 }
 .view-grid .project-item:hover .proj-actions{display:flex}
-.view-grid .project-item:hover .proj-status{opacity:0}
 .view-grid .proj-act{width:20px;height:20px;border-radius:5px}
 .view-grid .proj-act svg{width:11px;height:11px}
 /* ---------- 风格 4：紧凑视图 ---------- */
@@ -521,34 +499,6 @@ body{
     color:var(--muted);
     border:1px solid var(--border-soft);
     letter-spacing:.3px;flex-shrink:0;
-}
-.view-compact .proj-status{
-    display:flex;align-items:center;gap:6px;
-    font-size:9.5px;color:var(--muted-2);
-    flex-shrink:0;width:52px;justify-content:flex-end;
-}
-.view-compact .proj-status .sdot{
-    width:5px;height:5px;border-radius:50%;
-    background:var(--green);box-shadow:0 0 6px rgba(61,220,132,.6);
-}
-.view-compact .proj-status.offline .sdot{background:#37424f;box-shadow:none}
-.view-compact .proj-status.idle .sdot{background:#42505f;box-shadow:none}
-.view-compact .proj-status.warn .sdot{
-    background:var(--yellow);box-shadow:0 0 6px rgba(229,181,103,.55);
-}
-/* 列表视图状态点 */
-.view-list .proj-status{
-    display:flex;align-items:center;gap:6px;
-    font-size:9.5px;color:var(--muted);flex-shrink:0;
-}
-.view-list .proj-status .sdot{
-    width:6px;height:6px;border-radius:50%;
-    background:var(--green);box-shadow:0 0 7px rgba(61,220,132,.65);
-}
-.view-list .proj-status.offline .sdot{background:#37424f;box-shadow:none}
-.view-list .proj-status.idle .sdot{background:#42505f;box-shadow:none}
-.view-list .proj-status.warn .sdot{
-    background:var(--yellow);box-shadow:0 0 7px rgba(229,181,103,.55);
 }
 /* ---------- 通用：色板 ---------- */
 .icon-green{

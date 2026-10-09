@@ -1,6 +1,7 @@
 # 启动动画（Splash）设计方案
 
-> 状态：已落地（2026-10-06）
+> status: 已落地（2026-10-06）
+>
 > 关联文档：`docs/applog-design.md`（生命周期事件）、`docs/architecture.md`
 
 ## 1. 目标与非目标

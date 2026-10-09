@@ -1,12 +1,14 @@
 # 应用日志（App Log）设计方案与规范
 
-> 状态：设计定稿，待落地（2026-10-05）
+> status: 设计定稿，待落地（2026-10-05）
+>
 > 日期：2026-10-05
-> 范围：Rhost 应用自身运行日志的采集、过滤、内存缓冲、底部面板输出、磁盘持久化与轮转清理
+>
+> scope: Rhost 应用自身运行日志的采集、过滤、内存缓冲、底部面板输出、磁盘持久化与轮转清理
+>
 > 关联代码：`src-tauri/src/lib.rs`、`src-tauri/src/ipc.rs`、`frontend/src/stores/settings.ts`（log* 字段）、`frontend/src/components/SettingsModal.vue`（日志 tab）、`frontend/src/components/wb/DockPanel.vue`（日志面板，当前为 mock）
+>
 > 边界：**本文档只覆盖应用日志**（Rhost 客户端自己的运行事件）。终端会话录制（PTY 输出落盘）是另一独立特性，不复用本管线的任何字段与目录。
-
----
 
 ## 1. 设计目标与硬约束
 

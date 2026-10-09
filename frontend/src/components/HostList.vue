@@ -6,19 +6,8 @@ import { closeSession, openSession } from '../stores/session'
 import { COLOR_MAP } from '../data/mockHosts'
 import type { Host } from '../types'
 
-function statusInfo(h: Host) {
-  if (h.status === 'idle') return { cls: 'idle', text: '未连接' }
-  if (h.status === 'offline') return { cls: 'offline', text: '离线' }
-  if (h.status === 'warn') return { cls: 'warn', text: '告警' }
-  return { cls: '', text: '在线' }
-}
-
 function onConnect(h: Host) {
-  if (h.status === 'offline') {
-    toast(`主机 ${h.id} 处于离线状态，无法连接`, 'err', 2400)
-  } else {
-    openSession(h.id)
-  }
+  openSession(h.id)
 }
 
 function accent(h: Host) {
@@ -84,9 +73,6 @@ onUnmounted(clearConfirm)
               <span>{{ h.os }}</span>
             </div>
           </div>
-          <div class="proj-status" :class="statusInfo(h).cls">
-            <span class="sdot"></span>{{ statusInfo(h).text }}
-          </div>
           <div class="proj-actions" @mouseleave="clearConfirm">
             <button type="button" class="proj-act" title="编辑连接" @click="onEdit($event, h)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -129,9 +115,6 @@ onUnmounted(clearConfirm)
             <div class="proj-title">
               <div class="proj-name">{{ h.id }}</div>
               <div class="proj-tagline">{{ h.os }}</div>
-            </div>
-            <div class="proj-status" :class="statusInfo(h).cls">
-              <span class="sdot"></span>{{ statusInfo(h).text }}
             </div>
           </div>
 
@@ -182,7 +165,6 @@ onUnmounted(clearConfirm)
           class="project-item"
           @click="onConnect(h)"
         >
-          <span class="proj-status" :class="statusInfo(h).cls"></span>
           <span class="proj-actions" @mouseleave="clearConfirm">
             <button type="button" class="proj-act" title="编辑连接" @click="onEdit($event, h)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -227,9 +209,6 @@ onUnmounted(clearConfirm)
           <div class="proj-addr">{{ h.user }}@{{ h.ip }}:{{ h.port }}</div>
           <div class="proj-os">{{ h.os }}</div>
           <span class="proj-tag">{{ h.tag }}</span>
-          <div class="proj-status" :class="statusInfo(h).cls">
-            <span class="sdot"></span>{{ statusInfo(h).text }}
-          </div>
           <span class="proj-actions" @mouseleave="clearConfirm">
             <button type="button" class="proj-act" title="编辑连接" @click="onEdit($event, h)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"

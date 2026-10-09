@@ -3,11 +3,12 @@
 # 发版 Release notes 模板
 
 > description: 发版时编写 GitHub Release body 的完整模板与字段说明，含 rhost 产物下载表、SHA256 校验、未签名提示与流水线自动段说明
-> 创建时间：2026-10-08 10:58:02
-> 更新时间：2026-10-08 16:10:24
-> 作者：
-
----
+>
+> created: 2026-10-08 10:58:02
+>
+> updated: 2026-10-08 16:10:24
+>
+> author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
 ## 1. 何时用本模板
 

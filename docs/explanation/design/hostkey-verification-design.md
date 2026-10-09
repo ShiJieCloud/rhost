@@ -1,15 +1,16 @@
 # SSH 主机密钥校验（known_hosts）设计方案
 
 > description: SSH 首连指纹确认、known_hosts 持久化、密钥变更告警的两阶段校验设计
-> 创建时间：2026-10-08 09:28:16
-> 更新时间：2026-10-08 12:13:11
-> 作者：
-
----
+>
+> created: 2026-10-08 09:28:16
+>
+> updated: 2026-10-08 12:13:11
+>
+> author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
 ## 1. 设计目标与硬约束
 
-> 范围：本文覆盖 SSH 建连阶段的服务器主机密钥校验——首次连接指纹确认（TOFU）、指纹持久化、密钥不匹配告警与更新。
+> scope: 本文覆盖 SSH 建连阶段的服务器主机密钥校验——首次连接指纹确认（TOFU）、指纹持久化、密钥不匹配告警与更新。
 > 边界：不覆盖用户公钥认证（authorized_keys）、SSH CA 证书链校验、known_hosts 多指纹/哈希条目、指纹管理界面。
 > 关联代码：`src-tauri/src/ssh/session.rs`、`src-tauri/src/ssh/mod.rs`、`src-tauri/src/ipc.rs`、`src-tauri/src/known_hosts.rs`（新建）、`frontend/src/stores/session.ts`、`frontend/src/composables/useHostKeyPrompt.ts`（新建）、`frontend/src/components/HostKeyModal.vue`（新建）、`frontend/src/App.vue`、`frontend/src/views/home/QuickConnectView.vue`
 

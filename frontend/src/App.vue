@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import WbTitleBar from './components/wb/WbTitleBar.vue'
 import HomeView from './views/HomeView.vue'
@@ -17,12 +17,27 @@ import { loadHosts } from './stores/hosts'
 import { savedSettings } from './stores/settings'
 import { loadAppConfig } from './stores/appConfig'
 import { initGlobalErrorReporting, syncLogConfig } from './stores/applog'
-import { detectPlatform } from './lib/tauri'
+import { appWindow, detectPlatform } from './lib/tauri'
 
 // 标题栏跨平台策略：根节点按平台挂 class，CSS 据此切换安全区方向
 // - platform-macos：左侧为原生红绿灯预留安全区（Overlay 模式）
 // - platform-windows / platform-linux：右侧渲染前端自绘窗口控制按钮
 const platformClass = `platform-${detectPlatform()}`
+
+// macOS 原生全屏后红绿灯隐藏（悬停才浮现），左侧安全区预留失效——
+// 挂 is-fullscreen class 供 CSS 取消预留，避免 logo 左侧留白
+const isFullscreen = ref(false)
+
+onMounted(async () => {
+  if (detectPlatform() !== 'macos') return
+  const w = await appWindow()
+  if (!w) return
+  isFullscreen.value = await w.isFullscreen()
+  const unlisten = await w.onResized(async () => {
+    isFullscreen.value = await w.isFullscreen()
+  })
+  onBeforeUnmount(unlisten)
+})
 
 // 工作台挂载闩锁：一旦进入过工作台就永久保持挂载（v-show 保活终端状态），
 // 即使关闭全部会话停留在空态也不卸载
@@ -72,7 +87,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="app" :class="platformClass">
+  <div class="app" :class="[platformClass, { 'is-fullscreen': isFullscreen }]">
     <TitleBar v-if="appView === 'home'" />
     <WbTitleBar v-else />
     <HomeView v-show="appView === 'home'" />
