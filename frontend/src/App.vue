@@ -4,6 +4,8 @@ import TitleBar from './components/TitleBar.vue'
 import WbTitleBar from './components/wb/WbTitleBar.vue'
 import HomeView from './views/HomeView.vue'
 import Workbench from './views/Workbench.vue'
+import RightIconRail from './components/RightIconRail.vue'
+import RightPanel from './components/RightPanel.vue'
 import NewConnectionModal from './components/NewConnectionModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import GroupModal from './components/GroupModal.vue'
@@ -12,7 +14,7 @@ import PasswordModal from './components/PasswordModal.vue'
 import HostKeyModal from './components/HostKeyModal.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import AppToast from './components/AppToast.vue'
-import { appView, restoreSessions } from './stores/session'
+import { appView, restoreSessions, rightPanelMaximized, rightPanelVisible } from './stores/session'
 import { loadHosts } from './stores/hosts'
 import { savedSettings } from './stores/settings'
 import { loadAppConfig } from './stores/appConfig'
@@ -90,8 +92,12 @@ onMounted(async () => {
   <div class="app" :class="[platformClass, { 'is-fullscreen': isFullscreen }]">
     <TitleBar v-if="appView === 'home'" />
     <WbTitleBar v-else />
-    <HomeView v-show="appView === 'home'" />
-    <Workbench v-if="workbenchMounted" v-show="appView === 'workbench'" />
+    <div class="app-body" :class="{ 'rp-maximized': rightPanelVisible && rightPanelMaximized }">
+      <HomeView v-show="appView === 'home'" />
+      <Workbench v-if="workbenchMounted" v-show="appView === 'workbench'" />
+      <RightPanel v-show="rightPanelVisible" />
+      <RightIconRail />
+    </div>
 
     <NewConnectionModal />
     <SettingsModal />

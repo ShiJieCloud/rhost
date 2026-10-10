@@ -183,6 +183,7 @@ const PANELS: PanelDef[] = [
           { key: 'pasteGuard', title: '粘贴保护', desc: '多行粘贴时弹窗确认，避免误执行', kind: 'switch', keywords: '粘贴 保护 确认 paste 安全' },
           { key: 'autoReconnect', title: '断线自动重连', desc: '网络异常导致连接中断时自动重连（等待 1s 起逐次翻倍，最长 30s）；远端主动 exit、手动断开不会触发，等待期间可随时取消', kind: 'switch', keywords: '断线 自动重连 重连 网络 中断 掉线 退避 reconnect 断开' },
           { key: 'autoReconnectMaxAttempts', title: '自动重连次数上限', desc: '自动重连的最大尝试次数，达到上限后停止并保留标签等待手动重连；填 0 表示不限次数，持续退避重试', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', disabledKey: 'autoReconnect', keywords: '自动重连 次数 上限 最大 尝试 重试 失败 reconnect' },
+          { key: 'recentConnectionsLimit', title: '历史会话数量', desc: '首页右侧栏「历史会话」展示的最大条数，超出后丢弃最旧的记录', kind: 'number', width: 100, min: 5, max: 100, step: 1, unit: ' 条', keywords: '历史 会话 数量 最近 连接 记录 recent history' },
           { key: 'rightClick', title: '右键行为', desc: '终端内右键：弹出操作菜单，或直接粘贴剪贴板', kind: 'segmented', keywords: '右键 粘贴 菜单 right click 鼠标',
             options: [{ v: 'menu', t: '菜单' }, { v: 'paste', t: '粘贴' }] },
         ],

@@ -5,7 +5,7 @@ import { showNewConn } from '../../stores/hosts'
 import { showSettings } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
 import {
-  appView, dockVisible, inspectorVisible, openDock, searchTick, sidebarVisible, toggleDock,
+  appView, dockVisible, openDock, rightPanelVisible, searchTick, sidebarVisible, toggleDock,
 } from '../../stores/session'
 
 // macOS 由原生 Overlay 红绿灯渲染（左侧安全区）；Windows/Linux 前端自绘右侧窗口按钮
@@ -107,9 +107,9 @@ function onSettings() {
       </button>
       <button
         class="tb-toggle"
-        :class="{ active: inspectorVisible }"
-        title="显示 / 隐藏右侧栏"
-        @click="inspectorVisible = !inspectorVisible"
+        :class="{ active: rightPanelVisible }"
+        title="显示 / 隐藏右侧面板"
+        @click="rightPanelVisible = !rightPanelVisible"
       >
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
       </button>

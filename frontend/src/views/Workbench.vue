@@ -3,9 +3,8 @@ import WbSideBar from '../components/wb/WbSideBar.vue'
 import WbTabs from '../components/wb/WbTabs.vue'
 import TerminalPane from '../components/wb/TerminalPane.vue'
 import DockPanel from '../components/wb/DockPanel.vue'
-import Inspector from '../components/wb/Inspector.vue'
 import StatusBar from '../components/wb/StatusBar.vue'
-import { dockVisible, inspectorVisible, sidebarVisible } from '../stores/session'
+import { dockVisible, sidebarVisible } from '../stores/session'
 </script>
 
 <template>
@@ -20,8 +19,6 @@ import { dockVisible, inspectorVisible, sidebarVisible } from '../stores/session
 
         <DockPanel v-show="dockVisible" />
       </main>
-
-      <Inspector v-show="inspectorVisible" />
     </div>
 
     <StatusBar />

@@ -68,6 +68,8 @@ export interface AppSettings {
   memPauseHidden: boolean
   /** 内存告警阈值（MB）：主进程 RSS 持续超过该值时状态栏告警 */
   memAlertMb: number
+  /** 历史会话保留数量上限（超出后丢弃最旧的记录） */
+  recentConnectionsLimit: number
   /* ---- SFTP 文件传输 ---- */
   /** 传输分块大小（KB）：上传/下载单次读写长度，越大吞吐越高、进度粒度越粗 */
   sftpChunkKb: number
@@ -185,6 +187,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   metricsInterval: 3,
   memPauseHidden: true,
   memAlertMb: 300,
+  recentConnectionsLimit: 20,
 
   sftpChunkKb: 64,
   sftpResume: true,

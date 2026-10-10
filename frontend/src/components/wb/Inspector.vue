@@ -3,11 +3,12 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { toast } from '../../composables/useToast'
 import {
   METRICS_HEARTBEAT_MS, activeHost, activeHostInfo, activeMetrics, activeNetHist,
-  activeReconnectAttempt, activeSession,
-  connected, disconnectSession, inspectorVisible, metricsHeartbeat, openDock, reconnectTick,
+  activeReconnectAttempt, activeSession, appView,
+  connected, disconnectSession, metricsHeartbeat, openDock, openSession, recentConnections, reconnectTick, rightPanelTab, rightPanelVisible,
   startMetrics, stopMetrics,
 } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
+import { hosts } from '../../stores/hosts'
 
 /* ---------- 会话时长计时 ---------- */
 const uptime = ref('00:00:00')
@@ -69,6 +70,18 @@ const stateDotVar = computed(() => {
     default: return 'var(--rhost-status-idle)'
   }
 })
+
+/* ---------- 首页模式：历史会话列表（数据源为 recentConnections，模板直接渲染） ---------- */
+const isHome = computed(() => appView.value === 'home')
+
+/** 点击历史会话：主机已被删除时仅提示，保留记录 */
+function onRecentClick(r: { hostId: string }) {
+  if (!hosts.value.some(h => h.id === r.hostId)) {
+    toast('主机已删除', 'warn')
+    return
+  }
+  openSession(r.hostId)
+}
 
 /* ---------- 主机地址（带复制） ---------- */
 const hostLabel = computed(() => activeSession.value?.host.id ?? '—')
@@ -243,7 +256,7 @@ function toggleAutoRefresh() {
 }
 
 /* ---------- 动态指标采集门控（0x06） ----------
- * 仅当「活动会话在线 + Inspector 显示 + 面板在视口 + 页面可见 + 自动刷新」
+ * 仅当「活动会话在线 + 右侧面板展开 + 面板在视口 + 页面可见 + 自动刷新」
  * 全部满足时才让后端采集；任一条件翻转即停，后端 9s 心跳 TTL 兜底。 */
 const rootEl = ref<HTMLElement | null>(null)
 const panelVisible = ref(true)
@@ -252,7 +265,7 @@ const docVisible = ref(typeof document === 'undefined' ? true : document.visibil
 const metricsTarget = computed<{ id: string; iface: string | null; intervalMs: number } | null>(() => {
   const s = activeSession.value
   if (!s || s.state !== 'online' || !s.backendId) return null
-  if (!autoRefresh.value || !inspectorVisible.value || !panelVisible.value || !docVisible.value) {
+  if (!autoRefresh.value || !rightPanelVisible.value || !panelVisible.value || !docVisible.value) {
     return null
   }
   // iface 取自 0x05：首帧若晚到，target 变化会触发一次幂等重启切到默认网卡
@@ -317,11 +330,6 @@ onUnmounted(() => {
   panelObserver?.disconnect()
 })
 
-/* ---------- 折叠侧栏 ---------- */
-function onCollapse() {
-  inspectorVisible.value = false
-}
-
 /* ---------- 快捷操作（保留现有） ---------- */
 function onReconnect() {
   if (!activeSession.value) {
@@ -345,56 +353,62 @@ async function onDisconnect() {
 </script>
 
 <template>
-  <aside ref="rootEl" class="inspector ri-root">
-    <!-- 头部：左侧标题 + 右侧操作图标（重连/SFTP/转发/编辑/断开/折叠） -->
-    <header class="ri-head">
-      <div class="ri-title">主机概览</div>
-      <div class="ri-head-actions">
-
-        <button class="ri-icon-btn" title="重新连接" @click="onReconnect">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-            <path d="M21 3v6h-6" />
-          </svg>
-        </button>
-
-        <!-- 自动刷新开关 -->
-        <button class="ri-icon-btn ri-toggle" :class="{ on: autoRefresh }"
-                title="自动刷新"
-                @click="toggleAutoRefresh">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
-            <path d="M21 3v5h-5"/>
-            <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
-            <path d="M8 16H3v5"/>
-          </svg>
-        </button>
-
-        <button class="ri-icon-btn" title="打开 SFTP 文件管理"
-                @click="openDock(); toast('已打开 SFTP 文件管理', 'info', 1600)">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-          </svg>
-        </button>
-        <button class="ri-icon-btn danger" title="断开连接" @click="onDisconnect">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-            <line x1="12" y1="2" x2="12" y2="12"/>
-          </svg>
-        </button>
-        <button class="ri-icon-btn" title="折叠侧栏" @click="onCollapse">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 18l6-6-6-6" />
-          </svg>
-        </button>
-      </div>
-    </header>
+  <aside ref="rootEl" class="ri-root">
+    <!-- 操作按钮注入 RightPanel 头部（仅工作台模式且当前为监控页签） -->
+    <Teleport v-if="!isHome && rightPanelTab === 'monitor'" to="#rp-head-actions">
+      <button class="ri-icon-btn" title="重新连接" @click="onReconnect">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+          <path d="M21 3v6h-6" />
+        </svg>
+      </button>
+      <button class="ri-icon-btn ri-toggle" :class="{ on: autoRefresh }"
+              title="自动刷新"
+              @click="toggleAutoRefresh">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+          <path d="M21 3v5h-5"/>
+          <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+          <path d="M8 16H3v5"/>
+        </svg>
+      </button>
+      <button class="ri-icon-btn" title="打开 SFTP 文件管理"
+              @click="openDock(); toast('已打开 SFTP 文件管理', 'info', 1600)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
+      </button>
+      <button class="ri-icon-btn danger" title="断开连接" @click="onDisconnect">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+          <line x1="12" y1="2" x2="12" y2="12"/>
+        </svg>
+      </button>
+    </Teleport>
 
     <!-- 滚动内容 -->
     <div class="ri-body">
+      <!-- 首页模式：历史会话列表（最近成功连接的主机，含已关闭，点击快速重连） -->
+      <template v-if="isHome">
+        <div class="ri-home-summary">
+          <div v-if="recentConnections.length === 0" class="ri-home-empty">暂无历史会话</div>
+          <button
+            v-for="r in recentConnections"
+            :key="r.hostId"
+            class="ri-home-item"
+            :title="`连接到 ${r.name}`"
+            @click="onRecentClick(r)"
+          >
+            <span class="ri-home-name">{{ r.name }}</span>
+            <span class="ri-home-addr">{{ r.user }}@{{ r.ip }}:{{ r.port }}</span>
+          </button>
+        </div>
+      </template>
+
+      <!-- 工作台模式：单会话详情 -->
+      <template v-else>
       <!-- 连接状态：扁平信息网格 -->
       <div class="ri-conn">
         <div class="ri-conn-grid">
@@ -634,17 +648,71 @@ async function onDisconnect() {
           </div>
         </div>
       </section>
+      </template>
     </div>
   </aside>
 </template>
 
 <style scoped>
-/* 根容器：覆盖全局 .inspector 的 padding/overflow，改为 flex 列布局 */
-.inspector.ri-root {
+/* 根容器：作为 RightPanel 监控页签内容填充；宽度/背景/边框由外层提供 */
+.ri-root {
   display: flex;
   flex-direction: column;
+  width: 100%;
+  height: 100%;
   padding: 0;
   overflow: hidden;
+}
+
+/* ============ 首页历史会话列表 ============ */
+.ri-home-summary {
+  margin: 4px 0 2px;
+}
+.ri-home-empty {
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 12px 0;
+  text-align: center;
+}
+.ri-home-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  text-align: left;
+}
+.ri-home-item:hover {
+  background: var(--panel-2);
+  border-color: var(--border);
+}
+.ri-home-name {
+  width: 100%;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ri-home-addr {
+  width: 100%;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ri-home-state {
+  font-size: 11px;
+  color: var(--muted-2);
+  flex-shrink: 0;
 }
 
 /* ============ 头部 ============ */
@@ -725,6 +793,17 @@ async function onDisconnect() {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 0 12px 12px;
+  /* 专注模式下面板很宽：内容统一限宽 720px 居中；
+     用 flex + align-items 居中，避免被子元素自身 margin 覆盖而失效 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.ri-body > * {
+  width: 100%;
+  max-width: 720px;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 .ri-body::-webkit-scrollbar {
   width: 8px;

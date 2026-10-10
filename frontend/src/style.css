@@ -91,6 +91,10 @@ body{
 .wc-btn.wc-close:hover{background:#e81123;color:#fff}
 .wc-btn.wc-close:active{background:#c42b1c;color:#fff}
 /* ---------- 主体 ---------- */
+.app-body{flex:1;display:flex;min-height:0}
+.app-body>.body,.app-body>.workbench-root{flex:1;min-width:0}
+/* 右侧面板专注模式：隐藏中央主区，仅保留面板 + 图标栏 */
+.app-body.rp-maximized>.body,.app-body.rp-maximized>.workbench-root{display:none}
 .workbench-root{display:flex;flex-direction:column;flex:1;min-height:0}
 .body{flex:1;display:flex;min-height:0}
 /* ============ 左侧边栏 ============ */
@@ -2503,6 +2507,7 @@ body{
 /* ---- 工作台响应式 ---- */
 @media (max-width:1180px){
     .inspector{display:none}
+    .right-panel{display:none}
 }
 @media (max-width:900px){
     .body .sidebar{position:absolute;top:46px;bottom:27px;left:0;z-index:30;
