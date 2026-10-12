@@ -59,9 +59,47 @@ export interface AiChatMessage {
   reasoning?: string
   /** 工具提案（M2.3）：assistant 消息携带的 propose_command 提案卡片状态 */
   toolProposals?: AiToolProposal[]
+  /** 执行计划（M4 Plan-and-Act）：规划模式生成的计划卡片状态 */
+  plan?: AiPlan
   /** streaming：流式生成中；done：完成；error：出错；stopped：用户中止 */
   status: 'streaming' | 'done' | 'error' | 'stopped'
   createdAt: number
+}
+
+/* ---- Plan-and-Act 执行计划（M4） ---- */
+
+/** 计划步骤（卡片持久化形态，随会话落盘） */
+export interface AiPlanStep {
+  id: string
+  /** 步骤简述（≤50 字符；draft 态可编辑） */
+  title: string
+  /** 步骤详情（draft 态可编辑） */
+  detail: string
+  /** pending 待执行 / running 执行中 / done 已完成 / failed 失败 / skipped 用户跳过 */
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  /** 执行结果摘要（≤150 字符；failed 存失败原因；skipped 记「用户跳过」） */
+  result?: string
+}
+
+/** 执行计划（挂在生成它的 assistant 消息上，随会话落盘） */
+export interface AiPlan {
+  /** 用户原始问题（剥离 /plan 前缀后） */
+  goal: string
+  steps: AiPlanStep[]
+  /** 当前执行下标（executing 态有效） */
+  currentIndex: number
+  /** draft 待确认 / executing 执行中 / done 全部落定 / cancelled 已取消 */
+  state: 'draft' | 'executing' | 'done' | 'cancelled'
+}
+
+/** 后端计划生成结果（serde camelCase） */
+export interface AiPlanGenResult {
+  steps: { title: string; detail: string }[]
+}
+
+/** 生成执行计划：非流式单次调用，模型输出经后端宽松解析为 3~8 步数组 */
+export function aiPlanGenerate(scope: AiScope, question: string): Promise<AiPlanGenResult> {
+  return invoke('ai_plan_generate', { scope, question })
 }
 
 /** 落盘的会话记录（后端原样存取） */
