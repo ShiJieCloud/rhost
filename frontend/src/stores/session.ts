@@ -824,13 +824,83 @@ export function detachTerminal(id: string) {
 
 /** 前端键盘原始字节写入 PTY（低频控制消息走 invoke/JSON 无妨）。
  *  非 online（断线/重连等待/连接中）一律静默丢弃——输入冻结，
- *  既不下发也不本地回显，终端停留在断线瞬间的静态快照 */
-export function sendInput(id: string, data: string | Uint8Array) {
+ *  既不下发也不本地回显，终端停留在断线瞬间的静态快照。
+ *  返回 invoke Promise：常规调用方无需 await；AI 工具提案写入需判定成败 */
+export function sendInput(id: string, data: string | Uint8Array): Promise<void> {
   const s = sessions.value.find(x => x.id === id)
-  if (!s?.backendId || !isTauri || s.state !== 'online') return
+  if (!s?.backendId || !isTauri || s.state !== 'online') return Promise.resolve()
   const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
   // Tauri 序列化 Vec<u8> 需要普通数组（Uint8Array 会被 JSON 序列化成对象）
-  void invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
+  return invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
+}
+
+/* ---- AI 执行结果捕获（M3.1）：开关控制，仅在 aiAutoReturnOutput=true 时启用 ---- */
+
+/** 常见 shell 提示符模式：bash/sh/zsh/fish 的默认与常见自定义 PS1 */
+const PROMPT_PATTERNS = [
+  /[\$#%>]\s*$/,           // 通用结尾符 + 可选空格
+  /\[[^\]]*\][\$#%>]\s*$/, // [user@host ~]$ 风格
+  /root@[^:]+:.*#\s*$/,    // root@host:/path#
+  /❯\s*$/,                 // starship/oh-my-zsh 常见
+]
+
+/** 检测输出是否已回到 shell 提示符（命令执行完毕的近似判定） */
+function isPromptLine(text: string): boolean {
+  const tail = text.split('\n').pop()?.trim() ?? ''
+  return PROMPT_PATTERNS.some(re => re.test(tail))
+}
+
+/** AI 提案执行：写入命令并等待输出返回（仅 aiAutoReturnOutput=true 时调用）。
+ *  捕获策略：订阅该会话帧，检测提示符出现或超时，截取写入点之后的增量输出。
+ *  返回 { output: string, timedOut: boolean } */
+export function sendInputAndCapture(
+  id: string,
+  data: string | Uint8Array,
+  timeoutMs = 30000,
+): Promise<{ output: string; timedOut: boolean }> {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s?.backendId || !isTauri || s.state !== 'online') {
+    return Promise.resolve({ output: '', timedOut: false })
+  }
+  const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
+
+  return new Promise((resolve) => {
+    const chunks: string[] = []
+    let done = false
+
+    // 劫持该会话的 TermSink：先捕获，再透传给 xterm（不干扰正常渲染）
+    const origSink = termSinks.get(id)
+    termSinks.set(id, (payload: Uint8Array) => {
+      if (!done) chunks.push(textDecoder.decode(payload, { stream: true }))
+      origSink?.(payload)
+    })
+
+    const timer = window.setTimeout(() => finish(true), timeoutMs)
+    // 写入命令
+    void invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) }).catch(() => finish(false))
+
+    /** 轮询检测提示符（每 300ms；PTY 是流式，无事件通知） */
+    const checker = window.setInterval(() => {
+      if (done) return
+      const text = chunks.join('')
+      if (isPromptLine(text)) finish(false)
+    }, 300)
+
+    function finish(timedOut: boolean) {
+      if (done) return
+      done = true
+      window.clearTimeout(timer)
+      window.clearInterval(checker)
+      // 还原 sink（可能已被其他逻辑替换，只还原本 hijack）
+      if (origSink) termSinks.set(id, origSink)
+      else termSinks.delete(id)
+      const raw = chunks.join('')
+      // 截断：去头（命令回显）去尾（提示符），保留中间输出
+      const lines = raw.split('\r\n')
+      const body = lines.slice(1, -1).join('\n').trim()
+      resolve({ output: body || raw.trim(), timedOut })
+    }
+  })
 }
 
 /* ============================================================

@@ -70,6 +70,38 @@ export interface AppSettings {
   memAlertMb: number
   /** 历史会话保留数量上限（超出后丢弃最旧的记录） */
   recentConnectionsLimit: number
+  /* ---- AI 助手 ---- */
+  /** AI 功能总开关：关闭后右侧栏隐藏 AI 入口 */
+  aiEnabled: boolean
+  /** 模型服务商预设：custom 自定义 / openai / deepseek / ollama（仅快捷填充 aiBaseUrl，不锁定） */
+  aiProvider: string
+  /** 模型服务地址（OpenAI 兼容 API） */
+  aiBaseUrl: string
+  /** API 密钥（仅保存时一次性使用，真实值存于系统钥匙串；此处常态为空，留空表示不修改） */
+  aiApiKey: string
+  /** 模型名称 */
+  aiModel: string
+  /** 启用 .agents 技能目录 */
+  aiSkillsEnabled: boolean
+  /** 技能目录路径 */
+  aiSkillsPath: string
+  /** 启用项目规则文件 */
+  aiRulesEnabled: boolean
+  /** 规则文件路径 */
+  aiRulesPath: string
+  /** 启用跨会话记忆 */
+  aiMemoryEnabled: boolean
+  /** 记忆条数上限，超出后淘汰最旧记录 */
+  aiMemoryLimit: number
+  /** 允许多行命令直接执行：关闭时含多行的命令仅可插入终端人工编辑（M2） */
+  aiMultilineExec: boolean
+  /** 直接执行确认模式：always 每次确认 / risky 高危命令确认（默认）/ never 不确认（M2） */
+  aiExecConfirmMode: 'always' | 'risky' | 'never'
+  /** 自定义高危命令关键词：一行一条，直接执行的命令包含即视为高危，纯子串匹配（M2） */
+  aiRiskKeywords: string
+  /** 执行结果自动回传：开启后，AI 提案命令执行完成时捕获终端输出作为 tool 结果
+   *  回传模型，实现自主多步执行；关闭时保持零回传（M2.1 隐私边界） */
+  aiAutoReturnOutput: boolean
   /* ---- SFTP 文件传输 ---- */
   /** 传输分块大小（KB）：上传/下载单次读写长度，越大吞吐越高、进度粒度越粗 */
   sftpChunkKb: number
@@ -188,6 +220,22 @@ export const DEFAULT_SETTINGS: AppSettings = {
   memPauseHidden: true,
   memAlertMb: 300,
   recentConnectionsLimit: 20,
+
+  aiEnabled: true,
+  aiProvider: 'custom',
+  aiBaseUrl: '',
+  aiApiKey: '',
+  aiModel: '',
+  aiSkillsEnabled: true,
+  aiSkillsPath: '.agents/skills',
+  aiRulesEnabled: true,
+  aiRulesPath: 'AGENTS.md',
+  aiMemoryEnabled: true,
+  aiMemoryLimit: 100,
+  aiMultilineExec: false,
+  aiExecConfirmMode: 'risky',
+  aiRiskKeywords: '',
+  aiAutoReturnOutput: false,
 
   sftpChunkKb: 64,
   sftpResume: true,
