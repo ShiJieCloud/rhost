@@ -169,6 +169,34 @@ export function aiSummarize(messages: AiWireMessage[]): Promise<string> {
   return invoke<string>('ai_summarize', { messages })
 }
 
+/* ---- 技能/规则提示资产（M3.2：ai/skills/ 与 ai/rules/ 目录） ---- */
+
+/** 一条技能/规则文件（serde camelCase；fileName 为稳定 key） */
+export interface AiPromptAsset {
+  fileName: string
+  name: string
+  description?: string
+  content: string
+  /** 单文件超 8KB 被截断 */
+  truncated: boolean
+  sizeBytes: number
+}
+
+export interface AiPromptAssets {
+  skills: AiPromptAsset[]
+  rules: AiPromptAsset[]
+}
+
+/** 列出技能/规则提示资产（目录由后端固定解析；目录/单文件失败降级为空，不报错） */
+export function aiListPromptAssets(): Promise<AiPromptAssets> {
+  return invoke<AiPromptAssets>('ai_list_prompt_assets')
+}
+
+/** 系统文件管理器打开技能/规则目录，返回目录绝对路径 */
+export function aiRevealPromptDir(kind: 'skills' | 'rules'): Promise<string> {
+  return invoke<string>('ai_reveal_prompt_dir', { kind })
+}
+
 /* ---- 事件订阅（一次性注册四个事件，组件卸载时 unlisten） ---- */
 
 export interface AiEventHandlers {

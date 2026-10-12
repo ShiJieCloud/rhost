@@ -11,7 +11,7 @@ import {
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
-import { aiHasApiKey, aiSetApiKey, aiTestConnection } from '../lib/ai'
+import { aiHasApiKey, aiListPromptAssets, aiRevealPromptDir, aiSetApiKey, aiTestConnection, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
 import {
@@ -30,6 +30,7 @@ import {
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
   | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'list' | 'exportOptions'
+  | 'assetList'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -58,11 +59,14 @@ interface RowDef {
   placeholder?: string
   /** textarea 行数（默认 4） */
   rows?: number
+  /** assetList 行目标类别：技能/规则（数据不放 schema，组件内 ref 持有） */
+  assetKind?: 'skills' | 'rules'
   actions?: {
     id:
       | 'exportFile' | 'importFile'
       | 'resetSettings'
       | 'changelog' | 'checkUpdate' | 'openLogDir' | 'testAiConnection'
+      | 'openSkillsDir' | 'openRulesDir' | 'refreshAssets'
     label: string
   }[]
 }
@@ -424,15 +428,19 @@ const PANELS: PanelDef[] = [
       {
         label: '技能 SKILL',
         rows: [
-          { key: 'aiSkillsEnabled', title: '启用 .agents 技能目录', desc: '开启后，智能体将自动加载 .agents/skills 路径下的自定义技能', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 技能 skill agents 目录 TODO', todo: '仅持久化，待接入 AI 服务' },
-          { key: 'aiSkillsPath', title: '技能目录路径', desc: '相对于项目根目录', kind: 'text', width: 240, placeholder: '.agents/skills', disabledKey: 'aiEnabled', keywords: 'AI 技能 skill 路径 path TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiSkillsEnabled', title: '启用技能注入', desc: '将技能目录下的 .md 文件注入对话上下文；文件内容将随对话发送给模型服务商', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 技能 skill markdown 注入 目录' },
+          { title: '技能目录', desc: '在系统文件管理器中打开技能目录；将 .md 文件放入目录即自动生效，可用 frontmatter 声明 name/description', kind: 'buttons', disabledKey: ['aiEnabled', 'aiSkillsEnabled'], keywords: 'AI 技能 skill 目录 打开 文件夹 刷新',
+            actions: [{ id: 'openSkillsDir', label: '打开目录' }, { id: 'refreshAssets', label: '刷新列表' }] },
+          { title: '技能文件', desc: '逐条开关控制注入，重命名文件后需重新设置', kind: 'assetList', assetKind: 'skills', disabledKey: ['aiEnabled', 'aiSkillsEnabled'], keywords: 'AI 技能 skill 文件 列表 开关' },
         ],
       },
       {
         label: '规则 Rules',
         rows: [
-          { key: 'aiRulesEnabled', title: '启用项目规则文件', desc: '开启后，智能体将自动加载规则文件中的项目约定', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 规则 rules agents.md TODO', todo: '仅持久化，待接入 AI 服务' },
-          { key: 'aiRulesPath', title: '规则文件路径', desc: '相对于项目根目录，如 AGENTS.md', kind: 'text', width: 240, placeholder: 'AGENTS.md', disabledKey: 'aiEnabled', keywords: 'AI 规则 rules 路径 path TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiRulesEnabled', title: '启用规则注入', desc: '将规则目录下的 .md 文件注入对话上下文；文件内容将随对话发送给模型服务商', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 规则 rules markdown 注入 目录' },
+          { title: '规则目录', desc: '在系统文件管理器中打开规则目录；将 .md 文件放入目录即自动生效，可用 frontmatter 声明 name/description', kind: 'buttons', disabledKey: ['aiEnabled', 'aiRulesEnabled'], keywords: 'AI 规则 rules 目录 打开 文件夹 刷新',
+            actions: [{ id: 'openRulesDir', label: '打开目录' }, { id: 'refreshAssets', label: '刷新列表' }] },
+          { title: '规则文件', desc: '逐条开关控制注入，重命名文件后需重新设置', kind: 'assetList', assetKind: 'rules', disabledKey: ['aiEnabled', 'aiRulesEnabled'], keywords: 'AI 规则 rules 文件 列表 开关' },
         ],
       },
       {
@@ -506,6 +514,11 @@ watch(showSettings, v => {
   // 刷新字体安装态：面板打开期间新装/卸载字体重开面板即反映
   void refreshFontAvail()
   nextTick(() => searchEl.value?.focus())
+})
+
+// 切到 AI 页签时拉取一次技能/规则目录清单（手动重拉走「刷新列表」按钮）
+watch(activePanelId, id => {
+  if (id === 'ai') void refreshPromptAssets()
 })
 
 function close() {
@@ -970,7 +983,67 @@ async function onAction(id: string) {
     case 'testAiConnection':
       void testAi()
       break
+    case 'openSkillsDir':
+      void openPromptDir('skills')
+      break
+    case 'openRulesDir':
+      void openPromptDir('rules')
+      break
+    case 'refreshAssets':
+      void refreshPromptAssets(true)
+      break
   }
+}
+
+/* ---- 技能/规则提示资产（M3.2） ---- */
+
+/** 目录扫描结果：组件内独立 ref 持有（rows 为静态 schema，资产数据不进 schema） */
+const promptAssets = ref<AiPromptAssets>({ skills: [], rules: [] })
+const assetsLoading = ref(false)
+
+/** 拉取目录清单；切到 AI 页签自动拉一次，「刷新列表」按钮手动重拉 */
+async function refreshPromptAssets(manual = false) {
+  if (!isTauri || assetsLoading.value) return
+  assetsLoading.value = true
+  try {
+    promptAssets.value = await aiListPromptAssets()
+    if (manual) toast('列表已刷新', 'ok', 1500)
+  } catch (e) {
+    toast(`加载技能/规则列表失败：${e}`, 'err', 2600)
+  } finally {
+    assetsLoading.value = false
+  }
+}
+
+/** 系统文件管理器打开技能/规则目录（后端自动创建），返回后提示投放方式 */
+async function openPromptDir(kind: 'skills' | 'rules') {
+  try {
+    const opened = await aiRevealPromptDir(kind)
+    toast(`已打开：${opened}`, 'ok', 2600)
+  } catch (e) {
+    toast(`打开目录失败：${e}`, 'err', 2600)
+  }
+}
+
+function assetListOf(r: RowDef): AiPromptAsset[] {
+  return r.assetKind === 'skills' ? promptAssets.value.skills : promptAssets.value.rules
+}
+
+function assetDisabled(r: RowDef, fileName: string): boolean {
+  const list = r.assetKind === 'skills' ? draft.aiSkillsDisabled : draft.aiRulesDisabled
+  return list.includes(fileName)
+}
+
+/** 逐条开关：开启即从禁用名单移除 fileName，关闭则加入 */
+function toggleAsset(kind: 'skills' | 'rules', fileName: string, enabled: boolean) {
+  const key = kind === 'skills' ? 'aiSkillsDisabled' : 'aiRulesDisabled'
+  const list = draft[key].filter(f => f !== fileName)
+  if (!enabled) list.push(fileName)
+  setVal(key, list)
+}
+
+function fmtSize(n: number): string {
+  return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`
 }
 
 /** 测试 AI 连接：用面板草稿值（可能尚未保存）请求 /models */
@@ -1132,7 +1205,7 @@ function optionList(r: RowDef): Opt[] {
                   v-for="r in g.rows"
                   :key="r.title"
                   class="st-row"
-                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' || r.kind === 'list' }"
+                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' || r.kind === 'list' || r.kind === 'assetList' }"
                 >
                   <div class="st-row-main">
                     <div class="st-row-title" :class="{ 'has-tail-switch': !!r.switchKey }">
@@ -1345,10 +1418,35 @@ function optionList(r: RowDef): Opt[] {
                         v-for="a in r.actions"
                         :key="a.id"
                         class="btn"
-                        :disabled="cfgBusy || (a.id === 'testAiConnection' && aiTesting)"
+                        :disabled="cfgBusy || (a.id === 'testAiConnection' && aiTesting) || rowDisabled(r)"
                         @click="onAction(a.id)"
                       >{{ a.id === 'testAiConnection' && aiTesting ? '检测中…' : a.label }}</button>
                     </template>
+
+                    <!-- 技能/规则文件列表（M3.2：逐条开关写禁用名单；开关靠右与其他行统一） -->
+                    <div v-else-if="r.kind === 'assetList'" class="st-assets">
+                      <template v-if="assetListOf(r).length">
+                        <div v-for="a in assetListOf(r)" :key="a.fileName" class="st-asset-row">
+                          <div class="st-asset-main">
+                            <span class="st-asset-name">
+                              {{ a.name }}
+                              <span v-if="a.truncated" class="st-asset-flag" title="文件超过 8KB，注入时只取前 8KB">已截断</span>
+                            </span>
+                            <span class="st-asset-desc">{{ a.description || a.fileName }}</span>
+                          </div>
+                          <span class="st-asset-size">{{ fmtSize(a.sizeBytes) }}</span>
+                          <label class="st-switch">
+                            <input
+                              type="checkbox"
+                              :checked="!assetDisabled(r, a.fileName)"
+                              :disabled="rowDisabled(r)"
+                              @change="toggleAsset(r.assetKind!, a.fileName, ($event.target as HTMLInputElement).checked)"
+                            >
+                          </label>
+                        </div>
+                      </template>
+                      <div v-else class="st-asset-empty">目录为空 —— 将 .md 文件放入目录即自动生效</div>
+                    </div>
 
                     <!-- 控件下方辅助提示（独占一行右对齐） -->
                     <span v-if="ctlHint(r)" class="st-ctl-hint">{{ ctlHint(r) }}</span>

@@ -81,14 +81,14 @@ export interface AppSettings {
   aiApiKey: string
   /** 模型名称 */
   aiModel: string
-  /** 启用 .agents 技能目录 */
+  /** 启用技能注入（app_config_dir/ai/skills/ 目录下的 .md 文件） */
   aiSkillsEnabled: boolean
-  /** 技能目录路径 */
-  aiSkillsPath: string
-  /** 启用项目规则文件 */
+  /** 技能禁用名单：fileName 数组，命中即不注入（默认 [] 全部启用） */
+  aiSkillsDisabled: string[]
+  /** 启用规则注入（app_config_dir/ai/rules/ 目录下的 .md 文件） */
   aiRulesEnabled: boolean
-  /** 规则文件路径 */
-  aiRulesPath: string
+  /** 规则禁用名单：fileName 数组，命中即不注入（默认 [] 全部启用） */
+  aiRulesDisabled: string[]
   /** 启用跨会话记忆 */
   aiMemoryEnabled: boolean
   /** 记忆条数上限，超出后淘汰最旧记录 */
@@ -227,9 +227,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   aiApiKey: '',
   aiModel: '',
   aiSkillsEnabled: true,
-  aiSkillsPath: '.agents/skills',
+  aiSkillsDisabled: [],
   aiRulesEnabled: true,
-  aiRulesPath: 'AGENTS.md',
+  aiRulesDisabled: [],
   aiMemoryEnabled: true,
   aiMemoryLimit: 100,
   aiMultilineExec: false,

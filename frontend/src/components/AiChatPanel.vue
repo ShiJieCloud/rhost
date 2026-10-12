@@ -12,12 +12,15 @@ import AiMarkdown from './AiMarkdown.vue'
 import {
   aiChatStream,
   aiClearChat,
+  aiListPromptAssets,
   aiLoadChat,
   aiSaveChat,
   aiStopChat,
   aiSummarize,
   listenAiEvents,
   type AiChatMessage,
+  type AiPromptAsset,
+  type AiPromptAssets,
   type AiScope,
   type AiToolProposal,
   type AiWireMessage,
@@ -273,7 +276,7 @@ async function maybeSummarize() {
 
 /* ---------- 发送 ---------- */
 
-function buildWireMessages(): AiWireMessage[] {
+function buildWireMessages(assets?: AiPromptAssets): AiWireMessage[] {
   // 仅把已成形的消息发给模型；空回复/错误回复不进上下文（带提案的空正文 assistant 除外）
   const usable = messages.value.filter(
     m => m.status !== 'streaming' && (m.content.trim() || m.toolProposals?.length),
@@ -302,16 +305,66 @@ function buildWireMessages(): AiWireMessage[] {
     }
     wired.push({ role: m.role, content: m.content })
   }
-  // 会话上下文 system 靠近对话（注意力靠后），置于摘要之后
-  const ctx = buildSessionContext()
-  if (ctx) wired.unshift(ctx)
+  // system 前缀按「规则 → 技能 → 摘要 → 会话上下文」顺序装配
+  // （注意力靠后原则：越稳定、越全局的约定越靠前；合并为单条，兼容多 system 支持不一的上游）
+  const systems: AiWireMessage[] = []
+  const rulesSys = buildAssetSystem(
+    '规则', 'rules', savedSettings.aiRulesEnabled, savedSettings.aiRulesDisabled, assets?.rules ?? [],
+  )
+  if (rulesSys) systems.push(rulesSys)
+  const skillsSys = buildAssetSystem(
+    '技能', 'skills', savedSettings.aiSkillsEnabled, savedSettings.aiSkillsDisabled, assets?.skills ?? [],
+  )
+  if (skillsSys) systems.push(skillsSys)
   if (summary.value) {
-    wired.unshift({
+    systems.push({
       role: 'system',
       content: `以下是此前对话的摘要：\n${summary.value}\n\n请结合摘要与近期消息继续对话。`,
     })
   }
-  return wired
+  // 会话上下文 system 靠近对话（注意力靠后），置于最末
+  const ctx = buildSessionContext()
+  if (ctx) systems.push(ctx)
+  return [...systems, ...wired]
+}
+
+/** 单类（规则/技能）合计注入预算：16KB，按 UTF-8 字节计量（与后端单文件 8KB 口径一致；
+ *  不用 string.length——UTF-16 code unit 对中文计量偏差约 3 倍） */
+const ASSET_BUDGET_BYTES = 16 * 1024
+
+/** 组装一类提示资产（规则/技能）的合并 system 消息；总开关关闭或无可用文件返回 null。
+ *  按禁用名单过滤，截断文件标题标注；超合计预算丢弃靠后文件并在末尾标注 */
+function buildAssetSystem(
+  kindLabel: '规则' | '技能',
+  dirName: 'rules' | 'skills',
+  enabled: boolean,
+  disabled: string[],
+  assets: AiPromptAsset[],
+): AiWireMessage | null {
+  if (!enabled) return null
+  const files = assets.filter(a => !disabled.includes(a.fileName))
+  if (files.length === 0) return null
+  const header = kindLabel === '规则'
+    ? '# 用户自定义规则（遵循以下约定响应）'
+    : '# 用户自定义技能（参考以下能力说明响应）'
+  const enc = new TextEncoder()
+  const parts: string[] = []
+  let used = 0
+  let dropped = 0
+  for (const a of files) {
+    const block = `## ${a.name}（${dirName}/${a.fileName}${a.truncated ? '，内容已截断' : ''}）\n\n${a.content}`
+    const bytes = enc.encode(block).length
+    if (used + bytes > ASSET_BUDGET_BYTES) {
+      dropped++
+      continue
+    }
+    used += bytes
+    parts.push(block)
+  }
+  if (parts.length === 0) return null
+  let content = `${header}\n\n${parts.join('\n\n')}`
+  if (dropped > 0) content += `\n\n（其余 ${dropped} 个文件因总量超限未注入）`
+  return { role: 'system', content }
 }
 
 /* ---------- 工具提案裁决（M2.3 前端循环） ---------- */
@@ -430,9 +483,18 @@ function send(override?: string) {
 }
 
 /** 发起流式请求（send 与提案裁决续跑共用）。工具提案仅在工作台会话下启用
- *  （全局对话无终端可写）；请求失败写入最后一条 assistant 消息 */
-function runAiStream(seq: number) {
-  aiChatStream(scope.value, buildWireMessages(), {
+ *  （全局对话无终端可写）；请求失败写入最后一条 assistant 消息。
+ *  技能/规则资产每轮重新拉取：无缓存实时读，用户改文件后下一轮即最新 */
+async function runAiStream(seq: number) {
+  let assets: AiPromptAssets | undefined
+  try {
+    assets = await aiListPromptAssets()
+  } catch (e) {
+    // 资产加载失败降级为空注入，对话主流程不受影响
+    console.warn('[AI] 技能/规则加载失败（按空注入）:', e)
+  }
+  if (seq !== loadSeq) return // 拉取期间切换了 scope，丢弃本次发送
+  aiChatStream(scope.value, buildWireMessages(assets), {
     enableTools: scope.value !== 'global',
   }).catch(e => {
     if (seq !== loadSeq) return
