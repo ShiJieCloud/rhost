@@ -1070,6 +1070,115 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
 }
 
 /* =========================================================
+ *  Plan-and-Act 计划生成（M4：ai_plan_generate）
+ * ========================================================= */
+
+/// 计划生成器指令：拆解用户目标为 3~8 步，严格输出 JSON 数组。
+/// 声明执行环境（SSH + 只读工具 + 授权写操作）使步骤落到工具可及范围。
+const PLANNER_PROMPT: &str = "你是运维任务规划器。请将用户的目标拆解为 3~8 个可执行步骤，输出严格的 JSON 数组，不要输出任何其他文本、解释或 markdown 代码围栏。\n执行环境：SSH 远程服务器；可用只读工具 read_file（读取文件内容）、list_directory（列出目录）、get_system_info（系统信息快照），以及经用户授权后的写操作（编辑文件、执行命令）。\n每个步骤是一个对象：{\"title\": \"步骤简述（不超过 50 字符）\", \"detail\": \"该步具体要做什么、如何验证结果\"}。\n要求：步骤按执行顺序排列；先观察诊断、后修改验证；每步可通过上述工具独立完成；不要包含无法通过命令行完成的步骤。";
+
+/// 计划步数范围：少于 3 步无需规划（普通 ReAct 即可），
+/// 多于 8 步注入膨胀且模型长程规划质量显著下降
+const PLAN_MIN_STEPS: usize = 3;
+const PLAN_MAX_STEPS: usize = 8;
+/// 步骤标题上限（字符）：卡片单行展示；Planner prompt 约束 + 此处截断双闸
+const PLAN_TITLE_MAX_CHARS: usize = 50;
+
+/// 计划生成结果（前端 camelCase）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGenResult {
+    /// 步骤列表（3~8 步，已校验）
+    steps: Vec<PlanStepOut>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStepOut {
+    /// 步骤简述（≤50 字符）
+    title: String,
+    /// 步骤详情（做什么、如何验证）
+    detail: String,
+}
+
+/// 模型输出的步骤（宽松反序列化：缺字段按空串，后续校验剔除）
+#[derive(Deserialize)]
+struct PlanStepIn {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    detail: String,
+}
+
+/// 宽松解析模型输出为步骤数组：模型未严格遵守「只输出 JSON」时，
+/// 截取首个 `[` 至末个 `]` 的子串再反序列化。
+/// 校验：步数 ∈ [3, 8]；title 空白的步剔除，剔除后不足 3 步整体报错；
+/// title 超 50 字符截断（按 char 计，不拆多字节字符）。
+fn parse_plan_json(raw: &str) -> Result<Vec<PlanStepOut>, String> {
+    let start = raw.find('[').ok_or("计划输出不含 JSON 数组")?;
+    let end = raw.rfind(']').ok_or("计划输出不含 JSON 数组")?;
+    if end <= start {
+        return Err("计划输出 JSON 数组不完整".to_string());
+    }
+    let items: Vec<PlanStepIn> = serde_json::from_str(&raw[start..=end])
+        .map_err(|e| format!("计划 JSON 解析失败: {e}"))?;
+    let steps: Vec<PlanStepOut> = items
+        .into_iter()
+        .filter(|s| !s.title.trim().is_empty())
+        .map(|s| PlanStepOut {
+            title: s.title.trim().chars().take(PLAN_TITLE_MAX_CHARS).collect(),
+            detail: s.detail.trim().to_string(),
+        })
+        .collect();
+    if steps.len() < PLAN_MIN_STEPS {
+        return Err(format!(
+            "计划步骤不足 {} 步（实际 {} 步），请改用普通模式提问",
+            PLAN_MIN_STEPS,
+            steps.len()
+        ));
+    }
+    if steps.len() > PLAN_MAX_STEPS {
+        return Err(format!(
+            "计划步骤超过 {} 步（实际 {} 步），请缩小目标范围后重试",
+            PLAN_MAX_STEPS,
+            steps.len()
+        ));
+    }
+    Ok(steps)
+}
+
+/// 生成执行计划（Plan-and-Act）：非流式单次调用（复用摘要链路，不带工具定义），
+/// 模型输出经 parse_plan_json 宽松解析。
+/// 取消令牌登记进 cancels（与对话流同一 scope 键）：中止/新请求顶替时取消在飞规划。
+#[tauri::command]
+pub async fn ai_plan_generate(
+    app: AppHandle,
+    scope: String,
+    question: String,
+    state: State<'_, AiState>,
+) -> Result<PlanGenResult, String> {
+    if question.trim().is_empty() {
+        return Err("规划输入为空".to_string());
+    }
+    let cfg = read_ai_settings(&app)?;
+    let token = state.register(&scope);
+    let messages = vec![AiMessage {
+        role: "user".into(),
+        content: Some(question),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    let result = tokio::select! {
+        _ = token.cancelled() => Err("规划已取消".to_string()),
+        r = chat_non_stream(&cfg, PLANNER_PROMPT, messages) => {
+            r.and_then(|raw| parse_plan_json(&raw))
+        }
+    };
+    state.unregister(&scope, &token);
+    result.map(|steps| PlanGenResult { steps })
+}
+
+/* =========================================================
  *  技能/规则提示资产（M3.2：ai/skills/ 与 ai/rules/）
  * ========================================================= */
 
@@ -1502,6 +1611,66 @@ mod tests {
         assert!(truncated);
         assert!(capped.len() <= 8192);
         assert!(capped.chars().all(|c| c == '你')); // 不拆字
+    }
+
+    #[test]
+    fn parse_plan_json_strict() {
+        let raw = r#"[
+            {"title":"查看 nginx 配置","detail":"读取 /etc/nginx/nginx.conf"},
+            {"title":"检查后端服务","detail":"curl 后端端口确认响应"},
+            {"title":"修复并重启","detail":"修改配置后 systemctl restart nginx"}
+        ]"#;
+        let steps = parse_plan_json(raw).expect("严格 JSON 应解析成功");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].title, "查看 nginx 配置");
+        assert_eq!(steps[2].detail, "修改配置后 systemctl restart nginx");
+    }
+
+    #[test]
+    fn parse_plan_json_lenient_strips_prose() {
+        // 模型未严格遵守时：截取首个 [ 至末个 ]
+        let raw = "好的，这是计划：\n```json\n[{\"title\":\"步骤一\",\"detail\":\"d1\"},{\"title\":\"步骤二\",\"detail\":\"d2\"},{\"title\":\"步骤三\",\"detail\":\"d3\"}]\n```\n请确认。";
+        let steps = parse_plan_json(raw).expect("宽松解析应成功");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].title, "步骤一");
+        // 无 JSON 数组
+        assert!(parse_plan_json("无法规划").is_err());
+        // 数组不完整
+        assert!(parse_plan_json("[] x").is_err() || parse_plan_json("] [").is_err());
+    }
+
+    #[test]
+    fn parse_plan_json_step_count_bounds() {
+        // 2 步：不足下限
+        let two = r#"[{"title":"a","detail":"d"},{"title":"b","detail":"d"}]"#;
+        assert!(parse_plan_json(two).is_err());
+        // 9 步：超过上限
+        let nine: String = format!(
+            "[{}]",
+            (0..9)
+                .map(|i| format!(r#"{{"title":"s{i}","detail":"d"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse_plan_json(&nine).is_err());
+        // 空 title 步剔除后仍 ≥3：正常
+        let mixed = r#"[{"title":"","detail":"d"},{"title":"a","detail":"d"},{"title":"b","detail":"d"},{"title":"c","detail":"d"}]"#;
+        let steps = parse_plan_json(mixed).expect("剔除空 title 后 3 步应通过");
+        assert_eq!(steps.len(), 3);
+        // 空 title 剔除后 <3：报错
+        let sparse = r#"[{"title":" ","detail":"d"},{"title":"","detail":"d"},{"title":"a","detail":"d"}]"#;
+        assert!(parse_plan_json(sparse).is_err());
+    }
+
+    #[test]
+    fn parse_plan_json_title_truncates_at_50_chars() {
+        let long_title = "查".repeat(60);
+        let raw = format!(
+            r#"[{{"title":"{}","detail":"d"}},{{"title":"b","detail":"d"}},{{"title":"c","detail":"d"}}]"#,
+            long_title
+        );
+        let steps = parse_plan_json(&raw).expect("应解析成功");
+        assert_eq!(steps[0].title.chars().count(), PLAN_TITLE_MAX_CHARS);
     }
 
     #[test]
