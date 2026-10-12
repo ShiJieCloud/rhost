@@ -1,4 +1,5 @@
 mod applog;
+mod ai;
 mod config_crypto;
 mod config_io;
 mod config_migrate;
@@ -208,6 +209,8 @@ pub fn run() {
         })
         // 会话池注入全局状态，供命令按 session_id 查找
         .manage(SessionManager::new())
+        // AI 对话进行中请求的取消令牌表（按 scope 索引）
+        .manage(ai::AiState::default())
         .invoke_handler(tauri::generate_handler![
             ipc::connect_ssh,
             ipc::write_terminal,
@@ -258,6 +261,15 @@ pub fn run() {
             localfs::local_create_file,
             localfs::local_copy,
             localfs::local_open_terminal,
+            ai::ai_chat_stream,
+            ai::ai_stop_chat,
+            ai::ai_test_connection,
+            ai::ai_set_api_key,
+            ai::ai_has_api_key,
+            ai::ai_save_chat,
+            ai::ai_load_chat,
+            ai::ai_clear_chat,
+            ai::ai_summarize,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

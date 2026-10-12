@@ -11,6 +11,7 @@ import {
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
+import { aiHasApiKey, aiSetApiKey, aiTestConnection } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
 import {
@@ -28,7 +29,7 @@ import {
    ========================================================= */
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
-  | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'exportOptions'
+  | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'list' | 'exportOptions'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -61,7 +62,7 @@ interface RowDef {
     id:
       | 'exportFile' | 'importFile'
       | 'resetSettings'
-      | 'changelog' | 'checkUpdate' | 'openLogDir'
+      | 'changelog' | 'checkUpdate' | 'openLogDir' | 'testAiConnection'
     label: string
   }[]
 }
@@ -89,6 +90,7 @@ const ICONS: Record<string, string> = {
   monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/></svg>',
   sftp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/><path d="M12 8v6"/><path d="M9.5 11.5L12 14l2.5-2.5"/></svg>',
   tunnel: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="8" r="2"/><circle cx="12" cy="8" r="2"/><path d="M6 8h4"/></svg>',
+  ai: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>',
   about: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
 }
 
@@ -393,6 +395,66 @@ const PANELS: PanelDef[] = [
     ],
   },
   {
+    id: 'ai', label: 'AI', glyph: 'ai',
+    title: 'AI 助手', sub: '配置模型接入与对话行为',
+    groups: [
+      {
+        label: '功能',
+        rows: [
+          { key: 'aiEnabled', title: '启用 AI 助手', desc: '关闭后右侧栏隐藏 AI 入口，快捷键随之停用', kind: 'switch', keywords: 'AI 助手 启用 开关 隐藏' },
+        ],
+      },
+      {
+        label: '连接与凭据',
+        rows: [
+          { key: 'aiProvider', title: '服务商', desc: '选择后自动填充兼容 API 地址，仍可手动修改；均走 OpenAI 兼容协议', kind: 'select', width: 160, disabledKey: 'aiEnabled', keywords: 'AI 服务商 provider openai deepseek ollama 自定义',
+            options: [
+              { v: 'custom', t: '自定义' },
+              { v: 'openai', t: 'OpenAI' },
+              { v: 'deepseek', t: 'DeepSeek' },
+              { v: 'ollama', t: 'Ollama（本地）' },
+            ] },
+          { key: 'aiBaseUrl', title: '接口地址 Base URL', desc: 'OpenAI 兼容接口地址', kind: 'text', width: 240, placeholder: 'https://api.openai.com/v1', disabledKey: 'aiEnabled', keywords: 'AI API 地址 base url openai' },
+          { key: 'aiApiKey', title: 'API 密钥', desc: '已加密存储于系统钥匙串；Ollama 本地服务可留空', kind: 'text', width: 240, placeholder: 'sk-…', disabledKey: 'aiEnabled', keywords: 'AI API Key 密钥 token 凭据' },
+          { key: 'aiModel', title: '模型', desc: '命令生成场景推荐使用中等规模模型，延迟更低', kind: 'text', width: 240, placeholder: 'gpt-4o-mini', disabledKey: 'aiEnabled', keywords: 'AI 模型 model' },
+          { title: '测试连接', desc: '使用上方配置请求模型列表，验证地址与密钥是否可用', kind: 'buttons', disabledKey: 'aiEnabled', keywords: 'AI 测试 连接 test connection',
+            actions: [{ id: 'testAiConnection', label: '测试连接' }] },
+        ],
+      },
+      {
+        label: '技能 SKILL',
+        rows: [
+          { key: 'aiSkillsEnabled', title: '启用 .agents 技能目录', desc: '开启后，智能体将自动加载 .agents/skills 路径下的自定义技能', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 技能 skill agents 目录 TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiSkillsPath', title: '技能目录路径', desc: '相对于项目根目录', kind: 'text', width: 240, placeholder: '.agents/skills', disabledKey: 'aiEnabled', keywords: 'AI 技能 skill 路径 path TODO', todo: '仅持久化，待接入 AI 服务' },
+        ],
+      },
+      {
+        label: '规则 Rules',
+        rows: [
+          { key: 'aiRulesEnabled', title: '启用项目规则文件', desc: '开启后，智能体将自动加载规则文件中的项目约定', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 规则 rules agents.md TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiRulesPath', title: '规则文件路径', desc: '相对于项目根目录，如 AGENTS.md', kind: 'text', width: 240, placeholder: 'AGENTS.md', disabledKey: 'aiEnabled', keywords: 'AI 规则 rules 路径 path TODO', todo: '仅持久化，待接入 AI 服务' },
+        ],
+      },
+      {
+        label: '记忆 Memory',
+        rows: [
+          { key: 'aiMemoryEnabled', title: '启用跨会话记忆', desc: '开启后，智能体将记住你的偏好与项目上下文，跨会话生效', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 记忆 memory 跨会话 TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiMemoryLimit', title: '记忆条数上限', desc: '超出后自动淘汰最旧的记录', kind: 'number', width: 110, min: 10, max: 1000, step: 10, disabledKey: 'aiEnabled', keywords: 'AI 记忆 memory 上限 条数 TODO', todo: '仅持久化，待接入 AI 服务' },
+        ],
+      },
+      {
+        label: '终端执行',
+        rows: [
+          { key: 'aiMultilineExec', title: '允许多行命令直接执行', desc: '关闭时，含多行的命令仅可插入终端人工编辑；开启后多行命令整块提交执行', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 终端 执行 多行 命令 直接执行 代码块' },
+          { key: 'aiExecConfirmMode', title: '直接执行确认', kind: 'select', width: 140, disabledKey: 'aiEnabled',
+            options: [{ v: 'always', t: '每次确认' }, { v: 'risky', t: '高危命令确认' }, { v: 'never', t: '不确认' }],
+            keywords: 'AI 终端 执行 确认 弹窗 高危 授权 审批' },
+          { key: 'aiRiskKeywords', title: '自定义高危关键词', desc: '命令包含任一关键词（或内置高危规则，如 rm -rf、mkfs）时需确认；支持 # 注释行', kind: 'list', placeholder: '例如：docker system prune -a', disabledKey: 'aiEnabled', keywords: 'AI 高危 危险 命令 规则 关键词 确认 审批 risk 黑名单 添加' },
+        ],
+      },
+    ],
+  },
+  {
     id: 'about', label: '关于', glyph: 'about',
     title: '关于', sub: '版本信息与更新通道', about: true,
     groups: [
@@ -417,6 +479,20 @@ const searchEl = ref<HTMLInputElement | null>(null)
 const modalEl = ref<HTMLElement | null>(null)
 
 const draft = reactive(JSON.parse(JSON.stringify(savedSettings)) as AppSettings)
+
+/** AI 服务商预设 → 兼容 API 地址（custom 无预设） */
+const AI_PROVIDER_URLS: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  deepseek: 'https://api.deepseek.com/v1',
+  ollama: 'http://localhost:11434/v1',
+}
+/** 切换服务商时快捷填充地址：仅当地址为空或仍停留在旧预设地址时跟随，保留用户手改值 */
+watch(() => draft.aiProvider, (v, old) => {
+  const next = AI_PROVIDER_URLS[v]
+  if (!next) return
+  const prev = (old && AI_PROVIDER_URLS[old]) || ''
+  if (!draft.aiBaseUrl || draft.aiBaseUrl === prev) draft.aiBaseUrl = next
+})
 
 watch(showSettings, v => {
   if (!v) return
@@ -498,6 +574,27 @@ function numVal(key: keyof AppSettings): number {
 function boolVal(key: keyof AppSettings): boolean {
   return draft[key] as boolean
 }
+/* ---- list kind：换行分隔 string ↔ 行数组视图（环境变量式逐条编辑）。
+ *  存储格式与判定逻辑零改动，仅 UI 形态；空行保留以维持输入索引稳定（判定时跳过） ---- */
+function listVal(key: keyof AppSettings): string[] {
+  const v = strVal(key)
+  return v === '' ? [] : v.split('\n')
+}
+function setListLine(key: keyof AppSettings, i: number, v: string) {
+  const lines = listVal(key)
+  lines[i] = v
+  setVal(key, lines.join('\n'))
+}
+function addListLine(key: keyof AppSettings) {
+  const lines = listVal(key)
+  lines.push('')
+  setVal(key, lines.join('\n'))
+}
+function removeListLine(key: keyof AppSettings, i: number) {
+  const lines = listVal(key)
+  lines.splice(i, 1)
+  setVal(key, lines.join('\n'))
+}
 /** 行控件是否置灰：静态 disabled 优先；否则 disabledKey（单个或数组）中任一开关为 false；
  *  excludeKey 用于行内开关排除自身依赖（switchKey 本身不参与自身置灰判断） */
 function rowDisabled(r: RowDef, excludeKey?: keyof AppSettings): boolean {
@@ -507,9 +604,11 @@ function rowDisabled(r: RowDef, excludeKey?: keyof AppSettings): boolean {
     .filter(k => k !== excludeKey)
   return keys.some(k => !boolVal(k))
 }
-/** 文本行 placeholder：日志存储路径留空时展示后端下发的平台默认目录 */
+/** 文本行 placeholder：日志存储路径留空时展示后端下发的平台默认目录；
+ *  API 密钥已存钥匙串时提示"留空不修改" */
 function rowPlaceholder(r: RowDef): string | undefined {
   if (r.key === 'logStoragePath') return getSnapshot()?.defaultLogDir || r.placeholder
+  if (r.key === 'aiApiKey' && apiKeySaved.value) return '已保存到系统钥匙串，留空不修改'
   return r.placeholder
 }
 function resetOne(key: keyof AppSettings) {
@@ -653,13 +752,41 @@ onMounted(() => document.addEventListener('keydown', onKey))
 onUnmounted(() => document.removeEventListener('keydown', onKey))
 
 /* ---- 保存 / 放弃 ---- */
-function save() {
+/** list 项 key 集合（从面板定义推导，保持数据驱动） */
+const LIST_KEYS = PANELS
+  .flatMap(p => p.groups.flatMap(g => g.rows))
+  .filter(r => r.kind === 'list' && r.key)
+  .map(r => r.key!)
+async function save() {
+  // list 项规范化：trim 后剔除空行——未输入有效内容的行不保存（如点了「添加」却没输入）
+  for (const k of LIST_KEYS) {
+    const cleaned = strVal(k).split('\n').map(l => l.trim()).filter(l => l !== '').join('\n')
+    if (cleaned !== strVal(k)) setVal(k, cleaned)
+  }
+  // API 密钥迁移：输入框有值 → 存入系统钥匙串，配置文件中不再保留明文（留空表示不修改）
+  const apiKey = draft.aiApiKey.trim()
+  let keyMigrated = false
+  if (apiKey) {
+    if (isTauri) {
+      try {
+        await aiSetApiKey(apiKey)
+        apiKeySaved.value = true
+        keyMigrated = true
+      } catch (e) {
+        toast(`API 密钥保存失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`, 'err', 3600)
+        return
+      }
+    }
+    draft.aiApiKey = ''
+  }
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
   saveSettings(draft)
   syncLogConfig()
   if (storagePathChanged) {
     toast('日志存储路径已变更，重启应用后生效', 'warn', 3200)
+  } else if (keyMigrated) {
+    toast('设置已保存，API 密钥已存入系统钥匙串', 'ok', 2400)
   } else {
     toast('设置已保存', 'ok', 1800)
   }
@@ -677,6 +804,11 @@ const exportScope = ref<'full' | 'hosts' | 'ui'>('full')
 const EXPORT_PW_MIN = 6
 /** 配置文件操作进行中（禁用按钮防重复触发） */
 const cfgBusy = ref(false)
+/** AI 测试连接进行中（按钮禁用 + 文案切换） */
+const aiTesting = ref(false)
+/** 系统钥匙串中是否已保存 API Key（决定密钥输入框 placeholder） */
+const apiKeySaved = ref(false)
+if (isTauri) void aiHasApiKey().then(v => { apiKeySaved.value = v }).catch(() => {})
 
 function timeStamp() {
   const d = new Date()
@@ -834,6 +966,32 @@ async function onAction(id: string) {
     case 'openLogDir':
       void openLogDir()
       break
+    case 'testAiConnection':
+      void testAi()
+      break
+  }
+}
+
+/** 测试 AI 连接：用面板草稿值（可能尚未保存）请求 /models */
+async function testAi() {
+  if (aiTesting.value) return
+  const baseUrl = draft.aiBaseUrl.trim()
+  if (!baseUrl) {
+    toast('请先填写接口地址 Base URL', 'warn', 2200)
+    return
+  }
+  if (!isTauri) {
+    toast('请在桌面端测试连接', 'info', 2000)
+    return
+  }
+  aiTesting.value = true
+  try {
+    const r = await aiTestConnection(baseUrl, draft.aiApiKey.trim())
+    toast(`检测通过：${r.latencyMs} ms · HTTP ${r.status} · ${r.modelCount} 个可用模型`, 'ok', 3200)
+  } catch (e) {
+    toast(`连接失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`, 'err', 4000)
+  } finally {
+    aiTesting.value = false
   }
 }
 
@@ -973,7 +1131,7 @@ function optionList(r: RowDef): Opt[] {
                   v-for="r in g.rows"
                   :key="r.title"
                   class="st-row"
-                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' }"
+                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' || r.kind === 'list' }"
                 >
                   <div class="st-row-main">
                     <div class="st-row-title" :class="{ 'has-tail-switch': !!r.switchKey }">
@@ -1119,6 +1277,24 @@ function optionList(r: RowDef): Opt[] {
                       @input="setVal(r.key!, ($event.target as HTMLTextAreaElement).value)"
                     ></textarea>
 
+                    <!-- 动态行列表（环境变量式逐条编辑，如 AI 高危关键词） -->
+                    <div v-else-if="r.kind === 'list'" class="st-list">
+                      <div v-for="(line, i) in listVal(r.key!)" :key="i" class="st-list-row">
+                        <input
+                          class="st-input"
+                          type="text"
+                          :value="line"
+                          :placeholder="i === 0 ? (r.placeholder ?? '例如：docker system prune -a') : ''"
+                          :disabled="rowDisabled(r)"
+                          spellcheck="false"
+                          autocomplete="off"
+                          @input="setListLine(r.key!, i, ($event.target as HTMLInputElement).value)"
+                        >
+                        <button type="button" class="st-list-del" title="删除" :disabled="rowDisabled(r)" @click="removeListLine(r.key!, i)">✕</button>
+                      </div>
+                      <button type="button" class="st-list-add" :disabled="rowDisabled(r)" @click="addListLine(r.key!)">+ 添加关键词</button>
+                    </div>
+
                     <!-- 强调色 -->
                     <div v-else-if="r.kind === 'color'" class="st-colors">
                       <button
@@ -1168,9 +1344,9 @@ function optionList(r: RowDef): Opt[] {
                         v-for="a in r.actions"
                         :key="a.id"
                         class="btn"
-                        :disabled="cfgBusy"
+                        :disabled="cfgBusy || (a.id === 'testAiConnection' && aiTesting)"
                         @click="onAction(a.id)"
-                      >{{ a.label }}</button>
+                      >{{ a.id === 'testAiConnection' && aiTesting ? '检测中…' : a.label }}</button>
                     </template>
 
                     <!-- 控件下方辅助提示（独占一行右对齐） -->

@@ -2797,6 +2797,26 @@ body{
     font-family:var(--mono);font-size:11.5px;text-align:left;
     padding:7px 10px;
 }
+/* 动态行列表（环境变量式逐条编辑：输入行 + 删除 + 虚线添加按钮） */
+.st-list{display:flex;flex-direction:column;gap:6px;width:100%;align-items:flex-start}
+.st-list-row{display:flex;gap:6px;width:100%}
+.st-list-row .st-input{flex:1;font-family:var(--mono)}
+.st-list-del{
+    width:30px;height:30px;flex:none;border-radius:7px;
+    border:1px solid var(--border);background:var(--panel-2);
+    color:var(--muted);font-size:12px;line-height:1;cursor:pointer;
+    transition:border-color .13s,color .13s,background .13s;
+}
+.st-list-del:hover{color:var(--red);border-color:rgba(247,118,142,.5);background:rgba(247,118,142,.08)}
+.st-list-del:disabled{opacity:.4;cursor:not-allowed}
+.st-list-add{
+    padding:5px 14px;border-radius:7px;
+    border:1px dashed #2a3948;background:transparent;
+    color:var(--muted);font-size:11px;cursor:pointer;
+    transition:border-color .13s,color .13s,background .13s;
+}
+.st-list-add:hover{color:var(--text);border-color:#3a4c61;background:rgba(255,255,255,.03)}
+.st-list-add:disabled{opacity:.4;cursor:not-allowed}
 .st-input:disabled,.st-select:disabled,.st-textarea:disabled{opacity:.4;cursor:not-allowed}
 .st-switch:has(input:disabled){opacity:.4;cursor:not-allowed}
 .st-row-title.has-tail-switch{display:flex;align-items:center}

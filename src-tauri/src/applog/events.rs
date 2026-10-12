@@ -272,6 +272,8 @@ mod tests {
         let doc_path = std::path::Path::new(manifest)
             .join("..")
             .join("docs")
+            .join("explanation")
+            .join("design")
             .join("applog-design.md");
         let doc = std::fs::read_to_string(&doc_path)
             .unwrap_or_else(|e| panic!("读取设计文档失败 {}：{e}", doc_path.display()));

@@ -45,3 +45,11 @@ aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 zeroize = "1"
 base64 = "0.22"
+# AI 助手：OpenAI 兼容协议薄封装（json + SSE 流式；rustls 纯 Rust TLS，
+# 复用依赖树中的 aws-lc-rs，不引入 OpenSSL 动态库）
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+] }
+futures-util = "0.3"

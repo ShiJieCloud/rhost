@@ -1,8 +1,18 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { appView, rightPanelTab, rightPanelVisible } from '../stores/session'
+import { savedSettings } from '../stores/settings'
 
 const isHome = computed(() => appView.value === 'home')
+const aiEnabled = computed(() => savedSettings.aiEnabled)
+
+/** AI 关闭时若正停留在 AI 页签，折叠面板并回退到监控页签 */
+watch(aiEnabled, on => {
+  if (!on && rightPanelTab.value === 'ai') {
+    rightPanelTab.value = 'monitor'
+    rightPanelVisible.value = false
+  }
+})
 
 /** 点击图标：面板折叠→展开并切到对应页签；当前页签激活中→折叠；否则仅切换页签 */
 function onIcon(tab: 'monitor' | 'ai') {
@@ -35,6 +45,7 @@ function onIcon(tab: 'monitor' | 'ai') {
       </svg>
     </button>
     <button
+      v-if="aiEnabled"
       class="rail-btn"
       :class="{ on: rightPanelVisible && rightPanelTab === 'ai' }"
       title="AI 助手 (⌘I)"

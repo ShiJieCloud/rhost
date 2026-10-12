@@ -9,6 +9,8 @@ import '@xterm/xterm/css/xterm.css'
 import AppLogo from '../AppLogo.vue'
 import ContextMenu, { type MenuItem } from './ContextMenu.vue'
 import { toast } from '../../composables/useToast'
+import { registerTerm, unregisterTerm } from '../../lib/termRegistry'
+import { addToAiChat } from '../../stores/aiQuote'
 import { hosts, showNewConn } from '../../stores/hosts'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
 import {
@@ -158,6 +160,8 @@ const termMenuItems = ref<MenuItem[]>([])
 
 const ICON_COPY = 'M9 9h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2V9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'
 const ICON_PASTE = 'M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'
+/** AI 对话图标：聊天气泡 */
+const ICON_AI = 'M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'
 const ICON_CLEAR = 'M18 6L6 18M6 6l12 12'
 const ICON_SELECT = 'M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3'
 
@@ -187,6 +191,16 @@ function openTermMenu(id: string, x: number, y: number) {
   termMenuItems.value = [
     { label: '复制', icon: ICON_COPY, shortcut: '⌘C', disabled: !inst.term.hasSelection(), action: () => copySelection(id) },
     { label: '粘贴', icon: ICON_PASTE, shortcut: '⌘V', action: () => pasteFromClipboard(id) },
+    { divider: true },
+    {
+      label: '添加到 AI 对话', icon: ICON_AI, disabled: !inst.term.hasSelection(),
+      action: () => {
+        const text = inst.term.getSelection()
+        if (!text.trim()) return
+        addToAiChat(text)
+        toast('已添加到 AI 对话', 'ok', 1500)
+      },
+    },
     { divider: true },
     { label: '清屏', icon: ICON_CLEAR, action: () => inst.term.clear() },
     { label: '全选', icon: ICON_SELECT, shortcut: '⌘A', action: () => inst.term.selectAll() },
@@ -280,6 +294,8 @@ function mountTerminal(id: string) {
     })
   }))
   term.open(el)
+  // 注册到模块级注册表：AI 面板（App 层）读终端缓冲组装会话上下文用
+  registerTerm(id, term)
   // open 后根元素必然存在，提前取出供监听注册/清理使用
   const screenEl: HTMLElement = term.element!
 
@@ -388,6 +404,7 @@ watch(
       if (!ids.includes(id)) {
         // 先移除自定义监听（copy capture），再 dispose xterm
         for (const d of inst.disposables) d.dispose()
+        unregisterTerm(id)
         inst.term.dispose()
         termInsts.delete(id)
         termEls.delete(id)

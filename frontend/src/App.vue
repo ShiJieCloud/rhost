@@ -4,6 +4,7 @@ import TitleBar from './components/TitleBar.vue'
 import WbTitleBar from './components/wb/WbTitleBar.vue'
 import HomeView from './views/HomeView.vue'
 import Workbench from './views/Workbench.vue'
+import StatusBar from './components/wb/StatusBar.vue'
 import RightIconRail from './components/RightIconRail.vue'
 import RightPanel from './components/RightPanel.vue'
 import NewConnectionModal from './components/NewConnectionModal.vue'
@@ -98,6 +99,9 @@ onMounted(async () => {
       <RightPanel v-show="rightPanelVisible" />
       <RightIconRail />
     </div>
+
+    <!-- 状态栏提升到 App 层横贯全窗：右侧栏/图标栏底部对齐状态栏上沿，不再覆盖状态栏高度带 -->
+    <StatusBar v-if="appView === 'workbench'" />
 
     <NewConnectionModal />
     <SettingsModal />

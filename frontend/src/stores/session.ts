@@ -824,13 +824,14 @@ export function detachTerminal(id: string) {
 
 /** 前端键盘原始字节写入 PTY（低频控制消息走 invoke/JSON 无妨）。
  *  非 online（断线/重连等待/连接中）一律静默丢弃——输入冻结，
- *  既不下发也不本地回显，终端停留在断线瞬间的静态快照 */
-export function sendInput(id: string, data: string | Uint8Array) {
+ *  既不下发也不本地回显，终端停留在断线瞬间的静态快照。
+ *  返回 invoke Promise：常规调用方无需 await；AI 工具提案写入需判定成败 */
+export function sendInput(id: string, data: string | Uint8Array): Promise<void> {
   const s = sessions.value.find(x => x.id === id)
-  if (!s?.backendId || !isTauri || s.state !== 'online') return
+  if (!s?.backendId || !isTauri || s.state !== 'online') return Promise.resolve()
   const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
   // Tauri 序列化 Vec<u8> 需要普通数组（Uint8Array 会被 JSON 序列化成对象）
-  void invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
+  return invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
 }
 
 /* ============================================================
