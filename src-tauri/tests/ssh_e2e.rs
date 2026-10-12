@@ -399,19 +399,20 @@ async fn ssh_exec_collect_after_connect() {
     };
 
     // 1. 正常采集：stdout 合并返回
-    let out = session
+    let exec = session
         .exec_collect("echo RHOST_EXEC_OK; uname -srm", Duration::from_secs(3))
         .await
         .expect("exec 采集应成功");
+    let out = exec.output;
     assert!(out.contains("RHOST_EXEC_OK"), "exec 输出异常: {out}");
     assert!(out.contains("Linux"), "uname 输出异常: {out}");
 
-    // 2. 超时：慢命令必须在指定时间返回 Err（通道随 future drop 关闭）
-    let timed_out = session
+    // 2. 超时：慢命令在 deadline 到达时返回 timed_out=true（通道随作用域 drop 关闭）
+    let exec = session
         .exec_collect("sleep 2", Duration::from_millis(200))
         .await
-        .is_err();
-    assert!(timed_out, "exec 采集未按超时取消");
+        .expect("exec 超时应返回 Ok(timed_out)");
+    assert!(exec.timed_out, "exec 采集未按超时标记 timed_out");
 
     // 3. exec 与超时之后 PTY 终端仍可正常交互（通道物理隔离）
     session
@@ -1679,40 +1680,42 @@ async fn tunnel_remote_forward_curl_roundtrip_and_concurrency() {
     assert_eq!(st.bound_port, 24001, "远端回报端口应与请求一致");
 
     // 单发：容器内 curl 经远端转发回源到本进程
-    let out = session
+    let exec = session
         .exec_collect(
             "curl -s -m 5 http://127.0.0.1:24001/",
             Duration::from_secs(15),
         )
         .await
         .expect("容器内 curl 执行失败");
+    let out = exec.output;
     assert!(
         out.contains(BODY),
         "远端转发未回源到本地目标，curl 输出: {out}"
     );
 
     // 64 路并发：恰好打满单规则许可，全部应成功（无 panic / 挂起 / channel 提前 drop）
-    let out = session
+    let exec = session
         .exec_collect(
             "for i in $(seq 1 64); do curl -s -m 10 http://127.0.0.1:24001/ & done; wait",
             Duration::from_secs(40),
         )
         .await
         .expect("并发 curl 执行失败");
-    let hits = out.matches(BODY).count();
+    let hits = exec.output.matches(BODY).count();
     eprintln!("-R 并发：{hits}/64 回源成功");
     assert_eq!(hits, 64, "64 路并发应全部回源成功（实际 {hits}）");
 
     // 停止后远端端口关闭：curl 直接失败（连接拒绝）
     tunnel.stop("e2e-r1").await.expect("停止规则");
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let out = session
+    let exec = session
         .exec_collect(
             "curl -s -m 3 http://127.0.0.1:24001/ >/dev/null 2>&1; echo EXIT:$?",
             Duration::from_secs(10),
         )
         .await
         .expect("容器内 curl 探测执行失败");
+    let out = exec.output;
     assert!(!out.contains("EXIT:0"), "停止后远端端口仍可连接: {out}");
 
     session.shutdown();

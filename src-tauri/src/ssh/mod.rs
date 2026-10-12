@@ -14,6 +14,7 @@ pub mod sftp;
 pub mod tunnel;
 
 pub use manager::SessionManager;
+pub use session::ExecOutput;
 
 /// 认证方式：一键连接仅支持密码与公钥两种，其余（agent/OTP）暂不支持
 #[derive(Debug, Clone)]

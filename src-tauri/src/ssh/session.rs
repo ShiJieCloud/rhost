@@ -1128,6 +1128,20 @@ pub fn metric_exec_concurrency() -> (usize, usize) {
     )
 }
 
+/// exec channel 执行结果（stdout/stderr 合并文本 + 退出码 + 超时标记）。
+///
+/// 退出码语义：`Some(0)` 成功；`Some(n>0)` 命令业务失败（文件不存在/权限拒绝等，
+/// 错误信息在 `output` 中）；`None` 通道未给出 ExitStatus（含超时）。
+/// `timed_out=true` 时 `output` 为已收到的部分片段（可能非空）。
+pub struct ExecOutput {
+    /// stdout + stderr 合并文本（超时时为部分片段）
+    pub output: String,
+    /// 远端命令退出码
+    pub exit_code: Option<i32>,
+    /// true 表示执行超时，output 为部分输出
+    pub timed_out: bool,
+}
+
 /// 在飞计数 RAII 守卫：无论 exec 成功/失败/提前返回，离开作用域即递减。
 struct InflightGuard;
 impl InflightGuard {
@@ -1418,65 +1432,102 @@ impl SshSession {
         self.cwd.lock().await.clone()
     }
 
-    /// 在独立 exec 子通道执行采集脚本，返回 stdout/stderr 合并的文本。
+    /// 在独立 exec 子通道执行采集脚本，返回 stdout/stderr 合并文本、退出码与超时标记。
     ///
     /// 与 PTY 交互通道完全隔离：不申请 PTY、不经键盘输入、不解析终端流，
-    /// 用于 MOTD 之后的主机指标采集（0x05 静态信息 / 0x06 周期指标）。
+    /// 用于 MOTD 之后的主机指标采集（0x05 静态信息 / 0x06 周期指标），
+    /// 以及 AI ReAct 只读工具（read_file / list_directory / get_system_info）。
     ///
     /// - `script_body` 为 `/bin/sh` 命令体（POSIX sh，兼容 fish/tcsh 用户 shell），
     ///   单引号按标准 shell 规则转义，禁止拼接任何会话参数字段；
-    /// - 整次执行受 `timeout` 约束；超时后 future 与通道随作用域 drop 关闭，
+    /// - 整次执行受 `timeout` 约束；超时采用 deadline-based 循环内超时：
+    ///   `channel_open_session`/`ch.exec`/`ch.wait` 均受同一 deadline 约束，
+    ///   超时后 break 并返回已收到的部分 output（标记 `timed_out=true`），
+    ///   不丢弃已到达的 stdout/stderr 片段；通道随作用域 drop 关闭，
     ///   远端 sh 收 SIGHUP/SIGPIPE 退出，无残留进程；
     /// - 同一会话的 exec 通道由 Mutex 串行（collector 侧另有单飞保证，不会竞争）。
     pub async fn exec_collect(
         &self,
         script_body: &str,
         timeout: Duration,
-    ) -> Result<String, SshError> {
+    ) -> Result<ExecOutput, SshError> {
         let wrapped = format!("/bin/sh -c '{}'", script_body.replace('\'', "'\\''"));
+        let deadline = Instant::now() + timeout;
 
-        let fut = async {
-            // 全局并发闸门：极端并发（批量会话齐启动/重连风暴/前端门控失效）下限制同时
-            // 在飞的 exec 通道，保护本机 fd 与远端 sshd MaxSessions。正常负载下立即取牌。
-            // permit 在整个 channel 读写期间持有，随本 async 块结束 drop 归还；
-            // 排队取牌也被外层 timeout 覆盖，慢主机上不会无限挂起。
-            let _permit = METRIC_EXEC_GATE
-                .acquire()
-                .await
-                .map_err(|e| SshError::Channel(format!("exec 闸门已关闭: {e}")))?;
-            // 取到牌才计入在飞（不计排队），守卫随本块结束 drop 递减，成功失败都不漏
-            let _inflight = InflightGuard::enter();
-            let handle = self.handle.lock().await;
-            let mut ch = handle
+        // 全局并发闸门：极端并发（批量会话齐启动/重连风暴/前端门控失效）下限制同时
+        // 在飞的 exec 通道，保护本机 fd 与远端 sshd MaxSessions。正常负载下立即取牌。
+        // permit 在整个 channel 读写期间持有，随本函数结束 drop 归还；
+        // 排队取牌也被 deadline 覆盖，慢主机上不会无限挂起。
+        let _permit = METRIC_EXEC_GATE
+            .acquire()
+            .await
+            .map_err(|e| SshError::Channel(format!("exec 闸门已关闭: {e}")))?;
+        // 取到牌才计入在飞（不计排队），守卫随本块结束 drop 递减，成功失败都不漏
+        let _inflight = InflightGuard::enter();
+        let handle = self.handle.lock().await;
+
+        // channel_open_session + ch.exec 受 deadline 约束：超时返回部分输出为空
+        let open_fut = async {
+            let ch = handle
                 .channel_open_session()
                 .await
                 .map_err(|e| SshError::Channel(e.to_string()))?;
             ch.exec(true, wrapped)
                 .await
                 .map_err(|e| SshError::Channel(e.to_string()))?;
-
-            let mut out = Vec::new();
-            while let Some(msg) = ch.wait().await {
-                match msg {
-                    ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                    ChannelMsg::ExtendedData { data, .. } => out.extend_from_slice(&data),
-                    ChannelMsg::Close => break,
-                    _ => {}
-                }
+            Ok::<_, SshError>(ch)
+        };
+        let mut ch = match tokio::time::timeout_at(deadline, open_fut).await {
+            // deadline 内成功打开并 exec
+            Ok(Ok(ch)) => ch,
+            // deadline 内打开/exec 失败
+            Ok(Err(e)) => return Err(e),
+            // deadline 超时
+            Err(_) => {
+                return Ok(ExecOutput {
+                    output: String::new(),
+                    exit_code: None,
+                    timed_out: true,
+                });
             }
-            let _ = ch.close().await;
-            // 远端命令输出均为 UTF-8 文本（/proc、df 等）；非法字节不致命，
-            // 与 MOTD 采集一致用 from_utf8_lossy 语义交给解析层降级
-            Ok::<_, SshError>(String::from_utf8_lossy(&out).into_owned())
         };
 
-        match time::timeout(timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(SshError::Channel(format!(
-                "exec 采集超时（{}s）",
-                timeout.as_secs()
-            ))),
+        let mut out = Vec::new();
+        let mut exit_code = None;
+        let mut timed_out = false;
+        // deadline-based 循环内超时：逐次 ch.wait 竞速剩余时间，
+        // 超时时 break 并保留 out 中已收到的部分片段
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                break;
+            }
+            match tokio::time::timeout(remaining, ch.wait()).await {
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+                Ok(None) => break, // 通道关闭
+                Ok(Some(msg)) => match msg {
+                    ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, .. } => out.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        exit_code = Some(exit_status as i32);
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                },
+            }
         }
+        let _ = ch.close().await;
+        // 远端命令输出均为 UTF-8 文本（/proc、df 等）；非法字节不致命，
+        // 与 MOTD 采集一致用 from_utf8_lossy 语义交给解析层降级
+        Ok(ExecOutput {
+            output: String::from_utf8_lossy(&out).into_owned(),
+            exit_code,
+            timed_out,
+        })
     }
 
     /// 启动动态指标采集（0x06）。幂等：已在采集则先停旧任务再以新间隔启动。

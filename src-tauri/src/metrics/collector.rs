@@ -179,7 +179,8 @@ async fn run(
             .exec_collect(&metrics_script(with_disk, with_gpu), ROUND_TIMEOUT)
             .await
         {
-            Ok(text) => {
+            Ok(exec) => {
+                let text = exec.output;
                 // exec 成功即解除退避（即使部分 marker 段缺失也算通道健康）
                 consecutive_failures = 0;
                 ever_succeeded = true;

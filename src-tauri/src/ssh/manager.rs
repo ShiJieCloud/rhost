@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::debug;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
-use super::session::SshSession;
+use super::session::{ExecOutput, SshSession};
 use super::sftp::{RemoteDirListing, TransferProgress};
 use super::{SessionConfig, SshError};
 use tauri::ipc::Channel;
@@ -68,6 +69,24 @@ impl SessionManager {
         };
         match session {
             Some(s) => s.resize(cols, rows).await,
+            None => Err(SshError::NotFound),
+        }
+    }
+
+    /// 经 exec channel 执行只读命令（转发 SshSession.exec_collect）。
+    /// 用于 AI ReAct 只读工具（read_file / list_directory / get_system_info）。
+    pub async fn exec_collect(
+        &self,
+        session_id: &str,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<ExecOutput, SshError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+        match session {
+            Some(s) => s.exec_collect(script, timeout).await,
             None => Err(SshError::NotFound),
         }
     }
