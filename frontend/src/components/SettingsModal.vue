@@ -11,7 +11,7 @@ import {
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
-import { aiHasApiKey, aiListPromptAssets, aiRevealPromptDir, aiSetApiKey, aiTestConnection, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
+import { aiClearMemories, aiHasApiKey, aiListMemories, aiListPromptAssets, aiRevealPromptDir, aiSaveMemories, aiSetApiKey, aiTestConnection, AI_MEMORY_CONTENT_MAX_CHARS, type AiMemoryItem, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
 import {
@@ -30,7 +30,7 @@ import {
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
   | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'list' | 'exportOptions'
-  | 'assetList'
+  | 'assetList' | 'memoryList' | 'memoryAdd'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -67,6 +67,7 @@ interface RowDef {
       | 'resetSettings'
       | 'changelog' | 'checkUpdate' | 'openLogDir' | 'testAiConnection'
       | 'openSkillsDir' | 'openRulesDir' | 'refreshAssets'
+      | 'clearMemories'
     label: string
   }[]
 }
@@ -446,8 +447,12 @@ const PANELS: PanelDef[] = [
       {
         label: '记忆 Memory',
         rows: [
-          { key: 'aiMemoryEnabled', title: '启用跨会话记忆', desc: '开启后，智能体将记住你的偏好与项目上下文，跨会话生效', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 记忆 memory 跨会话 TODO', todo: '仅持久化，待接入 AI 服务' },
-          { key: 'aiMemoryLimit', title: '记忆条数上限', desc: '超出后自动淘汰最旧的记录', kind: 'number', width: 110, min: 10, max: 1000, step: 10, disabledKey: 'aiEnabled', keywords: 'AI 记忆 memory 上限 条数 TODO', todo: '仅持久化，待接入 AI 服务' },
+          { key: 'aiMemoryEnabled', title: '启用跨会话记忆', desc: '开启后，智能体将从对话中提取你的偏好与项目上下文，跨会话生效；记忆内容将随对话发送给模型服务商', kind: 'switch', disabledKey: 'aiEnabled', keywords: 'AI 记忆 memory 跨会话 提取' },
+          { key: 'aiMemoryLimit', title: '记忆条数上限', desc: '超出后自动淘汰最旧的记录', kind: 'number', width: 110, min: 10, max: 1000, step: 10, disabledKey: ['aiEnabled', 'aiMemoryEnabled'], keywords: 'AI 记忆 memory 上限 条数' },
+          { title: '手动添加记忆', desc: '直接写入一条记忆（≤ 200 字符），随对话注入', kind: 'memoryAdd', disabledKey: ['aiEnabled', 'aiMemoryEnabled'], keywords: 'AI 记忆 memory 添加 手动 新增' },
+          { title: '记忆列表', desc: '对话中自动提取或手动添加的记忆，可逐条删除', kind: 'memoryList', disabledKey: ['aiEnabled', 'aiMemoryEnabled'], keywords: 'AI 记忆 memory 列表 删除' },
+          { title: '清空记忆', desc: '删除全部记忆条目，不可恢复', kind: 'buttons', disabledKey: ['aiEnabled', 'aiMemoryEnabled'], keywords: 'AI 记忆 memory 清空 删除',
+            actions: [{ id: 'clearMemories', label: '清空全部记忆' }] },
         ],
       },
       {
@@ -516,9 +521,12 @@ watch(showSettings, v => {
   nextTick(() => searchEl.value?.focus())
 })
 
-// 切到 AI 页签时拉取一次技能/规则目录清单（手动重拉走「刷新列表」按钮）
+// 切到 AI 页签时拉取一次技能/规则目录清单与记忆列表（手动重拉走「刷新列表」按钮）
 watch(activePanelId, id => {
-  if (id === 'ai') void refreshPromptAssets()
+  if (id === 'ai') {
+    void refreshPromptAssets()
+    void refreshMemories()
+  }
 })
 
 function close() {
@@ -992,6 +1000,9 @@ async function onAction(id: string) {
     case 'refreshAssets':
       void refreshPromptAssets(true)
       break
+    case 'clearMemories':
+      void clearAllMemories()
+      break
   }
 }
 
@@ -1044,6 +1055,90 @@ function toggleAsset(kind: 'skills' | 'rules', fileName: string, enabled: boolea
 
 function fmtSize(n: number): string {
   return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`
+}
+
+/* ---- 跨会话记忆（M3.3） ---- */
+
+/** 记忆条目：组件内独立 ref 持有（rows 为静态 schema，数据不进 schema） */
+const memories = ref<AiMemoryItem[]>([])
+const memoriesLoading = ref(false)
+/** 手动添加输入框草稿 */
+const memoryDraft = ref('')
+
+/** 拉取记忆列表；切到 AI 页签自动拉一次 */
+async function refreshMemories() {
+  if (!isTauri || memoriesLoading.value) return
+  memoriesLoading.value = true
+  try {
+    memories.value = await aiListMemories()
+  } catch (e) {
+    toast(`加载记忆列表失败：${e}`, 'err', 2600)
+  } finally {
+    memoriesLoading.value = false
+  }
+}
+
+/** 手动添加一条记忆（非空校验；≤ 200 字符由 maxlength + 截断双保险） */
+async function addMemory() {
+  const content = memoryDraft.value.trim()
+  if (!content || !isTauri) return
+  const item: AiMemoryItem = {
+    id: crypto.randomUUID(),
+    content: Array.from(content).slice(0, AI_MEMORY_CONTENT_MAX_CHARS).join(''),
+    createdAt: Date.now(),
+    sourceScope: 'manual',
+  }
+  try {
+    await aiSaveMemories([...memories.value, item])
+    memories.value = [...memories.value, item]
+    memoryDraft.value = ''
+    toast('记忆已添加', 'ok', 1500)
+  } catch (e) {
+    toast(`添加记忆失败：${e}`, 'err', 2600)
+  }
+}
+
+/** 删除一条记忆 */
+async function removeMemory(id: string) {
+  if (!isTauri) return
+  const next = memories.value.filter(m => m.id !== id)
+  try {
+    await aiSaveMemories(next)
+    memories.value = next
+  } catch (e) {
+    toast(`删除记忆失败：${e}`, 'err', 2600)
+  }
+}
+
+/** 清空全部记忆（危险操作，二次确认） */
+async function clearAllMemories() {
+  if (!isTauri) return
+  const ok = await confirmDialog(
+    `将删除全部 ${memories.value.length} 条记忆，不可恢复。确定继续吗？`,
+    '清空全部记忆',
+    { confirmText: '清空', cancelText: '取消' },
+  )
+  if (!ok) return
+  try {
+    await aiClearMemories()
+    memories.value = []
+    toast('记忆已清空', 'ok', 1500)
+  } catch (e) {
+    toast(`清空记忆失败：${e}`, 'err', 2600)
+  }
+}
+
+/** 记忆列表元信息行：创建时间 + 来源（手动添加 / 全局对话 / 会话 id 前 8 位） */
+function fmtMemoryMeta(m: AiMemoryItem): string {
+  const d = new Date(m.createdAt)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const ts = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const from = m.sourceScope === 'manual'
+    ? '手动添加'
+    : m.sourceScope === 'global'
+      ? '全局对话'
+      : `会话 ${m.sourceScope.slice(0, 8)}`
+  return `${ts} · ${from}`
 }
 
 /** 测试 AI 连接：用面板草稿值（可能尚未保存）请求 /models */
@@ -1205,7 +1300,7 @@ function optionList(r: RowDef): Opt[] {
                   v-for="r in g.rows"
                   :key="r.title"
                   class="st-row"
-                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' || r.kind === 'list' || r.kind === 'assetList' }"
+                  :class="{ modified: r.key && isDirty(r.key), stack: r.kind === 'textarea' || r.kind === 'list' || r.kind === 'assetList' || r.kind === 'memoryList' || r.kind === 'memoryAdd' }"
                 >
                   <div class="st-row-main">
                     <div class="st-row-title" :class="{ 'has-tail-switch': !!r.switchKey }">
@@ -1446,6 +1541,36 @@ function optionList(r: RowDef): Opt[] {
                         </div>
                       </template>
                       <div v-else class="st-asset-empty">目录为空 —— 将 .md 文件放入目录即自动生效</div>
+                    </div>
+
+                    <!-- 手动添加记忆（M3.3：Enter 或点按钮提交） -->
+                    <div v-else-if="r.kind === 'memoryAdd'" class="st-mem-add">
+                      <input
+                        v-model="memoryDraft"
+                        class="st-input"
+                        type="text"
+                        :maxlength="AI_MEMORY_CONTENT_MAX_CHARS"
+                        placeholder="例如：生产环境变更需先在 staging 验证"
+                        spellcheck="false"
+                        autocomplete="off"
+                        :disabled="rowDisabled(r)"
+                        @keydown.enter="addMemory"
+                      >
+                      <button class="btn" :disabled="rowDisabled(r) || !memoryDraft.trim()" @click="addMemory">添加</button>
+                    </div>
+
+                    <!-- 记忆列表（M3.3：逐条删除；复用 st-assets 结构样式） -->
+                    <div v-else-if="r.kind === 'memoryList'" class="st-assets">
+                      <template v-if="memories.length">
+                        <div v-for="m in memories" :key="m.id" class="st-asset-row">
+                          <div class="st-asset-main">
+                            <span class="st-asset-name">{{ m.content }}</span>
+                            <span class="st-asset-desc">{{ fmtMemoryMeta(m) }}</span>
+                          </div>
+                          <button class="st-env-del" title="删除该条记忆" :disabled="rowDisabled(r)" @click="removeMemory(m.id)">✕</button>
+                        </div>
+                      </template>
+                      <div v-else class="st-asset-empty">暂无记忆 —— 对话中产生的偏好与事实将自动记录在这里</div>
                     </div>
 
                     <!-- 控件下方辅助提示（独占一行右对齐） -->
