@@ -4,7 +4,8 @@
 //! - 协议：OpenAI 兼容 `chat/completions` 流式（SSE）与 `GET /models` 探活；
 //! - 凭据：API Key 仅存系统钥匙串（复用 [`crate::store`] 的跨平台封装），
 //!   旧版明文 `settings.aiApiKey` 作为只读回退，前端保存后即完成迁移；
-//! - 会话记录：按 scope（"global" | SSH 会话 id）落盘到 `app_config_dir/ai/chats/`。
+//! - 会话记录：按 scope（"global" | SSH 会话 id）落盘到 `app_config_dir/ai/chats/`；
+//! - 跨会话记忆：全局记忆条目落盘到 `app_config_dir/ai/memory/memory.json`（M3.3）。
 //!
 //! 流式事件（`app.emit` 广播，前端按 scope 过滤）：
 //! - `ai-token` `{scope, kind: "content"|"reasoning", delta}`：增量 token；
@@ -678,19 +679,17 @@ struct NonStreamMessage {
     content: String,
 }
 
-/// 滚动摘要：把旧摘要与待压缩消息合并为一份新摘要（非流式，一次性返回）。
-/// 摘要请求不经过 scope 事件通道，与进行中的对话流互不干扰。
-#[tauri::command]
-pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<String, String> {
-    if messages.is_empty() {
-        return Err("摘要输入为空".to_string());
-    }
-    let cfg = read_ai_settings(&app)?;
-
+/// 非流式对话调用（滚动摘要/记忆提取共用）：system 指令 + 消息，60s 超时，
+/// 取首个 choice 的 message.content；空内容报错
+async fn chat_non_stream(
+    cfg: &AiCfg,
+    sys_prompt: &str,
+    messages: Vec<AiMessage>,
+) -> Result<String, String> {
     let mut wired: Vec<AiMessage> = Vec::with_capacity(messages.len() + 1);
     wired.push(AiMessage {
         role: "system".into(),
-        content: Some(SUMMARIZE_PROMPT.into()),
+        content: Some(sys_prompt.into()),
         tool_calls: None,
         tool_call_id: None,
     });
@@ -710,7 +709,7 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
 
     let resp = timeout(std::time::Duration::from_secs(60), req.send())
         .await
-        .map_err(|_| "摘要请求超时（60s）".to_string())?
+        .map_err(|_| "请求超时（60s）".to_string())?
         .map_err(|e| format!("请求模型服务失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
@@ -721,16 +720,27 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
     let data: NonStreamResp = resp
         .json()
         .await
-        .map_err(|e| format!("解析摘要响应失败: {e}"))?;
+        .map_err(|e| format!("解析响应失败: {e}"))?;
     let content = data
         .choices
         .first()
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_default();
     if content.is_empty() {
-        return Err("模型返回了空摘要".to_string());
+        return Err("模型返回了空内容".to_string());
     }
     Ok(content)
+}
+
+/// 滚动摘要：把旧摘要与待压缩消息合并为一份新摘要（非流式，一次性返回）。
+/// 摘要请求不经过 scope 事件通道，与进行中的对话流互不干扰。
+#[tauri::command]
+pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<String, String> {
+    if messages.is_empty() {
+        return Err("摘要输入为空".to_string());
+    }
+    let cfg = read_ai_settings(&app)?;
+    chat_non_stream(&cfg, SUMMARIZE_PROMPT, messages).await
 }
 
 /* =========================================================
@@ -877,6 +887,135 @@ pub fn ai_reveal_prompt_dir(app: AppHandle, kind: String) -> Result<String, Stri
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败 {}：{e}", dir.display()))?;
     tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| e.to_string())?;
     Ok(dir.display().to_string())
+}
+
+/* =========================================================
+ *  跨会话记忆（M3.3：ai/memory/memory.json）
+ * ========================================================= */
+
+/// 单条记忆内容上限：200 字符（约 100 tokens，足够一条偏好/事实描述）；
+/// 前端保存前已截断，此处为写入兜底
+const MEMORY_CONTENT_MAX_CHARS: usize = 200;
+
+/// 记忆条数上限的默认值与可调范围（对应 settings.aiMemoryLimit）
+const MEMORY_LIMIT_DEFAULT: usize = 100;
+const MEMORY_LIMIT_MIN: usize = 10;
+const MEMORY_LIMIT_MAX: usize = 1000;
+
+/// 一条跨会话记忆（全局存储、全局注入；source_scope 仅记录提取来源供展示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryItem {
+    /// 唯一标识（前端生成，提取合并时保留）
+    id: String,
+    /// 记忆内容（≤ 200 字符）
+    content: String,
+    /// 创建时间（epoch ms）
+    created_at: u64,
+    /// 提取时的对话归属（global | SSH 会话 id），仅展示用
+    source_scope: String,
+}
+
+fn memory_file(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("获取应用配置目录失败: {e}"))?
+        .join("ai")
+        .join("memory")
+        .join("memory.json"))
+}
+
+/// 读取记忆文件；不存在/解析失败均返回空 Vec（失败无害，对话主流程不受影响）
+fn load_memories(path: &Path) -> Vec<MemoryItem> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_else(|e| {
+        log::warn!("memory.json 解析失败，按空记忆处理: {e}");
+        Vec::new()
+    })
+}
+
+/// 记忆条数上限：读 settings.aiMemoryLimit，缺省/越界/读取失败回退默认
+fn memory_limit(app: &AppHandle) -> usize {
+    let Ok(path) = app_config_file(app) else {
+        return MEMORY_LIMIT_DEFAULT;
+    };
+    persisted::load_full(&path)
+        .settings
+        .get("aiMemoryLimit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(MEMORY_LIMIT_MIN, MEMORY_LIMIT_MAX))
+        .unwrap_or(MEMORY_LIMIT_DEFAULT)
+}
+
+/// 原子写记忆文件（tmp + rename，对齐 ai_save_chat）；写入前裁剪：
+/// 单条内容截断至 200 字符，总数超 limit 从头部淘汰最旧
+fn save_memories_file(path: &Path, items: &mut Vec<MemoryItem>, limit: usize) -> Result<(), String> {
+    for it in items.iter_mut() {
+        if it.content.chars().count() > MEMORY_CONTENT_MAX_CHARS {
+            it.content = it.content.chars().take(MEMORY_CONTENT_MAX_CHARS).collect();
+        }
+    }
+    if items.len() > limit {
+        let overflow = items.len() - limit;
+        items.drain(..overflow);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建记忆目录失败: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(items).map_err(|e| format!("序列化记忆失败: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("替换记忆文件失败: {e}"))?;
+    Ok(())
+}
+
+/// 删除记忆文件；不存在视为成功
+fn clear_memories_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("删除记忆文件失败: {e}")),
+    }
+}
+
+/// 读取全部记忆条目。无参数：文件由后端固定解析，前端不传路径，无路径穿越面
+#[tauri::command]
+pub fn ai_list_memories(app: AppHandle) -> Result<Vec<MemoryItem>, String> {
+    crate::slow_span!("ai_list_memories");
+    Ok(load_memories(&memory_file(&app)?))
+}
+
+/// 覆盖写入记忆条目（含单条 200 字符截断与设置上限淘汰最旧）
+#[tauri::command]
+pub fn ai_save_memories(app: AppHandle, mut items: Vec<MemoryItem>) -> Result<(), String> {
+    crate::slow_span!("ai_save_memories");
+    let limit = memory_limit(&app);
+    save_memories_file(&memory_file(&app)?, &mut items, limit)
+}
+
+/// 清空记忆；文件不存在视为成功
+#[tauri::command]
+pub fn ai_clear_memories(app: AppHandle) -> Result<(), String> {
+    crate::slow_span!("ai_clear_memories");
+    clear_memories_file(&memory_file(&app)?)
+}
+
+/// 记忆提取指令：从对话历史提取跨会话有价值的用户偏好/项目事实，输出 JSON 数组
+const EXTRACT_MEMORIES_PROMPT: &str = "你是记忆提取器。从对话历史中提取值得长期记住的用户偏好、项目上下文、重要事实。要求：\n1. 只提取跨会话有价值的信息（用户偏好、项目约定、常用环境、重要决策）；\n2. 不提取一次性问题、闲聊、已解决的临时故障；\n3. 不记录密码、私钥、API Key、Token 等敏感凭据；\n4. 每条记忆为简洁中文陈述句，不超过 200 字符；\n5. 输出为 JSON 数组，每项为含 content 字段的对象；若无可提取内容，输出 []；\n6. 直接输出 JSON，不要包裹 markdown 代码块，不要评论。\n若输入中包含「已有记忆」，将新提取的内容与已有记忆合并去重后输出完整数组。";
+
+/// 记忆提取：非流式调用，返回模型输出的 JSON 字符串。
+/// 解析/校验/合并/生成 id 在前端完成——模型输出可能不完美，前端容错，
+/// 后端不做结构假设。与对话流互不干扰（同 ai_summarize 通道）。
+#[tauri::command]
+pub async fn ai_extract_memories(app: AppHandle, messages: Vec<AiMessage>) -> Result<String, String> {
+    if messages.is_empty() {
+        return Err("提取输入为空".to_string());
+    }
+    let cfg = read_ai_settings(&app)?;
+    chat_non_stream(&cfg, EXTRACT_MEMORIES_PROMPT, messages).await
 }
 
 /* =========================================================
@@ -1046,6 +1185,68 @@ mod tests {
         // 目录不存在 → 空列表（失败无害）
         assert!(scan_prompt_dir(&dir.join("nonexistent")).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- M3.3 跨会话记忆 -------- */
+
+    fn mem(id: &str, content: &str, created_at: u64) -> MemoryItem {
+        MemoryItem {
+            id: id.into(),
+            content: content.into(),
+            created_at,
+            source_scope: "global".into(),
+        }
+    }
+
+    #[test]
+    fn memory_save_truncates_and_evicts_oldest() {
+        let dir = std::env::temp_dir().join(format!("rhost-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("memory.json");
+        let long = "x".repeat(MEMORY_CONTENT_MAX_CHARS + 50);
+
+        // limit=2：淘汰最旧的一条（a），保留 b/c
+        let mut items = vec![mem("a", "一", 1), mem("b", "二", 2), mem("c", "三", 3)];
+        save_memories_file(&path, &mut items, 2).unwrap();
+        let loaded = load_memories(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "b");
+        assert_eq!(loaded[1].id, "c");
+
+        // 单条内容超 200 字符被截断
+        let mut items = vec![mem("a", &long, 1)];
+        save_memories_file(&path, &mut items, 10).unwrap();
+        let loaded = load_memories(&path);
+        assert_eq!(loaded[0].content.chars().count(), MEMORY_CONTENT_MAX_CHARS);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_load_degrades_on_missing_or_invalid() {
+        let dir = std::env::temp_dir().join(format!("rhost-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.json");
+        // 不存在 → 空
+        assert!(load_memories(&path).is_empty());
+        // 非法 JSON → 空（fail-open）
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_memories(&path).is_empty());
+        // 结构不符 → 空
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        assert!(load_memories(&path).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_clear_idempotent() {
+        let dir = std::env::temp_dir().join(format!("rhost-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("memory.json");
+        // 不存在时删除不报错
+        clear_memories_file(&path).unwrap();
+        save_memories_file(&path, &mut vec![mem("a", "一", 1)], 10).unwrap();
+        clear_memories_file(&path).unwrap();
+        assert!(load_memories(&path).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

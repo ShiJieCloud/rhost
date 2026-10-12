@@ -272,6 +272,10 @@ pub fn run() {
             ai::ai_summarize,
             ai::ai_list_prompt_assets,
             ai::ai_reveal_prompt_dir,
+            ai::ai_list_memories,
+            ai::ai_save_memories,
+            ai::ai_clear_memories,
+            ai::ai_extract_memories,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
