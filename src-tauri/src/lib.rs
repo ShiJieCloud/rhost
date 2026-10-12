@@ -276,6 +276,8 @@ pub fn run() {
             ai::ai_save_memories,
             ai::ai_clear_memories,
             ai::ai_extract_memories,
+            ai::ai_exec_tool,
+            ai::ai_cancel_execs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

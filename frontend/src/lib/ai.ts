@@ -124,6 +124,33 @@ export function aiStopChat(scope: AiScope): Promise<void> {
   return invoke('ai_stop_chat', { scope })
 }
 
+/** 只读工具执行结果（serde camelCase；exitCode 为 Option<i32> → null | number） */
+export interface AiToolExecResult {
+  /** stdout + stderr 合并文本，已截断至 8KB（超时时为部分片段） */
+  output: string
+  /** true 表示原始输出超出 8KB 已截断 */
+  truncated: boolean
+  /** 远端退出码：0=成功；n>0=命令业务失败；null=通道未给出 ExitStatus（含超时/通道级故障） */
+  exitCode: number | null
+  /** true 表示执行超时，output 含已收到的部分输出（可能非空） */
+  timedOut: boolean
+}
+
+/** 经 SSH exec channel 执行只读工具（后端构造 shell 命令，前端只传 tool_name + args）。
+ *  工具：read_file / list_directory / get_system_info，自动执行无需授权。 */
+export function aiExecTool(
+  sessionId: string,
+  toolName: string,
+  args: string,
+): Promise<AiToolExecResult> {
+  return invoke<AiToolExecResult>('ai_exec_tool', { sessionId, toolName, args })
+}
+
+/** 取消指定会话的全部在飞 exec 任务（会话切换时调用，防后端堆积） */
+export function aiCancelExecs(sessionId: string): Promise<void> {
+  return invoke<void>('ai_cancel_execs', { sessionId })
+}
+
 /** 测试连接结果（serde camelCase） */
 export interface AiTestResult {
   latencyMs: number

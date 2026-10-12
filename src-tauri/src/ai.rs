@@ -33,6 +33,9 @@ const AI_KEYRING_ACCOUNT: &str = "ai-api-key";
 #[derive(Default)]
 pub struct AiState {
     cancels: StdMutex<HashMap<String, CancellationToken>>,
+    /// 会话在飞 exec 任务取消令牌：session_id → Vec<CancellationToken>。
+    /// 同一会话可能并行多个只读工具，用 Vec 收集；会话切换时全部取消。
+    exec_cancels: StdMutex<HashMap<String, Vec<CancellationToken>>>,
 }
 
 impl AiState {
@@ -51,6 +54,37 @@ impl AiState {
         // 仅移除自己：极端情况下新请求已顶替，不能误删新令牌
         if map.get(scope).is_some_and(|t| t == token) {
             map.remove(scope);
+        }
+    }
+
+    /// 登记新 exec 任务令牌，返回克隆供 tokio::select! 使用
+    fn register_exec(&self, session_id: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut map = self.exec_cancels.lock().unwrap();
+        map.entry(session_id.to_string())
+            .or_default()
+            .push(token.clone());
+        token
+    }
+
+    /// 取消并清除指定会话的全部在飞 exec 任务令牌
+    fn cancel_execs(&self, session_id: &str) {
+        let mut map = self.exec_cancels.lock().unwrap();
+        if let Some(tokens) = map.remove(session_id) {
+            for t in tokens {
+                t.cancel();
+            }
+        }
+    }
+
+    /// exec 完成后注销令牌（正常/超时/取消均调用，避免列表膨胀）
+    fn unregister_exec(&self, session_id: &str, token: &CancellationToken) {
+        let mut map = self.exec_cancels.lock().unwrap();
+        if let Some(tokens) = map.get_mut(session_id) {
+            tokens.retain(|t| t != token);
+            if tokens.is_empty() {
+                map.remove(session_id);
+            }
         }
     }
 }
@@ -216,30 +250,322 @@ pub fn ai_stop_chat(state: State<'_, AiState>, scope: String) {
     }
 }
 
-/// 内置工具定义：向用户终端提案命令。后端只定义协议，不执行——
-/// 提案经 `ai-tool-calls` 事件透传给前端，由用户裁决后写入终端（设计 §6.2）。
+/// 内置工具定义。后端只定义协议，不执行——
+/// 提案经 `ai-tool-calls` 事件透传给前端，由前端路由：
+/// - 只读工具（read_file / list_directory / get_system_info）经 SSH exec channel
+///   自动执行，无需用户授权；
+/// - propose_command 经用户裁决后写入终端 PTY 执行。
 fn builtin_tools() -> serde_json::Value {
-    serde_json::json!([{
-        "type": "function",
-        "function": {
-            "name": "propose_command",
-            "description": "向用户当前活动的终端提案一条命令。命令会完整展示给用户，经用户批准后写入终端并执行。仅在用户明确要求执行命令、操作远程服务器或排查问题时调用；不要用此工具获取信息或闲聊。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "要写入终端的命令原文，必须是用户可读可审的完整命令"
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "读取远程服务器上的文件内容。适用于查看配置文件、日志片段、脚本源码等。单次最多返回 8KB 文本，超出截断。路径不存在或无权限时返回错误信息。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "文件的绝对路径，如 /etc/nginx/nginx.conf" }
                     },
-                    "reason": {
-                        "type": "string",
-                        "description": "一句话说明执行这条命令的目的"
-                    }
-                },
-                "required": ["command"]
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "列出远程服务器上指定目录的文件和子目录，包含名称、类型、大小、权限、修改时间，以及条目类型统计（目录/普通文件/符号链接/socket 等数量）。适用于探索目录结构、查找配置文件位置、了解目录内容分布。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "目录的绝对路径，如 /etc/nginx" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_system_info",
+                "description": "获取远程服务器的系统信息快照：操作系统、内核版本、CPU 核数、内存、磁盘使用率、运行时间。无需参数。适用于了解环境后进行诊断。",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "编辑远程服务器上的文件，用 new_text 精确替换 old_text。适用于修改配置项、修复代码片段等小范围变更。old_text 必须与文件中现有内容完全匹配（含空白），否则替换失败。执行前会自动备份原文件。单次替换内容 ≤ 64KB。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "文件的绝对路径，如 /etc/nginx/nginx.conf" },
+                        "old_text": { "type": "string", "description": "要被替换的原始文本，必须与文件内容完全匹配" },
+                        "new_text": { "type": "string", "description": "替换后的新文本" }
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "将内容写入远程服务器上的文件，全量覆盖（文件不存在则创建）。适用于新建文件或大幅重写。执行前若文件已存在会自动备份。单次写入内容 ≤ 64KB。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "文件的绝对路径，如 /etc/nginx/conf.d/default.conf" },
+                        "content": { "type": "string", "description": "要写入的完整文件内容" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_command",
+                "description": "向用户当前活动的终端提案一条命令。命令会完整展示给用户，经用户批准后写入终端并执行。仅在需要执行命令行操作、重启服务、安装软件等场景时调用。文件读写请使用 read_file / edit_file / write_file，不要用此工具执行 cat/sed/echo 重定向等文件操作。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "要写入终端的命令原文，必须是用户可读可审的完整命令"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "一句话说明执行这条命令的目的"
+                        }
+                    },
+                    "required": ["command"]
+                }
             }
         }
-    }])
+    ])
+}
+
+/// 只读工具执行结果（前端 camelCase）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecResult {
+    /// stdout + stderr 合并文本，已截断至 8KB（超时时为部分片段）
+    output: String,
+    /// true 表示原始输出超出 8KB 已截断
+    truncated: bool,
+    /// 远端命令退出码：Some(0)=成功；Some(n>0)=命令业务失败；None=通道未给出 ExitStatus
+    exit_code: Option<i32>,
+    /// true 表示执行超时，output 含已收到的部分输出
+    timed_out: bool,
+}
+
+/// 工具名 → shell 命令构造（后端单点，前端不参与拼命令）
+fn build_tool_command(tool_name: &str, args: &str) -> Result<String, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(args).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    match tool_name {
+        "read_file" => {
+            let path = v
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("read_file 缺少 path 参数")?;
+            Ok(format!("head -c 8192 {}", shell_quote(path)))
+        }
+        "list_directory" => {
+            let path = v
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("list_directory 缺少 path 参数")?;
+            // ls -la 列表 + find 类型统计（f=普通文件 d=目录 l=符号链接 s=socket 等）
+            Ok(format!(
+                "ls -la --time-style=long-iso {}; echo '--- 类型统计 ---'; find {} -maxdepth 1 -printf '%y\\n' 2>/dev/null | sort | uniq -c",
+                shell_quote(path),
+                shell_quote(path)
+            ))
+        }
+        "get_system_info" => Ok(concat!(
+            "echo '== OS =='; ",
+            "(cat /etc/os-release 2>/dev/null || uname -s) | head -5; ",
+            "echo '== KERNEL =='; uname -r; ",
+            "echo '== CPU =='; nproc 2>/dev/null; ",
+            "echo '== MEMORY =='; free -h 2>/dev/null || echo 'N/A'; ",
+            "echo '== DISK =='; df -h / 2>/dev/null; ",
+            "echo '== UPTIME =='; uptime 2>/dev/null"
+        )
+        .to_string()),
+        "edit_file" => {
+            let path = v
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("edit_file 缺少 path 参数")?;
+            let old_text = v
+                .get("old_text")
+                .and_then(|v| v.as_str())
+                .ok_or("edit_file 缺少 old_text 参数")?;
+            let new_text = v
+                .get("new_text")
+                .and_then(|v| v.as_str())
+                .ok_or("edit_file 缺少 new_text 参数")?;
+            check_path_safe(path)?;
+            if old_text.len() > FILE_EDIT_MAX_BYTES || new_text.len() > FILE_EDIT_MAX_BYTES {
+                return Err(format!(
+                    "edit_file 内容超过 {} 字节上限",
+                    FILE_EDIT_MAX_BYTES
+                ));
+            }
+            if old_text.is_empty() {
+                return Err("edit_file old_text 不能为空".to_string());
+            }
+            // \Q...\E 禁用 old_text 的正则元字符解析，按字面量匹配
+            let old_escaped = format!("\\Q{}\\E", old_text);
+            // new_text 转义 perl 替换侧的特殊字符：\ $ @ /
+            let new_escaped = perl_replacement_escape(new_text);
+            Ok(format!(
+                "[ -f {} ] && cp {} {}.bak.$(date +%s) 2>/dev/null; perl -0pi -e 's/{}/{}/g' {}",
+                shell_quote(path),
+                shell_quote(path),
+                shell_quote(path),
+                old_escaped,
+                new_escaped,
+                shell_quote(path)
+            ))
+        }
+        "write_file" => {
+            let path = v
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("write_file 缺少 path 参数")?;
+            let content = v
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("write_file 缺少 content 参数")?;
+            check_path_safe(path)?;
+            if content.len() > FILE_EDIT_MAX_BYTES {
+                return Err(format!(
+                    "write_file 内容超过 {} 字节上限",
+                    FILE_EDIT_MAX_BYTES
+                ));
+            }
+            // heredoc 用单引号定界符防变量/命令替换展开
+            Ok(format!(
+                "[ -f {} ] && cp {} {}.bak.$(date +%s) 2>/dev/null; cat > {} << 'RHOST_EOF'\n{}\nRHOST_EOF",
+                shell_quote(path),
+                shell_quote(path),
+                shell_quote(path),
+                shell_quote(path),
+                content
+            ))
+        }
+        _ => Err(format!("未知工具: {tool_name}")),
+    }
+}
+
+/// 文件编辑单次内容上限：64KB
+const FILE_EDIT_MAX_BYTES: usize = 64 * 1024;
+
+/// 禁止写入的系统关键文件黑名单（精确匹配路径）
+const FORBIDDEN_PATHS: &[&str] = &[
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+];
+
+/// 校验写入路径是否在黑名单中
+fn check_path_safe(path: &str) -> Result<(), String> {
+    if FORBIDDEN_PATHS.iter().any(|p| path == *p) {
+        return Err(format!("禁止写入系统关键文件: {}", path));
+    }
+    Ok(())
+}
+
+/// perl 替换侧（new_text）转义：\ $ @ / 需转义，避免被 perl 解析为变量/分隔符
+fn perl_replacement_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '$' | '@' | '/' => out.push('\\'),
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 单引号 shell 转义：' → '\'' （与 exec_collect 的转义口径一致）
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 输出截断至 8KB UTF-8 字节（与 PROMPT_ASSET_MAX_BYTES 同口径）
+fn cap_output(s: &str) -> (bool, String) {
+    const MAX: usize = 8 * 1024;
+    let bytes = s.as_bytes();
+    if bytes.len() <= MAX {
+        return (false, s.to_string());
+    }
+    // 在 UTF-8 边界截断，避免拆分多字节字符
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (true, s[..end].to_string())
+}
+
+/// 执行只读工具：经 SessionManager 查找会话，exec_collect 执行 shell 命令。
+/// 工具名白名单 + 单引号转义防止注入；exec channel 与 PTY 共享同一 SSH 连接。
+#[tauri::command]
+pub async fn ai_exec_tool(
+    session_id: String,
+    tool_name: String,
+    args: String,
+    state: State<'_, crate::ssh::manager::SessionManager>,
+    ai_state: State<'_, AiState>,
+) -> Result<ToolExecResult, String> {
+    let cmd = build_tool_command(&tool_name, &args)?;
+
+    // 登记取消令牌：会话切换时前端调 ai_cancel_execs 取消在飞 exec
+    let token = ai_state.register_exec(&session_id);
+    let exec_fut = state.exec_collect(&session_id, &cmd, std::time::Duration::from_secs(10));
+    // exec_collect 与取消令牌竞速：令牌取消时 exec_fut 被 drop → 通道关闭
+    let result = tokio::select! {
+        _ = token.cancelled() => ToolExecResult {
+            output: String::new(),
+            truncated: false,
+            exit_code: None,
+            timed_out: false,
+        },
+        r = exec_fut => match r {
+            Ok(exec) => {
+                let (truncated, capped) = cap_output(&exec.output);
+                ToolExecResult {
+                    output: capped,
+                    truncated,
+                    exit_code: exec.exit_code,
+                    timed_out: exec.timed_out,
+                }
+            }
+            // 通道级故障（会话不存在/channel_open_session 失败等）：无任何输出
+            Err(_) => ToolExecResult {
+                output: String::new(),
+                truncated: false,
+                exit_code: None,
+                timed_out: false,
+            },
+        }
+    };
+    ai_state.unregister_exec(&session_id, &token);
+    Ok(result)
+}
+
+/// 取消指定会话的全部在飞 exec 任务（会话切换时前端调用，防后端堆积）
+#[tauri::command]
+pub fn ai_cancel_execs(session_id: String, ai_state: State<'_, AiState>) {
+    ai_state.cancel_execs(&session_id);
 }
 
 async fn run_stream(
@@ -1090,9 +1416,92 @@ mod tests {
     fn builtin_tools_shape() {
         let v = builtin_tools();
         let arr = v.as_array().expect("tools 应为数组");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["function"]["name"], "propose_command");
-        assert_eq!(arr[0]["function"]["parameters"]["required"][0], "command");
+        assert_eq!(arr.len(), 6);
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_directory",
+                "get_system_info",
+                "edit_file",
+                "write_file",
+                "propose_command"
+            ]
+        );
+        // propose_command 为最后一个，需含 command 参数
+        assert_eq!(arr[5]["function"]["parameters"]["required"][0], "command");
+        // read_file / list_directory 需 path 参数
+        assert_eq!(arr[0]["function"]["parameters"]["required"][0], "path");
+        assert_eq!(arr[1]["function"]["parameters"]["required"][0], "path");
+        // edit_file 需 path/old_text/new_text
+        assert_eq!(arr[3]["function"]["parameters"]["required"].as_array().unwrap().len(), 3);
+        // write_file 需 path/content
+        assert_eq!(arr[4]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn build_tool_command_mapping() {
+        // read_file
+        let cmd = build_tool_command("read_file", r#"{"path":"/etc/hosts"}"#).unwrap();
+        assert!(cmd.contains("head -c 8192"));
+        assert!(cmd.contains("'/etc/hosts'"));
+        // list_directory
+        let cmd = build_tool_command("list_directory", r#"{"path":"/var/log"}"#).unwrap();
+        assert!(cmd.starts_with("ls -la"));
+        assert!(cmd.contains("'/var/log'"));
+        // get_system_info 无参数
+        let cmd = build_tool_command("get_system_info", "{}").unwrap();
+        assert!(cmd.contains("uname"));
+        // edit_file：含 perl 替换 + 备份
+        let cmd = build_tool_command(
+            "edit_file",
+            r#"{"path":"/tmp/a","old_text":"foo","new_text":"bar"}"#
+        )
+        .unwrap();
+        assert!(cmd.contains("perl -0pi"));
+        assert!(cmd.contains("\\Qfoo\\E"));
+        assert!(cmd.contains("bar"));
+        assert!(cmd.contains(".bak.$(date +%s)"));
+        // write_file：含 heredoc + 备份
+        let cmd = build_tool_command("write_file", r#"{"path":"/tmp/b","content":"hello"}"#).unwrap();
+        assert!(cmd.contains("cat > '/tmp/b'"));
+        assert!(cmd.contains("RHOST_EOF"));
+        assert!(cmd.contains("hello"));
+        // 路径黑名单拒绝
+        assert!(build_tool_command("write_file", r#"{"path":"/etc/passwd","content":"x"}"#).is_err());
+        // 未知工具
+        assert!(build_tool_command("rm_rf", "{}").is_err());
+        // 缺少参数
+        assert!(build_tool_command("read_file", "{}").is_err());
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("/etc/hosts"), "'/etc/hosts'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn cap_output_truncates_at_8kb() {
+        let short = "hello".repeat(10);
+        let (truncated, _) = cap_output(&short);
+        assert!(!truncated);
+        // 8192 字节边界
+        let long = "a".repeat(9000);
+        let (truncated, capped) = cap_output(&long);
+        assert!(truncated);
+        assert_eq!(capped.len(), 8192);
+        // 多字节字符边界
+        let utf8 = "你".repeat(3000); // 每个 3 字节 = 9000 字节
+        let (truncated, capped) = cap_output(&utf8);
+        assert!(truncated);
+        assert!(capped.len() <= 8192);
+        assert!(capped.chars().all(|c| c == '你')); // 不拆字
     }
 
     #[test]

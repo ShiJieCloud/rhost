@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { activeSession, activeHost, activeSessionId, appView, rightPanelTab, rightPanelVisible, sendInput, sendInputAndCapture } from '../stores/session'
+import { activeSession, activeHost, activeSessionId, appView, rightPanelTab, rightPanelVisible, sendInput, sendInputAndCapture, sessions } from '../stores/session'
 import { savedSettings } from '../stores/settings'
 import { aiQuote } from '../stores/aiQuote'
 import { toast } from '../composables/useToast'
@@ -18,6 +18,8 @@ import {
   aiListPromptAssets,
   aiLoadChat,
   aiSaveChat,
+  aiCancelExecs,
+  aiExecTool,
   aiSaveMemories,
   aiStopChat,
   aiSummarize,
@@ -27,6 +29,7 @@ import {
   type AiPromptAsset,
   type AiPromptAssets,
   type AiScope,
+  type AiToolExecResult,
   type AiToolProposal,
   type AiWireMessage,
 } from '../lib/ai'
@@ -69,8 +72,9 @@ let unlisten: UnlistenFn | null = null
 let loadSeq = 0
 /** 工具循环轮次：用户输入归零，每次提案裁决续跑 +1，超上限自动续跑终止 */
 const toolRound = ref(0)
-/** 单次用户输入允许的最大工具循环轮次（覆盖「提案 → 执行 → 汇总」常规深度） */
-const MAX_TOOL_ROUNDS = 3
+/** 单次用户输入允许的最大工具循环轮次。
+ *  ReAct 场景：3~4 次只读探索 + 2~3 次命令执行 = 6 轮上限 */
+const MAX_TOOL_ROUNDS = 6
 
 function uid(): string {
   return crypto.randomUUID()
@@ -181,12 +185,18 @@ async function loadRecord(s: AiScope) {
   scrollToBottom()
 }
 
-watch(scope, s => {
+watch(scope, (s, oldS) => {
   loadSeq++
   streaming.value = false
   editFromId.value = null
   execPermission.value = 'manual' // 权限档随会话回落，杜绝「上次开的 full 忘了关」
   resetProposalState()
+  // 取消旧会话在飞的只读工具 exec 任务，防止后端堆积（旧 scope 非 global 时才需取消）
+  // 注意：ai_cancel_execs 需要后端 session_id（backendId），不是前端 scope
+  if (oldS && oldS !== 'global') {
+    const oldBackendId = sessions.value.find(s => s.id === oldS)?.backendId
+    if (oldBackendId) void aiCancelExecs(oldBackendId).catch(() => {}) // 失败静默，取消是尽力而为
+  }
   void loadRecord(s)
 })
 
@@ -234,24 +244,35 @@ onMounted(async () => {
           id: c.id,
           name: c.name,
           args,
-          reason: parsed?.reason,
+          reason: c.name === 'propose_command' ? parsed?.reason : undefined,
           state: 'pending' as const,
         }
       })
-      // 自动执行分流（权限档 M2.3 ③）：豁免表命中（任何档位，用户显式豁免优先）
-      // 或 risky 档低危或 full 档 → 免弹窗直接执行；否则照旧入队弹窗
+      // 按工具名路由分流：
+      // - propose_command / edit_file / write_file：走授权路径（权限档决定自动/弹窗）
+      // - 只读工具（read_file / list_directory / get_system_info）：自动执行，无需授权
       const allow = sessionAllowlist.get(scope.value)
+      const WRITE_TOOLS = ['propose_command', 'edit_file', 'write_file']
       for (const p of last.toolProposals) {
         if (p.state !== 'pending') continue
-        const cmd = parseProposalArgs(p.args)?.command
-        if (!cmd) continue
-        if (allow?.has(cmd)) {
-          autoApply(p, 'session')
-        } else if (
-          execPermission.value === 'full' ||
-          (execPermission.value === 'risky' && !matchHighRisk(cmd, savedSettings.aiRiskKeywords.split('\n')))
-        ) {
-          autoApply(p, 'once')
+        if (WRITE_TOOLS.includes(p.name)) {
+          // 写操作：豁免表仅对 propose_command 精确匹配命令生效，文件编辑不进豁免表
+          if (p.name === 'propose_command') {
+            const cmd = parseProposalArgs(p.args)?.command
+            if (!cmd) continue
+            if (allow?.has(cmd)) {
+              autoApply(p, 'session')
+              continue
+            }
+          }
+          if (execPermission.value === 'full') {
+            // full 档：写操作全自动放行
+            autoApply(p, 'once')
+          }
+          // manual / risky 档：写操作留 pending，由 pumpProposals 入队弹窗
+        } else {
+          // 只读工具：无条件自动执行（不经授权弹窗）
+          autoExecReadonly(p)
         }
       }
       persist()
@@ -545,8 +566,67 @@ function proposalCommand(p: AiToolProposal): string {
   return parseProposalArgs(p.args)?.command ?? p.args
 }
 
-/** 提案裁决结果 → tool 结果消息内容（模型据此了解裁决与执行情况） */
+/** 只读工具中文标签 */
+function readonlyLabel(name: string): string {
+  return (
+    {
+      read_file: '读取文件',
+      list_directory: '列出目录',
+      get_system_info: '系统信息',
+      edit_file: '编辑文件',
+      write_file: '写入文件',
+    }[name] ?? name
+  )
+}
+
+/** 工具参数展示（get_system_info 无参数，其余取 path） */
+function readonlyArgs(p: AiToolProposal): string {
+  if (p.name === 'get_system_info') return ''
+  try {
+    const v = JSON.parse(p.args)
+    return typeof v?.path === 'string' ? v.path : p.args
+  } catch {
+    return p.args
+  }
+}
+
+/** edit_file 的 old_text 预览 */
+function fileEditOld(p: AiToolProposal): string {
+  try {
+    const v = JSON.parse(p.args)
+    return typeof v?.old_text === 'string' ? v.old_text : ''
+  } catch {
+    return ''
+  }
+}
+
+/** edit_file 的 new_text 或 write_file 的 content 预览 */
+function fileEditNew(p: AiToolProposal): string {
+  try {
+    const v = JSON.parse(p.args)
+    if (p.name === 'edit_file') return typeof v?.new_text === 'string' ? v.new_text : ''
+    return typeof v?.content === 'string' ? v.content : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 计算文本行数（空文本算 0 行） */
+function countLines(text: string): number {
+  if (!text) return 0
+  return text.split('\n').length
+}
+
+/** 提案裁决结果 → tool 结果消息内容（模型据此了解裁决与执行情况）。
+ *  只读工具直接返回原始输出文本，模型据此理解远程环境；
+ *  propose_command 保持既有结构化 JSON 格式。 */
 function toolResultOf(p: AiToolProposal): string {
+  // 只读工具：直接返回输出文本（模型据此理解远程环境）
+  if (p.name !== 'propose_command') {
+    if (p.error) return JSON.stringify({ error: p.error })
+    return p.execOutput ?? '(无输出)'
+  }
+  // propose_command：既有结构化 JSON 格式
   if (p.state === 'accepted') {
     if (p.error) return JSON.stringify({ accepted: false, error: p.error })
     const out = p.execOutput ?? ''
@@ -694,7 +774,13 @@ function pumpProposals() {
   const last = [...messages.value].reverse().find(m => m.role === 'assistant')
   if (last?.toolProposals) {
     for (const p of last.toolProposals) {
-      if (p.state === 'pending' && !autoRunning.has(p)) {
+      // 只读工具已在 autoRunning 中（autoExecReadonly 同步 add），不会进入此分支；
+      // 写操作（propose_command / edit_file / write_file）需弹窗授权
+      if (
+        p.state === 'pending' &&
+        ['propose_command', 'edit_file', 'write_file'].includes(p.name) &&
+        !autoRunning.has(p)
+      ) {
         proposalQueue.value.push({ msgId: last.id, proposal: p })
       }
     }
@@ -737,29 +823,118 @@ function autoApply(p: AiToolProposal, choice: 'once' | 'session') {
   })
 }
 
-/** 应用裁决：写状态并按需执行命令（once/session 均执行，session 另记入豁免表）。
+/** 只读工具自动执行：经 SSH exec channel 执行，结果写入 execOutput，
+ *  完成后统一交 settleProposalRound 收尾推进（与 autoApply 同路径）。
+ *  状态分流：
+ *  - timedOut=true（超时，含部分输出）→ accepted（部分观察仍有价值）
+ *  - exitCode=null 且 timedOut=false（通道级故障）→ rejected
+ *  - exitCode=Some(n)（成功/命令业务失败）→ accepted（观察动作完成） */
+function autoExecReadonly(p: AiToolProposal) {
+  const atScope = scope.value
+  // 用 backendId（后端 SessionManager 的 key），不是前端 activeSessionId
+  const sid = activeSession.value?.backendId
+  if (!sid || activeSession.value?.state !== 'online') {
+    p.state = 'rejected'
+    p.error = '无可用会话或会话已断开'
+    settleProposalRound()
+    return
+  }
+  autoRunning.add(p) // 竞态防护：pumpProposals 不入队执行中的只读提案
+  aiExecTool(sid, p.name, p.args)
+    .then((result: AiToolExecResult) => {
+      if (scope.value !== atScope) return
+      p.execOutput = result.output
+      if (result.truncated) {
+        p.execOutput += '\n[输出超 8KB 已截断]'
+      }
+      if (result.timedOut) {
+        // 超时：output 含已收到的部分片段，标记 accepted（部分观察仍有价值）
+        p.state = 'accepted'
+        p.execOutput += p.execOutput
+          ? '\n[执行超时，输出可能不完整]'
+          : '[执行超时，无输出]'
+      } else if (result.exitCode === null) {
+        // 通道级故障（会话断开/通道打开失败）：无输出，标记 rejected
+        p.state = 'rejected'
+        p.error = '执行失败（会话断开）'
+      } else {
+        // Some(0) 成功 | Some(n>0) 命令业务失败（文件不存在等）
+        // 两者都标记 accepted：观察动作已完成，输出中的 stderr 供模型自行理解
+        p.state = 'accepted'
+      }
+    })
+    .catch(e => {
+      if (scope.value !== atScope) return
+      p.state = 'rejected'
+      p.error = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
+    })
+    .finally(() => {
+      autoRunning.delete(p)
+      if (scope.value === atScope) settleProposalRound()
+    })
+}
+
+/** 应用裁决：写状态并按需执行（once/session 均执行，session 另记入豁免表）。
+ *  执行方式按工具名分流：
+ *  - propose_command → writeExec（PTY 写入用户终端）
+ *  - edit_file / write_file → aiExecTool（exec channel，不污染终端）
  *  自动豁免路径在 onToolCalls 中直接调用（无弹窗） */
 async function applyProposal(p: AiToolProposal, choice: 'once' | 'session' | 'reject') {
-  const parsed = parseProposalArgs(p.args)
-  if (choice === 'reject' || !parsed?.command) {
-    // 拒绝 / 参数无法解析（不可执行）：按拒绝处理，模型得知后自行调整
+  if (choice === 'reject') {
     p.state = 'rejected'
-  } else {
-    const multiline = parsed.command.includes('\n')
-    if (multiline && !savedSettings.aiMultilineExec) {
-      p.state = 'accepted'
-      p.error = '多行命令直接执行未开启（设置 → AI → 终端执行）'
+    persist()
+    scrollToBottom()
+    return
+  }
+  if (p.name === 'propose_command') {
+    const parsed = parseProposalArgs(p.args)
+    if (!parsed?.command) {
+      p.state = 'rejected'
     } else {
-      // 弹窗即确认 UI（用户选择 = 人工批准），不再叠加 execConfirm 弹窗
-      const { error, output } = await writeExec(parsed.command, multiline)
-      p.state = 'accepted'
-      p.allowedSession = choice === 'session'
-      if (error) p.error = error
-      if (output) p.execOutput = output  // M3.1：回传输出暂存，tool 结果组装时读取
-      if (choice === 'session' && !error) {
-        const set = sessionAllowlist.get(scope.value) ?? new Set<string>()
-        set.add(parsed.command)
-        sessionAllowlist.set(scope.value, set)
+      const multiline = parsed.command.includes('\n')
+      if (multiline && !savedSettings.aiMultilineExec) {
+        p.state = 'accepted'
+        p.error = '多行命令直接执行未开启（设置 → AI → 终端执行）'
+      } else {
+        const { error, output } = await writeExec(parsed.command, multiline)
+        p.state = 'accepted'
+        p.allowedSession = choice === 'session'
+        if (error) p.error = error
+        if (output) p.execOutput = output
+        if (choice === 'session' && !error) {
+          const set = sessionAllowlist.get(scope.value) ?? new Set<string>()
+          set.add(parsed.command)
+          sessionAllowlist.set(scope.value, set)
+        }
+      }
+    }
+  } else {
+    // edit_file / write_file：经 exec channel 执行，不写入 PTY
+    const sid = activeSession.value?.backendId
+    if (!sid || activeSession.value?.state !== 'online') {
+      p.state = 'rejected'
+      p.error = '无可用会话或会话已断开'
+    } else {
+      try {
+        const result = await aiExecTool(sid, p.name, p.args)
+        p.execOutput = result.output
+        if (result.truncated) p.execOutput += '\n[输出超 8KB 已截断]'
+        if (result.timedOut) {
+          p.state = 'accepted'
+          p.execOutput += p.execOutput ? '\n[执行超时，输出可能不完整]' : '[执行超时，无输出]'
+        } else if (result.exitCode === null) {
+          p.state = 'rejected'
+          p.error = '执行失败（会话断开）'
+        } else if (result.exitCode === 0) {
+          p.state = 'accepted'
+        } else {
+          // exitCode>0：old_text 未匹配、权限不足等业务失败
+          p.state = 'accepted'
+          if (!p.execOutput) p.execOutput = `命令返回非零退出码 ${result.exitCode}`
+        }
+      } catch (e) {
+        p.state = 'rejected'
+        p.error = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
       }
     }
   }
@@ -963,16 +1138,15 @@ watch(execConfirm, open => {
 
 onUnmounted(() => window.removeEventListener('keydown', onExecKey))
 
-/** 授权弹窗键盘裁决：数字 1/2/3、Enter=仅本次、Esc=拒绝（capture 抢先，与 exec 弹窗互斥） */
+/** 授权弹窗键盘裁决：数字键、Enter=仅本次、Esc=拒绝（capture 抢先，与 exec 弹窗互斥）。
+ *  propose_command：1=仅本次 2=本会话允许 3=拒绝
+ *  edit_file/write_file：1=仅本次 2=拒绝（无会话豁免） */
 function onAuthKey(e: KeyboardEvent) {
   if (!authorizing.value || execConfirm.value) return
-  const map: Record<string, 'once' | 'session' | 'reject'> = {
-    '1': 'once',
-    '2': 'session',
-    '3': 'reject',
-    Enter: 'once',
-    Escape: 'reject',
-  }
+  const isCmd = authorizing.value.proposal.name === 'propose_command'
+  const map: Record<string, 'once' | 'session' | 'reject'> = isCmd
+    ? { '1': 'once', '2': 'session', '3': 'reject', Enter: 'once', Escape: 'reject' }
+    : { '1': 'once', '2': 'reject', Enter: 'once', Escape: 'reject' }
   const choice = map[e.key]
   if (!choice) return
   e.preventDefault()
@@ -1114,27 +1288,74 @@ const configHint = computed(() => {
           <div v-else-if="m.status === 'streaming'" class="typing">
             <span></span><span></span><span></span>
           </div>
-          <!-- 工具提案记录条（混合形态：决策在底部授权弹窗，流内仅留痕）：
-               非交互，展示终态 + 来源 + 命令原文，回溯可审计 -->
+          <!-- 工具提案记录条：
+               - propose_command：命令提案卡片（授权/拒绝/执行状态徽标）
+               - edit_file / write_file：文件编辑卡片（授权/执行状态徽标 + 变更预览）
+               - 只读工具：轻量观察卡片（无授权交互，可折叠输出） -->
           <div
             v-for="p in m.toolProposals"
             :key="p.id"
             class="proposal"
-            :class="p.state"
+            :class="[p.state, { 'readonly-tool': !['propose_command','edit_file','write_file'].includes(p.name) }]"
           >
-            <div class="proposal-head">
-              <span class="proposal-tag">命令执行</span>
-              <span class="proposal-state">
-                {{ p.state === 'pending'
-                  ? '等待授权'
-                  : p.state === 'accepted'
-                    ? p.error ? '执行失败' : p.allowedSession ? '已执行 · 会话允许' : '已执行'
-                    : p.state === 'rejected' ? '已拒绝' : '已失效' }}
-              </span>
-            </div>
-            <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
-            <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
-            <pre class="proposal-cmd">{{ proposalCommand(p) }}</pre>
+            <!-- propose_command 命令提案卡片 -->
+            <template v-if="p.name === 'propose_command'">
+              <div class="proposal-head">
+                <span class="proposal-tag">命令执行</span>
+                <span class="proposal-state">
+                  {{ p.state === 'pending'
+                    ? '等待授权'
+                    : p.state === 'accepted'
+                      ? p.error ? '执行失败' : p.allowedSession ? '已执行 · 会话允许' : '已执行'
+                      : p.state === 'rejected' ? '已拒绝' : '已失效' }}
+                </span>
+              </div>
+              <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
+              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+              <pre class="proposal-cmd">{{ proposalCommand(p) }}</pre>
+            </template>
+            <!-- edit_file / write_file 文件编辑卡片：两行布局，与只读工具卡片统一 -->
+            <template v-else-if="p.name === 'edit_file' || p.name === 'write_file'">
+              <div class="proposal-head">
+                <span class="proposal-tag">{{ readonlyLabel(p.name) }}</span>
+                <span class="proposal-state">
+                  {{ p.state === 'pending'
+                    ? '等待授权'
+                    : p.state === 'accepted'
+                      ? p.error ? '执行失败' : '已执行'
+                      : p.state === 'rejected' ? '已拒绝' : '已失效' }}
+                </span>
+              </div>
+              <div class="file-edit-row">
+                <span class="proposal-args">{{ readonlyArgs(p) }}</span>
+                <span class="line-diff">
+                  <span class="diff-add">+{{ countLines(fileEditNew(p)) }}</span>
+                  <template v-if="p.name === 'edit_file'">
+                    <span class="diff-del">-{{ countLines(fileEditOld(p)) }}</span>
+                  </template>
+                </span>
+              </div>
+              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+              <details v-if="p.execOutput" class="readonly-output">
+                <summary>输出（{{ p.execOutput.length }} 字符）</summary>
+                <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+              </details>
+            </template>
+            <!-- 只读工具观察卡片 -->
+            <template v-else>
+              <div class="proposal-head">
+                <span class="proposal-tag readonly-tag">{{ readonlyLabel(p.name) }}</span>
+                <span class="proposal-args">{{ readonlyArgs(p) }}</span>
+                <span class="proposal-state">
+                  {{ p.error ? '执行失败' : p.execOutput ? '已观察' : '执行中…' }}
+                </span>
+              </div>
+              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+              <details v-if="p.execOutput" class="readonly-output">
+                <summary>输出（{{ p.execOutput.length }} 字符）</summary>
+                <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+              </details>
+            </template>
           </div>
           <!-- 消息底栏：streaming 期间整体隐藏；hover 淡入。
                回复组内仅最后一条显示（组 = 一次逻辑回复，重新生成语义即重跑整组） -->
@@ -1216,26 +1437,48 @@ const configHint = computed(() => {
       </div>
     </div>
 
-    <!-- 命令授权弹窗（混合形态·决策端）：覆盖输入框上方，视线必达；
+    <!-- 授权弹窗（命令 / 文件编辑）：覆盖输入框上方，视线必达；
          数字键/Enter/Esc 快捷裁决，未裁决不能继续输入 -->
     <div v-if="authorizing" class="auth-wrap" role="alertdialog" aria-modal="true">
-      <div class="auth-title">⚠ 是否允许执行这个命令？</div>
-      <p class="auth-sub">
-        AI 请求在当前 SSH 会话执行以下命令<template v-if="authorizing.proposal.reason">：{{ authorizing.proposal.reason }}</template>
-      </p>
-      <pre class="auth-cmd">{{ proposalCommand(authorizing.proposal) }}</pre>
-      <p v-if="proposalCommand(authorizing.proposal).includes('\n')" class="auth-warn">
-        多行命令将整块提交执行（共 {{ proposalCommand(authorizing.proposal).split('\n').length }} 行），请逐行核对
-      </p>
+      <div class="auth-title">
+        ⚠ {{ authorizing.proposal.name === 'propose_command' ? '是否允许执行这个命令？' : '是否允许修改这个文件？' }}
+      </div>
+      <!-- propose_command：显示命令 -->
+      <template v-if="authorizing.proposal.name === 'propose_command'">
+        <p class="auth-sub">
+          AI 请求在当前 SSH 会话执行以下命令<template v-if="authorizing.proposal.reason">：{{ authorizing.proposal.reason }}</template>
+        </p>
+        <pre class="auth-cmd">{{ proposalCommand(authorizing.proposal) }}</pre>
+        <p v-if="proposalCommand(authorizing.proposal).includes('\n')" class="auth-warn">
+          多行命令将整块提交执行（共 {{ proposalCommand(authorizing.proposal).split('\n').length }} 行），请逐行核对
+        </p>
+      </template>
+      <!-- edit_file / write_file：单行展示路径 + 行数变化 -->
+      <template v-else-if="authorizing.proposal.name === 'edit_file' || authorizing.proposal.name === 'write_file'">
+        <p class="auth-sub file-edit-line">
+          <span class="file-edit-path">
+            {{ authorizing.proposal.name === 'edit_file' ? '编辑' : '写入' }}
+            <code>{{ readonlyArgs(authorizing.proposal) }}</code>
+          </span>
+          <span class="line-diff">
+            <span class="diff-add">+{{ countLines(fileEditNew(authorizing.proposal)) }}</span>
+            <template v-if="authorizing.proposal.name === 'edit_file'">
+              <span class="diff-del">-{{ countLines(fileEditOld(authorizing.proposal)) }}</span>
+            </template>
+          </span>
+        </p>
+      </template>
       <div class="auth-choices">
         <button type="button" class="auth-choice" @click="resolveCurrent('once')">
           <span class="auth-num">1</span>仅本次执行<span class="auth-key">↵</span>
         </button>
-        <button type="button" class="auth-choice" @click="resolveCurrent('session')">
+        <button
+          v-if="authorizing.proposal.name === 'propose_command'"
+          type="button" class="auth-choice" @click="resolveCurrent('session')">
           <span class="auth-num">2</span>本会话允许此命令（后续相同命令自动执行）<span class="auth-key">2</span>
         </button>
         <button type="button" class="auth-choice" @click="resolveCurrent('reject')">
-          <span class="auth-num">3</span>拒绝执行<span class="auth-key">Esc</span>
+          <span class="auth-num">{{ authorizing.proposal.name === 'propose_command' ? '3' : '2' }}</span>拒绝执行<span class="auth-key">Esc</span>
         </button>
       </div>
       <div v-if="proposalQueue.length > 1" class="auth-queue">
@@ -1550,6 +1793,80 @@ const configHint = computed(() => {
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text);
+}
+
+/* 只读工具观察卡片：蓝色系边框/标签，区别于命令提案的黄色 pending */
+.proposal.readonly-tool {
+  border-color: rgba(86, 156, 214, 0.4);
+}
+.proposal.readonly-tool .readonly-tag {
+  color: #569cd6;
+}
+.proposal.readonly-tool .proposal-args {
+  font-family: var(--mono);
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.readonly-output {
+  font-size: 11.5px;
+}
+.readonly-output summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+.readonly-output summary:hover {
+  color: var(--text);
+}
+.readonly-output[open] summary {
+  margin-bottom: 6px;
+}
+/* 文件编辑行数差异展示：+新增行 / -删除行 */
+.line-diff {
+  display: inline-flex;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.diff-add {
+  color: var(--accent, #3ddc84);
+}
+.diff-del {
+  color: var(--red, #f48771);
+}
+/* 卡片中文件编辑第二行：左侧路径，右侧行数变化 */
+.file-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.file-edit-row .proposal-args {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+/* 弹窗中文件编辑单行布局 */
+.file-edit-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.file-edit-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* AI 消息头：logo + Agent */
