@@ -66,6 +66,7 @@ pub const SSH_SESSION_SHELL: &str = "ssh.session.shell";
 pub const SSH_SESSION_FAILED: &str = "ssh.session.failed";
 pub const SSH_SESSION_READY: &str = "ssh.session.ready";
 pub const SSH_SESSION_INIT_SCRIPT_FAILED: &str = "ssh.session.init_script_failed";
+pub const SSH_SESSION_INIT_SCRIPT_CLEANUP_FAILED: &str = "ssh.session.init_script_cleanup_failed";
 pub const SSH_DISCONNECT: &str = "ssh.disconnect";
 pub const SSH_RECONNECT: &str = "ssh.reconnect";
 pub const SSH_SFTP_CHANNEL_OPEN: &str = "ssh.sftp.channel.open";
@@ -183,6 +184,7 @@ mod tests {
             SSH_SESSION_FAILED,
             SSH_SESSION_READY,
             SSH_SESSION_INIT_SCRIPT_FAILED,
+            SSH_SESSION_INIT_SCRIPT_CLEANUP_FAILED,
             SSH_DISCONNECT,
             SSH_RECONNECT,
             SSH_SFTP_CHANNEL_OPEN,
@@ -272,6 +274,8 @@ mod tests {
         let doc_path = std::path::Path::new(manifest)
             .join("..")
             .join("docs")
+            .join("explanation")
+            .join("design")
             .join("applog-design.md");
         let doc = std::fs::read_to_string(&doc_path)
             .unwrap_or_else(|e| panic!("读取设计文档失败 {}：{e}", doc_path.display()));

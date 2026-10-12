@@ -814,6 +814,9 @@ pub struct SshSession {
     tunnel: TunnelManager,
     /// 断开日志状态：共享给 read_task，防止主动关闭与异常断开重复记录
     dc_state: Arc<DisconnectState>,
+    /// 初始化脚本远端路径（/tmp/.ri-<uuid8>）：shutdown 时主动清理，
+    /// 避免会话中断导致残留
+    init_script_path: Option<String>,
 }
 
 /// 展开路径开头的 ~ 为当前用户家目录（不引入 shellexpand 依赖）
@@ -1215,6 +1218,9 @@ impl SshSession {
                 }
             }
         };
+        // 记录成功上传的脚本路径，供 shutdown 时主动清理（source 自删仅在
+        // 脚本成功执行后生效；会话在 source 前断开会导致残留）
+        let init_script_path = if init_cmd.is_some() { Some(tmp_path) } else { None };
 
         // 3. 建立帧 / 事件 / 输入通道；合并任务先待命（此时没有任何 PTY 事件）
         let (event_tx, event_rx) = mpsc::channel::<PtyEvent>(EVENT_QUEUE);
@@ -1367,6 +1373,7 @@ impl SshSession {
                 cwd,
                 tunnel,
                 dc_state,
+                init_script_path,
             },
             frame_rx,
         ))
@@ -1537,6 +1544,44 @@ impl SshSession {
                     "uptime_s": self.dc_state.connected_at.elapsed().as_secs(),
                 })),
             );
+        }
+        // 清理初始化脚本：source 自删仅在脚本成功执行后生效，会话在 source
+        // 前断开会导致残留。spawn 异步任务，不阻塞 shutdown（同步方法）。
+        // 复用 exec_collect 的 exec 通道（有闸门保护），包裹 rm -f 命令。
+        if let Some(ref path) = self.init_script_path {
+            let handle = self.handle.clone();
+            let sid = self.dc_state.sid.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                let h = handle.lock().await;
+                match h.channel_open_session().await {
+                    Ok(ch) => {
+                        let cmd = format!("rm -f '{path}'");
+                        if let Err(e) = ch.exec(true, cmd.as_str()).await {
+                            applog::emit(
+                                log::Level::Warn,
+                                "ssh",
+                                ev::SSH_SESSION_INIT_SCRIPT_CLEANUP_FAILED,
+                                Some(&sid),
+                                format!("初始化脚本清理失败（{path}）: {e}"),
+                                None,
+                            );
+                        }
+                        // 不等待 channel EOF：shutdown 场景连接即将断开，
+                        // 尽力而为发送即可，ch 随作用域结束自动关闭
+                    }
+                    Err(e) => {
+                        applog::emit(
+                            log::Level::Warn,
+                            "ssh",
+                            ev::SSH_SESSION_INIT_SCRIPT_CLEANUP_FAILED,
+                            Some(&sid),
+                            format!("初始化脚本清理通道打开失败（{path}）: {e}"),
+                            None,
+                        );
+                    }
+                }
+            });
         }
     }
 
