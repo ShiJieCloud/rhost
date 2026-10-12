@@ -270,6 +270,8 @@ pub fn run() {
             ai::ai_load_chat,
             ai::ai_clear_chat,
             ai::ai_summarize,
+            ai::ai_list_prompt_assets,
+            ai::ai_reveal_prompt_dir,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -12,7 +12,7 @@
 //! - `ai-error` `{scope, message}`：流式阶段错误（建连前错误直接以 Err 返回）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
@@ -734,6 +734,152 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
 }
 
 /* =========================================================
+ *  技能/规则提示资产（M3.2：ai/skills/ 与 ai/rules/）
+ * ========================================================= */
+
+/// 单文件注入上限：8KB（约 2k~4k tokens，中英混合），超出截断并标记 truncated
+const PROMPT_ASSET_MAX_BYTES: u64 = 8 * 1024;
+
+/// 一条技能/规则文件（目录顶层 .md 平铺，文件名即稳定 key）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAsset {
+    /// 含扩展名的文件名（"nginx.md"），前端禁用名单与列表渲染的稳定 key
+    file_name: String,
+    /// frontmatter name；缺省时取文件名去扩展
+    name: String,
+    description: Option<String>,
+    /// 截断后的文件全文（含 frontmatter 原文）
+    content: String,
+    truncated: bool,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAssets {
+    skills: Vec<PromptAsset>,
+    rules: Vec<PromptAsset>,
+}
+
+/// 解析 ai/{skills,rules} 目录；kind 已由命令入口白名单校验
+fn prompt_asset_dir(app: &AppHandle, kind: &str) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("获取应用配置目录失败: {e}"))?
+        .join("ai")
+        .join(kind))
+}
+
+/// 极简 frontmatter 解析：`---` 围栏内逐行 `key: value`，仅识别 name/description。
+/// 解析失败（无起始/闭合围栏等）按无 frontmatter 处理，不报错。
+fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>) {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (None, None);
+    }
+    let mut name = None;
+    let mut description = None;
+    for line in lines {
+        if line.trim() == "---" {
+            return (name, description);
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim();
+            match k.trim() {
+                "name" if !v.is_empty() => name = Some(v.to_string()),
+                "description" if !v.is_empty() => description = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    // 无闭合围栏：按无 frontmatter 处理
+    (None, None)
+}
+
+/// 读取单个文件：> 8KB 只读前 8KB 并标记截断；UTF-8 解码容错；失败返回 None（跳过）
+fn read_prompt_asset(path: &Path, file_name: &str) -> Option<PromptAsset> {
+    use std::io::Read;
+    let size = std::fs::metadata(path).ok()?.len();
+    let truncated = size > PROMPT_ASSET_MAX_BYTES;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(PROMPT_ASSET_MAX_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    let (fm_name, fm_desc) = parse_frontmatter(&content);
+    // 文件名已确认以 ".md" 结尾（小写比较），去掉末 3 字节即扩展名
+    let stem = &file_name[..file_name.len().saturating_sub(3)];
+    Some(PromptAsset {
+        file_name: file_name.to_string(),
+        name: fm_name.unwrap_or_else(|| stem.to_string()),
+        description: fm_desc,
+        content,
+        truncated,
+        size_bytes: size,
+    })
+}
+
+/// 扫描单个目录：仅顶层 .md，跳过隐藏文件/子目录/符号链接，按文件名字典序。
+/// 目录不存在/不可读返回空 Vec（失败无害，对话主流程不受影响）。
+fn scan_prompt_dir(dir: &Path) -> Vec<PromptAsset> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        // file_type 不跟随符号链接，可正确识别并跳过 symlink
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if file_name.starts_with('.') || !file_name.to_ascii_lowercase().ends_with(".md") {
+            continue;
+        }
+        if let Some(asset) = read_prompt_asset(&entry.path(), &file_name) {
+            out.push(asset);
+        }
+    }
+    out.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    out
+}
+
+/// 列出技能/规则提示资产。无参数：目录由后端固定解析，前端不传路径，无路径穿越面；
+/// 禁用过滤在前端完成，此处始终返回全量清单（设置界面需要完整列表渲染开关）。
+/// 首次扫描自动创建目录；目录/单文件失败均降级为空，不报错。
+#[tauri::command]
+pub fn ai_list_prompt_assets(app: AppHandle) -> Result<PromptAssets, String> {
+    crate::slow_span!("ai_list_prompt_assets");
+    let skills_dir = prompt_asset_dir(&app, "skills")?;
+    let rules_dir = prompt_asset_dir(&app, "rules")?;
+    let _ = std::fs::create_dir_all(&skills_dir);
+    let _ = std::fs::create_dir_all(&rules_dir);
+    Ok(PromptAssets {
+        skills: scan_prompt_dir(&skills_dir),
+        rules: scan_prompt_dir(&rules_dir),
+    })
+}
+
+/// 系统文件管理器打开技能/规则目录（首次调用自动创建），返回实际目录的绝对路径
+#[tauri::command]
+pub fn ai_reveal_prompt_dir(app: AppHandle, kind: String) -> Result<String, String> {
+    crate::slow_span!("ai_reveal_prompt_dir");
+    let kind = kind.trim();
+    if kind != "skills" && kind != "rules" {
+        return Err(format!("非法的目录类型: {kind}"));
+    }
+    let dir = prompt_asset_dir(&app, kind)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败 {}：{e}", dir.display()))?;
+    tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(dir.display().to_string())
+}
+
+/* =========================================================
  *  HTTP 客户端（共享连接池）
  * ========================================================= */
 
@@ -831,5 +977,75 @@ mod tests {
         let back = serde_json::to_value(&msgs).unwrap();
         assert!(back[1].get("tool_calls").is_none());
         assert_eq!(back[1]["tool_call_id"], "call_1");
+    }
+
+    /* -------- M3.2 技能/规则提示资产 -------- */
+
+    #[test]
+    fn frontmatter_parse() {
+        // 标准 frontmatter
+        let (n, d) = parse_frontmatter("---\nname: nginx 排障\ndescription: 502 排查\n---\n\n正文");
+        assert_eq!(n.as_deref(), Some("nginx 排障"));
+        assert_eq!(d.as_deref(), Some("502 排查"));
+        // 无 frontmatter
+        let (n, d) = parse_frontmatter("# 标题\n正文");
+        assert_eq!((n, d), (None, None));
+        // 无闭合围栏 → 按无 frontmatter 处理
+        let (n, d) = parse_frontmatter("---\nname: x\n正文没有闭合");
+        assert_eq!((n, d), (None, None));
+        // 未知键忽略；空值忽略
+        let (n, d) = parse_frontmatter("---\ntags: a,b\ndescription:\nname: x\n---\n");
+        assert_eq!(n.as_deref(), Some("x"));
+        assert_eq!(d, None);
+        // BOM 容错
+        let (n, _) = parse_frontmatter("\u{feff}---\nname: bom\n---\n");
+        assert_eq!(n.as_deref(), Some("bom"));
+    }
+
+    #[test]
+    fn prompt_dir_scan_filters_and_sorts() {
+        let dir = std::env::temp_dir().join(format!("rhost-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 合法文件（乱序写入，验证排序）
+        std::fs::write(dir.join("b-two.md"), "二").unwrap();
+        std::fs::write(dir.join("a-one.md"), "---\nname: 一\n---\n一").unwrap();
+        // 应被跳过：隐藏文件、非 .md、子目录
+        std::fs::write(dir.join(".hidden.md"), "x").unwrap();
+        std::fs::write(dir.join("note.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        // 符号链接（指向目录外目标）应被跳过
+        let outside = std::env::temp_dir().join(format!("rhost-out-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, "外部内容").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("link.md")).unwrap();
+
+        let assets = scan_prompt_dir(&dir);
+        let names: Vec<&str> = assets.iter().map(|a| a.file_name.as_str()).collect();
+        assert_eq!(names, ["a-one.md", "b-two.md"]);
+        assert_eq!(assets[0].name, "一"); // frontmatter name 优先
+        assert_eq!(assets[1].name, "b-two"); // 缺省回退文件名去扩展
+        assert_eq!(assets[0].description, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn prompt_asset_truncation() {
+        let dir = std::env::temp_dir().join(format!("rhost-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = "x".repeat((PROMPT_ASSET_MAX_BYTES + 100) as usize);
+        let path = dir.join("big.md");
+        std::fs::write(&path, &big).unwrap();
+
+        let asset = read_prompt_asset(&path, "big.md").unwrap();
+        assert!(asset.truncated);
+        assert_eq!(asset.content.len(), PROMPT_ASSET_MAX_BYTES as usize);
+        assert_eq!(asset.size_bytes, PROMPT_ASSET_MAX_BYTES + 100);
+
+        // 目录不存在 → 空列表（失败无害）
+        assert!(scan_prompt_dir(&dir.join("nonexistent")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
