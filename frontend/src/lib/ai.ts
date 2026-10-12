@@ -75,6 +75,8 @@ export interface AiChatRecord {
   summary?: string
   /** 摘要覆盖的最后一条消息 id；此后消息仍原文进上下文 */
   summaryUpTo?: string
+  /** 记忆提取覆盖的最后一条消息 id（M3.3）；此后消息待提取 */
+  extractedUpTo?: string
 }
 
 /* ---- 事件类型 ---- */
@@ -195,6 +197,39 @@ export function aiListPromptAssets(): Promise<AiPromptAssets> {
 /** 系统文件管理器打开技能/规则目录，返回目录绝对路径 */
 export function aiRevealPromptDir(kind: 'skills' | 'rules'): Promise<string> {
   return invoke<string>('ai_reveal_prompt_dir', { kind })
+}
+
+/* ---- 跨会话记忆（M3.3：ai/memory/memory.json） ---- */
+
+/** 单条记忆内容上限（字符）：与后端 MEMORY_CONTENT_MAX_CHARS 口径一致 */
+export const AI_MEMORY_CONTENT_MAX_CHARS = 200
+
+/** 一条跨会话记忆（serde camelCase；全局存储，sourceScope 仅展示来源） */
+export interface AiMemoryItem {
+  id: string
+  content: string
+  createdAt: number
+  sourceScope: string
+}
+
+/** 读取全部记忆条目（文件不存在/解析失败时后端降级为空数组） */
+export function aiListMemories(): Promise<AiMemoryItem[]> {
+  return invoke<AiMemoryItem[]>('ai_list_memories')
+}
+
+/** 覆盖写入记忆条目（后端兜底：单条截断 200 字符、按设置上限淘汰最旧） */
+export function aiSaveMemories(items: AiMemoryItem[]): Promise<void> {
+  return invoke('ai_save_memories', { items })
+}
+
+/** 清空记忆（文件不存在视为成功） */
+export function aiClearMemories(): Promise<void> {
+  return invoke('ai_clear_memories')
+}
+
+/** 记忆提取：非流式调用，返回模型输出的 JSON 字符串（解析/校验/合并在前端） */
+export function aiExtractMemories(messages: AiWireMessage[]): Promise<string> {
+  return invoke<string>('ai_extract_memories', { messages })
 }
 
 /* ---- 事件订阅（一次性注册四个事件，组件卸载时 unlisten） ---- */

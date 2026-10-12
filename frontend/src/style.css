@@ -2832,6 +2832,9 @@ body{
     font-size:10px;line-height:1.5;
 }
 .st-asset-empty{padding:12px;font-size:11px;color:var(--muted);text-align:center}
+.st-mem-add{display:flex;align-items:center;gap:8px;width:100%}
+.st-mem-add .st-input{flex:1;min-width:0}
+.st-mem-add .btn{flex:none}
 .st-input:disabled,.st-select:disabled,.st-textarea:disabled{opacity:.4;cursor:not-allowed}
 .st-switch:has(input:disabled){opacity:.4;cursor:not-allowed}
 .st-row-title.has-tail-switch{display:flex;align-items:center}

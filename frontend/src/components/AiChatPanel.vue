@@ -10,15 +10,20 @@ import { isTauri } from '../lib/tauri'
 import AppLogo from './AppLogo.vue'
 import AiMarkdown from './AiMarkdown.vue'
 import {
+  AI_MEMORY_CONTENT_MAX_CHARS,
   aiChatStream,
   aiClearChat,
+  aiExtractMemories,
+  aiListMemories,
   aiListPromptAssets,
   aiLoadChat,
   aiSaveChat,
+  aiSaveMemories,
   aiStopChat,
   aiSummarize,
   listenAiEvents,
   type AiChatMessage,
+  type AiMemoryItem,
   type AiPromptAsset,
   type AiPromptAssets,
   type AiScope,
@@ -31,6 +36,8 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 const SUMMARY_TRIGGER_CHARS = 8000
 /** 摘要后保留的最近消息条数（不参与压缩，保证当前话题连续性） */
 const SUMMARY_KEEP_RECENT = 4
+/** 触发记忆提取的未提取字符数（约 2k tokens，避免短对话每轮都提取） */
+const EXTRACT_TRIGGER_CHARS = 4000
 
 /** 对话归属：首页 'global'，终端为当前 SSH 会话 id */
 const scope = computed<AiScope>(() =>
@@ -45,10 +52,16 @@ const quote = ref<{ text: string; lines: number } | null>(null)
 /** 滚动摘要：覆盖 summaryUpTo 及之前的全部历史，组装上下文时以 system 注入 */
 const summary = ref('')
 const summaryUpTo = ref('')
+/** 记忆提取：覆盖 extractedUpTo 及之前的全部历史（已提取部分不再重复提取） */
+const extractedUpTo = ref('')
 /** 待编辑重发的 user 消息 id：填回输入框后不立即截断，真正发送时才截断该条及其后 */
 const editFromId = ref<string | null>(null)
 /** 摘要请求进行中（防重入） */
 let summarizing = false
+/** 记忆提取请求进行中（防重入） */
+let extracting = false
+/** reasoning 手动展开/收起状态：msg id → true(展开) / false(收起)；未在 map 中则跟随自动行为 */
+const reasoningManual = ref<Map<string, boolean>>(new Map())
 const inputRef = ref<HTMLInputElement | null>(null)
 const scrollEl = ref<HTMLElement | null>(null)
 let unlisten: UnlistenFn | null = null
@@ -98,6 +111,27 @@ function isGroupTail(i: number): boolean {
   return !next || next.role !== 'assistant'
 }
 
+/* ---------- 推理可视化 ---------- */
+
+/** reasoning 是否正在流式接收（思考阶段：有 reasoning、无 content、正在 streaming） */
+function isReasoningStreaming(m: { status: string; reasoning?: string; content: string }): boolean {
+  return m.status === 'streaming' && !!m.reasoning && !m.content
+}
+
+/** reasoning 是否应展开：手动操作优先，否则思考阶段自动展开、content 到达后自动收起 */
+function isReasoningOpen(m: { id: string; status: string; reasoning?: string; content: string }): boolean {
+  const manual = reasoningManual.value.get(m.id)
+  if (manual !== undefined) return manual
+  return isReasoningStreaming(m)
+}
+
+/** 用户手动切换 reasoning 展开/收起 */
+function toggleReasoning(id: string) {
+  const msg = messages.value.find(m => m.id === id)
+  if (!msg) return
+  reasoningManual.value.set(id, !isReasoningOpen(msg))
+}
+
 /* ---------- 持久化 ---------- */
 
 /** 落盘：streaming 态转为 stopped（应用崩溃/重载后的中间态收敛） */
@@ -115,6 +149,7 @@ function persist() {
     messages: cleaned,
     summary: summary.value || undefined,
     summaryUpTo: summaryUpTo.value || undefined,
+    extractedUpTo: extractedUpTo.value || undefined,
   }).catch(e => console.error('[AI] 会话保存失败:', e))
 }
 
@@ -123,6 +158,8 @@ async function loadRecord(s: AiScope) {
     messages.value = []
     summary.value = ''
     summaryUpTo.value = ''
+    extractedUpTo.value = ''
+    reasoningManual.value.clear()
     return
   }
   try {
@@ -132,11 +169,14 @@ async function loadRecord(s: AiScope) {
     )
     summary.value = rec?.summary ?? ''
     summaryUpTo.value = rec?.summaryUpTo ?? ''
+    extractedUpTo.value = rec?.extractedUpTo ?? ''
   } catch (e) {
     console.error('[AI] 会话加载失败:', e)
     messages.value = []
     summary.value = ''
     summaryUpTo.value = ''
+    extractedUpTo.value = ''
+    reasoningManual.value.clear()
   }
   scrollToBottom()
 }
@@ -231,6 +271,8 @@ function finishStreaming(status: 'done' | 'stopped') {
   // 提案调度：pending 入队弹窗；无 pending 且本轮已裁决完 → 自动续跑
   pumpProposals()
   void maybeSummarize()
+  // 记忆提取仅在正常完成后触发（中止/错误轮次内容不完整，不提取）
+  if (status === 'done') void maybeExtractMemories()
 }
 
 /* ---------- 滚动摘要（M1.5） ---------- */
@@ -274,9 +316,97 @@ async function maybeSummarize() {
   }
 }
 
+/* ---------- 跨会话记忆提取（M3.3） ---------- */
+
+/**
+ * 对话完成后后台检查：未提取部分超阈值时，把新对话连同已有记忆发给模型
+ * 提取跨会话事实，合并去重后落盘。失败静默（不更新 extractedUpTo，
+ * 下次完成后再试），不影响对话。已摘要部分不再重复提取。
+ */
+async function maybeExtractMemories() {
+  if (!isTauri || extracting || streaming.value) return
+  if (!savedSettings.aiMemoryEnabled) return
+  const floorIdx = summaryUpTo.value
+    ? messages.value.findIndex(m => m.id === summaryUpTo.value) + 1
+    : 0
+  const startIdx = extractedUpTo.value
+    ? messages.value.findIndex(m => m.id === extractedUpTo.value) + 1
+    : 0
+  const pending = messages.value
+    .slice(Math.max(floorIdx, startIdx, 0))
+    .filter(m => m.status !== 'streaming' && m.status !== 'error' && m.content.trim())
+  const chars = pending.reduce((n, m) => n + m.content.length, 0)
+  if (chars < EXTRACT_TRIGGER_CHARS) return
+
+  extracting = true
+  const seq = loadSeq // 期间切换 scope 则丢弃结果
+  try {
+    const existing = await aiListMemories()
+    const input: AiWireMessage[] = []
+    if (existing.length) {
+      input.push({
+        role: 'user',
+        content: `【已有记忆】\n${JSON.stringify(existing.map(e => e.content))}`,
+      })
+    }
+    input.push(...pending.map(m => ({ role: m.role, content: m.content })))
+    const raw = await aiExtractMemories(input)
+    if (seq !== loadSeq) return
+    const merged = mergeMemories(existing, parseExtracted(raw))
+    await aiSaveMemories(merged)
+    extractedUpTo.value = pending[pending.length - 1].id
+    persist()
+    console.info('[AI] 记忆提取完成，当前共', merged.length, '条')
+  } catch (e) {
+    console.warn('[AI] 记忆提取失败（不影响对话）:', e)
+  } finally {
+    extracting = false
+  }
+}
+
+/** 解析模型提取输出：宽容剥离 markdown 围栏后 JSON.parse，逐项校验 content，
+ *  单条截断至 200 字符；解析失败返回空数组（跳过本轮提取） */
+function parseExtracted(raw: string): string[] {
+  const stripped = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')
+  let arr: unknown
+  try {
+    arr = JSON.parse(stripped)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(arr)) return []
+  const out: string[] = []
+  for (const item of arr) {
+    const c = (item as { content?: unknown })?.content
+    if (typeof c === 'string' && c.trim()) {
+      // Array.from 按码点切分，避免截断代理对（与后端 chars 口径一致）
+      out.push(Array.from(c.trim()).slice(0, AI_MEMORY_CONTENT_MAX_CHARS).join(''))
+    }
+  }
+  return out
+}
+
+/** 合并提取结果与已有记忆：content 精确匹配去重（保留旧条目 id/时间），
+ *  新条目按提取输出顺序追加在后；总数超设置上限时从头部淘汰最旧 */
+function mergeMemories(existing: AiMemoryItem[], extracted: string[]): AiMemoryItem[] {
+  const seen = new Set(existing.map(e => e.content))
+  const now = Date.now()
+  const added = extracted
+    .filter(c => !seen.has(c))
+    .map((c, i): AiMemoryItem => ({
+      id: crypto.randomUUID(),
+      content: c,
+      createdAt: now + i,
+      sourceScope: scope.value,
+    }))
+  const merged = [...existing, ...added].sort((a, b) => a.createdAt - b.createdAt)
+  const limit = savedSettings.aiMemoryLimit
+  return merged.length > limit ? merged.slice(merged.length - limit) : merged
+}
+
 /* ---------- 发送 ---------- */
 
-function buildWireMessages(assets?: AiPromptAssets): AiWireMessage[] {
+function buildWireMessages(assets?: AiPromptAssets, memories?: AiMemoryItem[]): AiWireMessage[] {
   // 仅把已成形的消息发给模型；空回复/错误回复不进上下文（带提案的空正文 assistant 除外）
   const usable = messages.value.filter(
     m => m.status !== 'streaming' && (m.content.trim() || m.toolProposals?.length),
@@ -305,7 +435,7 @@ function buildWireMessages(assets?: AiPromptAssets): AiWireMessage[] {
     }
     wired.push({ role: m.role, content: m.content })
   }
-  // system 前缀按「规则 → 技能 → 摘要 → 会话上下文」顺序装配
+  // system 前缀按「规则 → 技能 → 记忆 → 摘要 → 会话上下文」顺序装配
   // （注意力靠后原则：越稳定、越全局的约定越靠前；合并为单条，兼容多 system 支持不一的上游）
   const systems: AiWireMessage[] = []
   const rulesSys = buildAssetSystem(
@@ -316,6 +446,8 @@ function buildWireMessages(assets?: AiPromptAssets): AiWireMessage[] {
     '技能', 'skills', savedSettings.aiSkillsEnabled, savedSettings.aiSkillsDisabled, assets?.skills ?? [],
   )
   if (skillsSys) systems.push(skillsSys)
+  const memSys = buildMemorySystem(savedSettings.aiMemoryEnabled, memories ?? [])
+  if (memSys) systems.push(memSys)
   if (summary.value) {
     systems.push({
       role: 'system',
@@ -364,6 +496,35 @@ function buildAssetSystem(
   if (parts.length === 0) return null
   let content = `${header}\n\n${parts.join('\n\n')}`
   if (dropped > 0) content += `\n\n（其余 ${dropped} 个文件因总量超限未注入）`
+  return { role: 'system', content }
+}
+
+/** 记忆注入合计预算：8KB UTF-8 字节（与技能/规则单类 16KB 同口径计量；
+ *  100 条 × 200 字符最坏约 20KB，8KB 约可注入 40 条，覆盖绝大多数场景） */
+const MEMORY_BUDGET_BYTES = 8 * 1024
+
+/** 组装跨会话记忆 system 消息；总开关关闭或无记忆返回 null。
+ *  记忆按 createdAt 升序存储，预算不足时从最旧开始丢弃，末尾标注 */
+function buildMemorySystem(enabled: boolean, memories: AiMemoryItem[]): AiWireMessage | null {
+  if (!enabled || memories.length === 0) return null
+  const header = '# 跨会话记忆（以下是你与用户的历史交互中记住的事实）'
+  const enc = new TextEncoder()
+  const kept: string[] = []
+  let used = 0
+  let dropped = 0
+  for (let i = memories.length - 1; i >= 0; i--) {
+    const line = `- ${memories[i].content}`
+    const bytes = enc.encode(line).length
+    if (used + bytes > MEMORY_BUDGET_BYTES) {
+      dropped++
+      continue
+    }
+    used += bytes
+    kept.unshift(line)
+  }
+  if (kept.length === 0) return null
+  let content = `${header}\n\n${kept.join('\n')}`
+  if (dropped > 0) content += `\n\n（其余 ${dropped} 条记忆因总量超限未注入）`
   return { role: 'system', content }
 }
 
@@ -484,17 +645,18 @@ function send(override?: string) {
 
 /** 发起流式请求（send 与提案裁决续跑共用）。工具提案仅在工作台会话下启用
  *  （全局对话无终端可写）；请求失败写入最后一条 assistant 消息。
- *  技能/规则资产每轮重新拉取：无缓存实时读，用户改文件后下一轮即最新 */
+ *  技能/规则资产与记忆每轮重新拉取：无缓存实时读，下一轮即最新 */
 async function runAiStream(seq: number) {
   let assets: AiPromptAssets | undefined
+  let memories: AiMemoryItem[] | undefined
   try {
-    assets = await aiListPromptAssets()
+    ;[assets, memories] = await Promise.all([aiListPromptAssets(), aiListMemories()])
   } catch (e) {
-    // 资产加载失败降级为空注入，对话主流程不受影响
-    console.warn('[AI] 技能/规则加载失败（按空注入）:', e)
+    // 资产/记忆加载失败降级为空注入，对话主流程不受影响
+    console.warn('[AI] 技能/规则/记忆加载失败（按空注入）:', e)
   }
   if (seq !== loadSeq) return // 拉取期间切换了 scope，丢弃本次发送
-  aiChatStream(scope.value, buildWireMessages(assets), {
+  aiChatStream(scope.value, buildWireMessages(assets, memories), {
     enableTools: scope.value !== 'global',
   }).catch(e => {
     if (seq !== loadSeq) return
@@ -834,6 +996,7 @@ function clearChat() {
   editFromId.value = null
   summary.value = ''
   summaryUpTo.value = ''
+  reasoningManual.value.clear()
   if (isTauri) void aiClearChat(scope.value).catch(e => console.error('[AI] 清空失败:', e))
 }
 
@@ -929,11 +1092,17 @@ const configHint = computed(() => {
             </span>
             <span class="agent-name">Agent</span>
           </div>
-          <!-- 思考过程（默认收起） -->
-          <details v-if="m.reasoning" class="reasoning">
-            <summary>思考过程</summary>
-            <div class="reasoning-body">{{ m.reasoning }}</div>
-          </details>
+          <!-- 思考过程：流式时自动展开，content 到达后自动收起；用户可手动切换 -->
+          <div v-if="m.reasoning" class="reasoning" :class="{ open: isReasoningOpen(m) }">
+            <div class="reasoning-toggle" @click="toggleReasoning(m.id)">
+              <span class="reasoning-arrow">›</span>
+              <span class="reasoning-label">思考过程</span>
+              <span v-if="isReasoningStreaming(m)" class="reasoning-thinking">思考中…</span>
+            </div>
+            <div v-show="isReasoningOpen(m)" class="reasoning-body">
+              <AiMarkdown :content="m.reasoning" />
+            </div>
+          </div>
           <!-- AI 正文 markdown 渲染；用户消息保持纯文本 -->
           <AiMarkdown
             v-if="m.role === 'assistant' && m.content"
@@ -1411,40 +1580,42 @@ const configHint = computed(() => {
   color: var(--text);
 }
 
-/* 思考过程（默认收起，› 指示展开方向） */
+/* 思考过程（流式时自动展开，content 到达后自动收起；› 指示展开方向） */
 .reasoning {
   margin-bottom: 6px;
   font-size: 11px;
 }
-.reasoning summary {
+.reasoning-toggle {
   cursor: pointer;
   color: var(--muted-2);
   user-select: none;
-  list-style: none;
   display: inline-flex;
   align-items: center;
   gap: 5px;
 }
-.reasoning summary::-webkit-details-marker {
-  display: none;
-}
-.reasoning summary::after {
-  content: '›';
+.reasoning-arrow {
   font-size: 12px;
   line-height: 1;
   transition: transform 0.15s;
 }
-.reasoning[open] summary::after {
+.reasoning.open .reasoning-arrow {
   transform: rotate(90deg);
 }
-.reasoning[open] summary {
+.reasoning.open .reasoning-toggle {
   margin-bottom: 4px;
+}
+.reasoning-thinking {
+  color: var(--accent);
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+@keyframes reasoning-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
 }
 .reasoning-body {
   color: var(--muted);
   border-left: 2px solid var(--border);
   padding-left: 8px;
-  white-space: pre-wrap;
 }
 
 /* 流式等待动画 */
