@@ -957,6 +957,23 @@ function planFailedIndex(plan: AiPlan): number {
   return plan.steps.findIndex(s => s.state === 'failed')
 }
 
+/** 活动计划（最新 draft/executing）：展示在输入框上方的可折叠面板；
+ *  done/cancelled 历史计划留在消息流中纯展示 */
+const activePlanMsg = computed<AiChatMessage | null>(
+  () =>
+    [...messages.value]
+      .reverse()
+      .find(m => m.plan && (m.plan.state === 'draft' || m.plan.state === 'executing')) ?? null,
+)
+/** 面板折叠态（内存态）：新计划出现自动展开，用户手动切换后保持 */
+const planCollapsed = ref(false)
+watch(
+  () => activePlanMsg.value?.id,
+  () => {
+    planCollapsed.value = false
+  },
+)
+
 /** 取消规划：后端 cancels 同 scope 键，aiPlanGenerate 返回「规划已取消」交 catch 处理 */
 function cancelPlanning() {
   void aiStopChat(scope.value).catch(() => {})
@@ -1751,19 +1768,11 @@ const configHint = computed(() => {
           <div v-else-if="m.status === 'streaming'" class="typing">
             <span></span><span></span><span></span>
           </div>
-          <!-- 执行计划卡片（M4 Plan-and-Act）：挂在产生它的 assistant 消息位置，
-               draft 可编辑；步骤状态图标随执行驱动实时更新 -->
-          <div v-if="m.plan" class="plan-card" :class="m.plan.state">
+          <!-- 历史计划卡片（已落定的 done/cancelled）：纯展示留痕。
+               活动计划（draft/executing）在输入框上方可折叠面板中展示与交互 -->
+          <div v-if="m.plan && (m.plan.state === 'done' || m.plan.state === 'cancelled')" class="plan-card" :class="m.plan.state">
             <div class="plan-head">
-              <span class="plan-badge">
-                {{ m.plan.state === 'draft'
-                  ? '计划中'
-                  : m.plan.state === 'executing'
-                    ? '执行中'
-                    : m.plan.state === 'done'
-                      ? '已完成'
-                      : '已取消' }}
-              </span>
+              <span class="plan-badge">{{ m.plan.state === 'done' ? '已完成' : '已取消' }}</span>
               <span class="plan-goal" :title="m.plan.goal">🎯 {{ m.plan.goal }}</span>
             </div>
             <ol class="plan-steps">
@@ -1774,83 +1783,23 @@ const configHint = computed(() => {
                 :class="s.state"
               >
                 <span class="plan-step-icon">
-                  <span v-if="s.state === 'running'" class="plan-dot"></span>
-                  <template v-else>
-                    {{ s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'skipped' ? '⊘' : '○' }}
-                  </template>
+                  {{ s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'skipped' ? '⊘' : '○' }}
                 </span>
                 <div class="plan-step-body">
-                  <!-- draft 态：title/detail 可编辑（v-model 直绑源数据，确认即冻结快照） -->
-                  <template v-if="m.plan.state === 'draft'">
-                    <input
-                      v-model="s.title"
-                      class="plan-step-title-input"
-                      type="text"
-                      maxlength="50"
-                      placeholder="步骤简述"
-                    />
-                    <textarea
-                      v-model="s.detail"
-                      class="plan-step-detail-input"
-                      rows="2"
-                      placeholder="步骤详情（做什么、验证什么）"
-                    ></textarea>
-                  </template>
-                  <template v-else>
-                    <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
-                    <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
-                    <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
-                    <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
-                    <details
-                      v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
-                      class="plan-step-result"
-                    >
-                      <summary>结果</summary>
-                      <div class="plan-step-result-body">{{ s.result }}</div>
-                    </details>
-                  </template>
+                  <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
+                  <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
+                  <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
+                  <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
+                  <details
+                    v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
+                    class="plan-step-result"
+                  >
+                    <summary>结果</summary>
+                    <div class="plan-step-result-body">{{ s.result }}</div>
+                  </details>
                 </div>
               </li>
             </ol>
-            <!-- 操作按钮行：draft → 确认/取消；executing 且有 failed 步 → 失败四按钮 -->
-            <div v-if="m.plan.state === 'draft'" class="plan-actions">
-              <button type="button" class="plan-btn primary" :disabled="planning" @click="confirmPlan(m)">
-                确认执行
-              </button>
-              <button type="button" class="plan-btn" :disabled="planning" @click="cancelPlan(m)">取消</button>
-            </div>
-            <div
-              v-else-if="m.plan.state === 'executing' && planFailedIndex(m.plan) >= 0"
-              class="plan-actions"
-            >
-              <button
-                type="button"
-                class="plan-btn primary"
-                :disabled="planning"
-                @click="retryPlanStep(m, planFailedIndex(m.plan))"
-              >
-                重试
-              </button>
-              <button
-                type="button"
-                class="plan-btn"
-                :disabled="planning"
-                @click="skipPlanStep(m, planFailedIndex(m.plan))"
-              >
-                跳过
-              </button>
-              <button type="button" class="plan-btn danger" :disabled="planning" @click="abortPlan(m)">
-                终止
-              </button>
-              <button
-                type="button"
-                class="plan-btn"
-                :disabled="planning"
-                @click="replan(m, planFailedIndex(m.plan))"
-              >
-                {{ planning ? '规划中…' : '重新规划' }}
-              </button>
-            </div>
           </div>
           <!-- 工具提案记录条：
                - propose_command：命令提案卡片（授权/拒绝/执行状态徽标）
@@ -1982,6 +1931,126 @@ const configHint = computed(() => {
       <span class="quote-label">终端引用 · {{ quote.lines }} 行</span>
       <span class="quote-preview">{{ quote.text.split('\n')[0] }}</span>
       <button class="quote-remove" title="移除引用" @click="quote = null">✕</button>
+    </div>
+
+    <!-- 活动计划面板（M4 Plan-and-Act）：固定在输入框上方，执行进展始终可见；
+         可折叠展开；授权弹窗出现时让位隐藏（授权优先，裁决完自动恢复） -->
+    <div
+      v-if="activePlanMsg?.plan && !authorizing"
+      class="plan-panel"
+      :class="[activePlanMsg.plan.state, { collapsed: planCollapsed }]"
+    >
+      <div class="plan-panel-head" @click="planCollapsed = !planCollapsed">
+        <span class="plan-badge">
+          {{ activePlanMsg.plan.state === 'draft' ? '计划中' : '执行中' }}
+        </span>
+        <span class="plan-goal" :title="activePlanMsg.plan.goal">🎯 {{ activePlanMsg.plan.goal }}</span>
+        <span class="plan-progress">
+          {{ activePlanMsg.plan.state === 'draft'
+            ? `${activePlanMsg.plan.steps.length} 步 · 待确认`
+            : `第 ${Math.min(activePlanMsg.plan.currentIndex + 1, activePlanMsg.plan.steps.length)}/${activePlanMsg.plan.steps.length} 步` }}
+        </span>
+        <span class="plan-collapse-arrow" :class="{ open: !planCollapsed }">›</span>
+      </div>
+      <div v-show="!planCollapsed" class="plan-panel-body">
+        <ol class="plan-steps">
+          <li
+            v-for="(s, si) in activePlanMsg.plan.steps"
+            :key="s.id"
+            class="plan-step"
+            :class="s.state"
+          >
+            <span class="plan-step-icon">
+              <span v-if="s.state === 'running'" class="plan-dot"></span>
+              <template v-else>
+                {{ s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'skipped' ? '⊘' : '○' }}
+              </template>
+            </span>
+            <div class="plan-step-body">
+              <!-- draft 态：title/detail 可编辑（v-model 直绑源数据，确认即冻结快照） -->
+              <template v-if="activePlanMsg.plan.state === 'draft'">
+                <input
+                  v-model="s.title"
+                  class="plan-step-title-input"
+                  type="text"
+                  maxlength="50"
+                  placeholder="步骤简述"
+                />
+                <textarea
+                  v-model="s.detail"
+                  class="plan-step-detail-input"
+                  rows="2"
+                  placeholder="步骤详情（做什么、验证什么）"
+                ></textarea>
+              </template>
+              <template v-else>
+                <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
+                <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
+                <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
+                <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
+                <details
+                  v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
+                  class="plan-step-result"
+                >
+                  <summary>结果</summary>
+                  <div class="plan-step-result-body">{{ s.result }}</div>
+                </details>
+              </template>
+            </div>
+          </li>
+        </ol>
+        <!-- 操作按钮行：draft → 确认/取消；executing 且有 failed 步 → 失败四按钮 -->
+        <div v-if="activePlanMsg.plan.state === 'draft'" class="plan-actions">
+          <button
+            type="button"
+            class="plan-btn primary"
+            :disabled="planning"
+            @click="confirmPlan(activePlanMsg)"
+          >
+            确认执行
+          </button>
+          <button type="button" class="plan-btn" :disabled="planning" @click="cancelPlan(activePlanMsg)">
+            取消
+          </button>
+        </div>
+        <div
+          v-else-if="activePlanMsg.plan.state === 'executing' && planFailedIndex(activePlanMsg.plan) >= 0"
+          class="plan-actions"
+        >
+          <button
+            type="button"
+            class="plan-btn primary"
+            :disabled="planning"
+            @click="retryPlanStep(activePlanMsg, planFailedIndex(activePlanMsg.plan))"
+          >
+            重试
+          </button>
+          <button
+            type="button"
+            class="plan-btn"
+            :disabled="planning"
+            @click="skipPlanStep(activePlanMsg, planFailedIndex(activePlanMsg.plan))"
+          >
+            跳过
+          </button>
+          <button
+            type="button"
+            class="plan-btn danger"
+            :disabled="planning"
+            @click="abortPlan(activePlanMsg)"
+          >
+            终止
+          </button>
+          <button
+            type="button"
+            class="plan-btn"
+            :disabled="planning"
+            @click="replan(activePlanMsg, planFailedIndex(activePlanMsg.plan))"
+          >
+            {{ planning ? '规划中…' : '重新规划' }}
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- 直接执行确认弹窗：写入即键盘，用户核对命令原文（对齐 paste guard 先例） -->
@@ -2622,6 +2691,58 @@ const configHint = computed(() => {
 .plan-btn.danger {
   border-color: rgba(229, 90, 90, 0.5);
   color: #e57a7a;
+}
+
+/* ---- 活动计划面板：固定输入框上方，可折叠，授权弹窗出现时让位（v-if 隐藏） ---- */
+.plan-panel {
+  flex-shrink: 0;
+  /* 与授权弹窗/输入区同宽居中 */
+  width: 100%;
+  max-width: 760px;
+  box-sizing: border-box;
+  margin: 0 auto 6px;
+  border: 1px solid rgba(86, 156, 214, 0.4);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+.plan-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.plan-panel-head .plan-badge {
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.plan-panel.draft .plan-badge {
+  animation: none;
+}
+.plan-progress {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.plan-collapse-arrow {
+  flex-shrink: 0;
+  color: var(--muted-2);
+  font-size: 14px;
+  line-height: 1;
+  transform: rotate(0deg); /* 折叠态箭头向右 */
+  transition: transform 0.15s;
+}
+.plan-collapse-arrow.open {
+  transform: rotate(90deg); /* 展开态箭头向下 */
+}
+.plan-panel-body {
+  padding: 2px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 /* Plan 模式开关：与权限档下拉同一弱化风格，激活时蓝色高亮 */
