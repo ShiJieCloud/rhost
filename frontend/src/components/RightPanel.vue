@@ -2,12 +2,21 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Inspector from './wb/Inspector.vue'
 import AiChatPanel from './AiChatPanel.vue'
-import { appView, rightPanelMaximized, rightPanelTab, rightPanelVisible, rightPanelWidth } from '../stores/session'
+import { appView, activeSession, rightPanelMaximized, rightPanelTab, rightPanelVisible, rightPanelWidth } from '../stores/session'
+import { savedSettings } from '../stores/settings'
 
 /** 头部标题：AI 固定；monitor 页签在首页显示「历史会话」，工作台显示「监控」 */
 const panelTitle = computed(() => {
   if (rightPanelTab.value === 'ai') return 'AI 助手'
   return appView.value === 'home' ? '历史会话' : '监控'
+})
+
+/** AI 对话 scope 标识：工作台显示当前主机名（别名优先回落 host.id），其余为全局 */
+const scopeLabel = computed(() => {
+  if (appView.value === 'workbench' && activeSession.value) {
+    return activeSession.value.alias || activeSession.value.host.id
+  }
+  return '全局'
 })
 
 const railRef = ref<HTMLElement | null>(null)
@@ -44,9 +53,10 @@ function toggleMaximize() {
   rightPanelMaximized.value = !rightPanelMaximized.value
 }
 
-/** ⌘I / Ctrl+I：折叠↔展开并切到 AI 页签；已在 AI 展开态再按则折叠 */
+/** ⌘I / Ctrl+I：折叠↔展开并切到 AI 页签；已在 AI 展开态再按则折叠；AI 功能关闭时停用 */
 function onKey(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'i') {
+    if (!savedSettings.aiEnabled) return
     e.preventDefault()
     if (rightPanelVisible.value && rightPanelTab.value === 'ai') {
       rightPanelVisible.value = false
@@ -81,7 +91,10 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
 
     <!-- 头部：当前面板标题 + 各面板 Teleport 注入的操作按钮 + 专注/折叠按钮 -->
     <div class="panel-head">
-      <div class="panel-title">{{ panelTitle }}</div>
+      <div class="panel-title">
+        <span class="title-text">{{ panelTitle }}</span>
+        <span v-if="rightPanelTab === 'ai'" class="scope-badge" :title="`对话归属：${scopeLabel}`">{{ scopeLabel }}</span>
+      </div>
       <div id="rp-head-actions" class="panel-actions" />
       <button
         class="close-btn"
@@ -179,15 +192,41 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
-  flex-shrink: 0;
+  /* 窄面板时标题区可收缩（收缩只发生在 scope 徽标上），保住右侧按钮不换行不溢出 */
+  flex-shrink: 1;
   /* 标题靠左，后续所有按钮（操作区 + 折叠）整体靠右 */
   margin-right: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.title-text {
+  flex-shrink: 0;
+}
+/* AI 对话归属标识：全局 / 当前主机名。
+ * 标题与右侧按钮宽度固定，徽标是唯一弹性元素：宽度 = min(完整名字, 可用空间)，
+ * 面板加宽跟随展开、收窄截断（ellipsis），极限压缩靠 min-width: 0 */
+.scope-badge {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--green);
+  background: rgba(61, 220, 132, 0.1);
+  border: 1px solid rgba(61, 220, 132, 0.25);
+  border-radius: 999px;
+  padding: 1px 8px;
 }
 /* 各面板通过 Teleport 注入的操作按钮容器 */
 .panel-actions {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 .panel-actions:empty {
   display: none;

@@ -63,7 +63,8 @@ struct ConnectionsFile {
 
 const FILE_VERSION: u32 = 1;
 const FILE_NAME: &str = "connections.json";
-const KEYRING_SERVICE: &str = "com.rhost.app";
+/// 钥匙串服务名：主机密码与 AI API Key 共用同一 service，以 account 区分
+pub(crate) const KEYRING_SERVICE: &str = "com.rhost.app";
 
 /// 获取 connections.json 的完整路径（位于 Tauri app_data_dir 下）。
 pub(crate) fn connections_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -285,7 +286,7 @@ fn macos_security_delete(host_id: &str) -> Result<(), String> {
 }
 
 /// 统一的钥匙串保存接口：macOS 用 security CLI，其余平台用 keyring crate。
-fn keyring_save(host_id: &str, password: &str) -> Result<(), String> {
+pub(crate) fn keyring_save(host_id: &str, password: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         macos_security_save(host_id, password)
@@ -299,7 +300,7 @@ fn keyring_save(host_id: &str, password: &str) -> Result<(), String> {
 }
 
 /// 统一的钥匙串读取接口。
-fn keyring_get(host_id: &str) -> Result<Option<String>, String> {
+pub(crate) fn keyring_get(host_id: &str) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     {
         macos_security_get(host_id)
