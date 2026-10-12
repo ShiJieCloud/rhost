@@ -17,6 +17,7 @@ import {
   aiListMemories,
   aiListPromptAssets,
   aiLoadChat,
+  aiPlanGenerate,
   aiSaveChat,
   aiCancelExecs,
   aiExecTool,
@@ -26,6 +27,7 @@ import {
   listenAiEvents,
   type AiChatMessage,
   type AiMemoryItem,
+  type AiPlan,
   type AiPromptAsset,
   type AiPromptAssets,
   type AiScope,
@@ -75,6 +77,20 @@ const toolRound = ref(0)
 /** 单次用户输入允许的最大工具循环轮次。
  *  ReAct 场景：3~4 次只读探索 + 2~3 次命令执行 = 6 轮上限 */
 const MAX_TOOL_ROUNDS = 6
+
+/* ---------- Plan-and-Act 规划模式（M4） ---------- */
+
+/** 规划模式开关（消息级：仅作用于本次提交，发送后自动复位；切 scope 自动关闭） */
+const planMode = ref(false)
+/** 计划生成/重规划进行中（防重入；输入区禁用，发送键变为取消） */
+const planning = ref(false)
+/** 当前正在执行的计划步：所属计划消息 + 步下标。
+ *  续跑链期间保持，直到该步落定（完成/失败）才清除 */
+const planRunRef = ref<{ msgId: string; stepIndex: number } | null>(null)
+/** finishPlan 总结轮所属计划消息 id（该轮注入全部步骤摘要且不带工具） */
+const planSummaryRef = ref<string | null>(null)
+/** 斜杠命令：消息以 "/plan " 开头强制走规划模式（优先级高于 Toggle 开关） */
+const PLAN_CMD_RE = /^\/plan\s+/
 
 function uid(): string {
   return crypto.randomUUID()
@@ -171,6 +187,18 @@ async function loadRecord(s: AiScope) {
     messages.value = (rec?.messages ?? []).map(m =>
       m.status === 'streaming' ? { ...m, status: 'stopped' as const } : m,
     )
+    // 计划崩溃收敛：executing 计划的 running 步中断后收敛为 failed（记「应用中断」），
+    // plan 保持 executing 等用户决策（重试/跳过/终止）——与 streaming→stopped 同语义
+    for (const m of messages.value) {
+      if (m.plan?.state === 'executing') {
+        m.plan.steps.forEach(st => {
+          if (st.state === 'running') {
+            st.state = 'failed'
+            st.result = '应用中断'
+          }
+        })
+      }
+    }
     summary.value = rec?.summary ?? ''
     summaryUpTo.value = rec?.summaryUpTo ?? ''
     extractedUpTo.value = rec?.extractedUpTo ?? ''
@@ -191,6 +219,43 @@ watch(scope, (s, oldS) => {
   editFromId.value = null
   execPermission.value = 'manual' // 权限档随会话回落，杜绝「上次开的 full 忘了关」
   resetProposalState()
+  // 旧 scope 执行中计划收敛：executing → cancelled、running 步 → failed，
+  // 在 loadRecord 替换消息前落盘到旧 scope（persist 内部读 scope.value 已是新值，此处手动存）
+  if (oldS && isTauri) {
+    let dirty = false
+    for (const m of messages.value) {
+      if (m.plan?.state === 'executing') {
+        m.plan.state = 'cancelled'
+        m.plan.steps.forEach(st => {
+          if (st.state === 'running') {
+            st.state = 'failed'
+            st.result = '会话切换'
+          }
+        })
+        dirty = true
+      }
+    }
+    if (dirty) {
+      const cleaned = messages.value.map(m =>
+        m.status === 'streaming' ? { ...m, status: 'stopped' as const } : m,
+      )
+      void aiSaveChat(oldS, {
+        version: 1,
+        scope: oldS,
+        title: cleaned.find(m => m.role === 'user')?.content.slice(0, 20),
+        updatedAt: Date.now(),
+        messages: cleaned,
+        summary: summary.value || undefined,
+        summaryUpTo: summaryUpTo.value || undefined,
+        extractedUpTo: extractedUpTo.value || undefined,
+      }).catch(() => {}) // 失败静默：收敛是尽力而为
+    }
+  }
+  // 计划相关内存态随 scope 清理
+  planMode.value = false
+  planning.value = false
+  planRunRef.value = null
+  planSummaryRef.value = null
   // 取消旧会话在飞的只读工具 exec 任务，防止后端堆积（旧 scope 非 global 时才需取消）
   // 注意：ai_cancel_execs 需要后端 session_id（backendId），不是前端 scope
   if (oldS && oldS !== 'global') {
@@ -228,6 +293,14 @@ onMounted(async () => {
         if (!last.content) last.content = `请求失败：${e.message}`
       }
       streaming.value = false
+      // 计划步执行中请求失败 → 该步转 failed，等用户决策
+      const run = planRunRef.value
+      if (run) {
+        planRunRef.value = null
+        const planMsg = messages.value.find(m => m.id === run.msgId)
+        if (planMsg?.plan) failPlanStep(planMsg, run.stepIndex, `请求失败：${e.message}`)
+      }
+      planSummaryRef.value = null
       persist()
     },
     onToolCalls: e => {
@@ -291,6 +364,10 @@ function finishStreaming(status: 'done' | 'stopped') {
   scrollToBottom()
   // 提案调度：pending 入队弹窗；无 pending 且本轮已裁决完 → 自动续跑
   pumpProposals()
+  // 计划步落定判定（pumpProposals 之后：有提案则续跑链推进，无提案才可能落定）
+  maybeAdvancePlan(status)
+  // finishPlan 总结轮无工具无续跑，流结束即清除标记
+  if (planSummaryRef.value) planSummaryRef.value = null
   void maybeSummarize()
   // 记忆提取仅在正常完成后触发（中止/错误轮次内容不完整，不提取）
   if (status === 'done') void maybeExtractMemories()
@@ -478,7 +555,73 @@ function buildWireMessages(assets?: AiPromptAssets, memories?: AiMemoryItem[]): 
   // 会话上下文 system 靠近对话（注意力靠后），置于最末
   const ctx = buildSessionContext()
   if (ctx) systems.push(ctx)
+  // 计划上下文（M4）：执行步/总结轮时置于最末（当前任务的强约束，注意力最近）
+  const planSys = buildPlanSystem()
+  if (planSys) systems.push(planSys)
   return [...systems, ...wired]
+}
+
+/* ---------- Plan-and-Act 计划上下文注入 ---------- */
+
+/** 计划注入总预算：2KB UTF-8（够表达 8 步目标清单与进展，不挤占技能/规则 16KB 预算） */
+const PLAN_BUDGET_BYTES = 2 * 1024
+/** 目标行截断（字符） */
+const PLAN_GOAL_MAX_CHARS = 100
+/** 步骤结果摘要截断（字符）：8 步 × 150 = 1.2KB，加目标与标题后总量 <2KB 预算 */
+const PLAN_RESULT_MAX_CHARS = 150
+
+/** 组装计划 system 消息：执行步轮注入「目标+进展+当前步+约束」，finishPlan 总结轮注入
+ *  「全部步骤结果摘要」。超 2KB 预算时从最旧的已完成步骤摘要开始丢弃并标注。
+ *  计划文本取自落盘的 plan 快照（确认时冻结），卡片展示与注入同源 */
+function buildPlanSystem(): AiWireMessage | null {
+  const enc = new TextEncoder()
+  // finishPlan 总结轮：全部步骤结果摘要，无工具、纯文本收尾
+  if (planSummaryRef.value) {
+    const plan = messages.value.find(m => m.id === planSummaryRef.value)?.plan
+    if (!plan) return null
+    const head = `【执行计划总结】（用户确认的计划已全部落定）\n目标：${plan.goal.slice(0, PLAN_GOAL_MAX_CHARS)}\n各步骤结果：\n`
+    const tail = `\n请基于以上执行过程给出完整总结。`
+    const parts: string[] = []
+    plan.steps.forEach((s, i) => {
+      const label =
+        s.state === 'done' ? '完成' : s.state === 'skipped' ? '跳过' : s.state === 'failed' ? '失败' : '未执行'
+      parts.push(`${i + 1}. [${label}] ${s.title} — ${s.result ?? ''}`)
+    })
+    let omitted = 0
+    while (parts.length > 1 && enc.encode(head + parts.join('\n') + tail).length > PLAN_BUDGET_BYTES) {
+      parts.shift()
+      omitted++
+    }
+    const content =
+      head + (omitted ? `[早期 ${omitted} 步摘要省略]\n` : '') + parts.join('\n') + tail
+    return { role: 'system', content }
+  }
+  // 执行步轮：目标 + 步骤进展 + 当前步 detail + 约束条款
+  const run = planRunRef.value
+  if (!run) return null
+  const plan = messages.value.find(m => m.id === run.msgId)?.plan
+  if (!plan) return null
+  const i = run.stepIndex
+  const n = plan.steps.length
+  const step = plan.steps[i]
+  if (!step) return null
+  const head = `【执行计划】（第 ${i + 1}/${n} 步，用户已确认，须严格遵守）\n目标：${plan.goal.slice(0, PLAN_GOAL_MAX_CHARS)}\n步骤进展：\n`
+  const tail =
+    `\n约束：专注完成当前步骤；禁止擅自新增不在计划内的动作；确需偏离时先向用户说明并获得同意；本步完成后用一句话总结本步结果。`
+  const parts: string[] = []
+  plan.steps.forEach((s, idx) => {
+    if (idx < i) parts.push(`${idx + 1}. [已完成] ${s.title} — ${s.result ?? ''}`)
+    else if (idx === i) parts.push(`${idx + 1}. [当前步] ${s.title}：${s.detail}`)
+    else parts.push(`${idx + 1}. [待执行] ${s.title}`)
+  })
+  // 从最旧已完成步骤摘要丢弃（不得丢当前步与待执行步）
+  let omitted = 0
+  while (omitted < i && enc.encode(head + parts.join('\n') + tail).length > PLAN_BUDGET_BYTES) {
+    parts.shift()
+    omitted++
+  }
+  const content = head + (omitted ? `[早期 ${omitted} 步摘要省略]\n` : '') + parts.join('\n') + tail
+  return { role: 'system', content }
 }
 
 /** 单类（规则/技能）合计注入预算：16KB，按 UTF-8 字节计量（与后端单文件 8KB 口径一致；
@@ -654,7 +797,7 @@ function buildSessionContext(): AiWireMessage | null {
 
 function send(override?: string) {
   const input = (override ?? draft.value).trim()
-  if (!input || streaming.value) return
+  if (!input || streaming.value || planning.value) return
 
   // 编辑重发：截断发生在真正发送时（填回时不截断，用户可能取消编辑）
   if (editFromId.value) {
@@ -671,6 +814,14 @@ function send(override?: string) {
     toast('有命令提案等待确认，请先完成授权', 'warn', 2400)
     return
   }
+  // 存在 draft/executing 计划：拦截发送（确认、取消或执行完毕后才可继续），避免多计划并行
+  const activePlan = messages.value.find(
+    m => m.plan && (m.plan.state === 'draft' || m.plan.state === 'executing'),
+  )
+  if (activePlan) {
+    toast('有计划进行中，请先确认、取消或等待完成', 'warn', 2400)
+    return
+  }
   // 兜底：会话切换/载入遗留的失效转换（正常路径已由 resetProposalState 处理）
   for (const m of messages.value) {
     m.toolProposals?.forEach(p => {
@@ -679,10 +830,16 @@ function send(override?: string) {
   }
   toolRound.value = 0
 
+  // 规划模式检测（优先级：/plan 命令 > Toggle 开关 > 默认 ReAct；仅工作台 scope）
+  const usePlan = scope.value !== 'global' && (PLAN_CMD_RE.test(input) || planMode.value)
+  // Toggle 为消息级：无论本次是否规划，提交后自动复位回默认
+  planMode.value = false
+
   // 终端引用块并入本次 user 消息（引用在前，问题在后；模型对标记内内容按上下文对待）
-  let text = input
+  let text = usePlan ? input.replace(PLAN_CMD_RE, '').trim() : input
+  if (!text) return // "/plan" 后无实际内容
   if (quote.value) {
-    text = `<terminal-output>\n${quote.value.text}\n</terminal-output>\n\n${input}`
+    text = `<terminal-output>\n${quote.value.text}\n</terminal-output>\n\n${text}`
     quote.value = null
   }
 
@@ -694,13 +851,6 @@ function send(override?: string) {
     status: 'done',
     createdAt: Date.now(),
   })
-  messages.value.push({
-    id: uid(),
-    role: 'assistant',
-    content: '',
-    status: 'streaming',
-    createdAt: Date.now(),
-  })
   streaming.value = true
   draft.value = ''
   scrollToBottom()
@@ -708,6 +858,13 @@ function send(override?: string) {
 
   if (!isTauri) {
     // 浏览器 dev 降级：占位回复
+    messages.value.push({
+      id: uid(),
+      role: 'assistant',
+      content: '',
+      status: 'streaming',
+      createdAt: Date.now(),
+    })
     window.setTimeout(() => {
       if (seq !== loadSeq) return
       const last = messages.value[messages.value.length - 1]
@@ -720,7 +877,277 @@ function send(override?: string) {
     return
   }
 
+  // 规划模式分流：先生成计划卡片，确认后再进入 ReAct 循环
+  if (usePlan) {
+    void sendPlanned(seq, text)
+    return
+  }
+
+  messages.value.push({
+    id: uid(),
+    role: 'assistant',
+    content: '',
+    status: 'streaming',
+    createdAt: Date.now(),
+  })
+  scrollToBottom()
+  persist()
   runAiStream(seq)
+}
+
+/** 规划模式发送：调用 ai_plan_generate 生成计划卡片（draft）。
+ *  失败降级：toast + 占位消息转普通流式回复（自动按 ReAct 发送，用户输入不丢失）；
+ *  用户取消：移除占位与 user 消息，原文填回输入框 */
+async function sendPlanned(seq: number, text: string) {
+  const placeholder: AiChatMessage = {
+    id: uid(),
+    role: 'assistant',
+    content: '',
+    status: 'streaming',
+    createdAt: Date.now(),
+  }
+  messages.value.push(placeholder)
+  scrollToBottom()
+  persist()
+  // 规划阶段非流式：streaming 置回（输入区由 planning 标记禁用，停止键可取消）
+  streaming.value = false
+  planning.value = true
+  try {
+    const result = await aiPlanGenerate(scope.value, text)
+    if (seq !== loadSeq) return
+    placeholder.status = 'done'
+    placeholder.plan = {
+      goal: text,
+      steps: result.steps.map(s => ({
+        id: uid(),
+        title: s.title,
+        detail: s.detail,
+        state: 'pending' as const,
+      })),
+      currentIndex: 0,
+      state: 'draft',
+    }
+    persist()
+    scrollToBottom()
+  } catch (e) {
+    if (seq !== loadSeq) return
+    const msg = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
+    if (msg === '规划已取消') {
+      // 用户取消：移除占位与 user 消息，原文填回输入框（输入不丢失）
+      messages.value = messages.value.filter(m => m.id !== placeholder.id)
+      const lastMsg = messages.value[messages.value.length - 1]
+      if (lastMsg?.role === 'user') {
+        draft.value = lastMsg.content
+        messages.value.pop()
+      }
+      persist()
+      return
+    }
+    // 规划失败：toast + 占位转普通流式回复（自动按 ReAct 发送）
+    toast('计划生成失败，已按普通模式发送', 'warn', 2600)
+    streaming.value = true
+    runAiStream(seq)
+  } finally {
+    planning.value = false
+  }
+}
+
+/** 计划中首个失败步下标（无则 -1）：失败操作按钮的作用目标（同时只会有一个 failed 步） */
+function planFailedIndex(plan: AiPlan): number {
+  return plan.steps.findIndex(s => s.state === 'failed')
+}
+
+/** 取消规划：后端 cancels 同 scope 键，aiPlanGenerate 返回「规划已取消」交 catch 处理 */
+function cancelPlanning() {
+  void aiStopChat(scope.value).catch(() => {})
+}
+
+/* ---------- Plan-and-Act 执行驱动（M4，设计文档 §6.4） ---------- */
+
+/** 确认执行：draft 编辑直接落在 plan.steps 上（v-model 绑源数据无中间态），
+ *  确认即冻结快照（卡片切换只读），随后从 currentIndex 启动逐步执行 */
+function confirmPlan(planMsg: AiChatMessage) {
+  const plan = planMsg.plan
+  if (!plan || plan.state !== 'draft') return
+  plan.state = 'executing'
+  persist()
+  scrollToBottom()
+  runPlanStep(planMsg, plan.currentIndex)
+}
+
+/** 取消计划：draft 态显式用户决策，落盘保留卡片（cancelled 纯展示） */
+function cancelPlan(planMsg: AiChatMessage) {
+  const plan = planMsg.plan
+  if (!plan || plan.state !== 'draft') return
+  plan.state = 'cancelled'
+  persist()
+}
+
+/** 启动步骤 i：step 转 running、工具轮次归零（每步独立计数），
+ *  追加 assistant 流式消息发起请求；buildPlanSystem 依 planRunRef 注入该步上下文 */
+function runPlanStep(planMsg: AiChatMessage, i: number) {
+  const plan = planMsg.plan
+  const step = plan?.steps[i]
+  if (!plan || !step) return
+  step.state = 'running'
+  step.result = undefined
+  plan.currentIndex = i
+  toolRound.value = 0
+  planRunRef.value = { msgId: planMsg.id, stepIndex: i }
+  messages.value.push({
+    id: uid(),
+    role: 'assistant',
+    content: '',
+    status: 'streaming',
+    createdAt: Date.now(),
+  })
+  streaming.value = true
+  scrollToBottom()
+  persist()
+  runAiStream(++loadSeq)
+}
+
+/** 步骤落定判定（finishStreaming 中 pumpProposals 之后调用）：
+ *  - 用户中止 → 当前步 failed「用户中止」，plan 保持 executing 等决策（不回滚已执行操作）
+ *  - 正常结束且续跑链已尽（无弹窗/无执行中/不再续跑）→ 该步 done，推进下一步或收尾 */
+function maybeAdvancePlan(status: 'done' | 'stopped') {
+  const run = planRunRef.value
+  if (!run) return
+  const planMsg = messages.value.find(m => m.id === run.msgId)
+  if (!planMsg?.plan) {
+    planRunRef.value = null
+    return
+  }
+  if (status === 'stopped') {
+    planRunRef.value = null
+    failPlanStep(planMsg, run.stepIndex, '用户中止')
+    return
+  }
+  // 提案弹窗中 / 只读工具执行中 / 已起续跑轮：步骤未落定，等后续回调推进
+  if (streaming.value || hasPendingProposal() || autoRunning.size > 0) return
+  planRunRef.value = null
+  completePlanStep(planMsg, run.stepIndex)
+}
+
+/** 步骤完成：取该步最终 assistant 回复前 150 字符为结果摘要，推进下一步或 finishPlan */
+function completePlanStep(planMsg: AiChatMessage, i: number) {
+  const plan = planMsg.plan
+  const step = plan?.steps[i]
+  if (!plan || !step) return
+  const last = messages.value[messages.value.length - 1]
+  const content = last?.role === 'assistant' ? last.content.trim() : ''
+  step.state = 'done'
+  step.result = (content || '（无文本输出）').slice(0, PLAN_RESULT_MAX_CHARS)
+  persist()
+  if (i + 1 < plan.steps.length) runPlanStep(planMsg, i + 1)
+  else finishPlan(planMsg)
+}
+
+/** 步骤失败：转 failed 记原因，plan 保持 executing，卡片呈现失败操作按钮等用户决策 */
+function failPlanStep(planMsg: AiChatMessage, i: number, reason: string) {
+  const plan = planMsg.plan
+  const step = plan?.steps[i]
+  if (!plan || !step) return
+  step.state = 'failed'
+  step.result = reason.slice(0, PLAN_RESULT_MAX_CHARS)
+  persist()
+  scrollToBottom()
+}
+
+/** 全部步骤落定：plan 转 done，发起总结轮（注入全部步骤摘要、不带工具，纯文本收尾） */
+function finishPlan(planMsg: AiChatMessage) {
+  const plan = planMsg.plan
+  if (!plan) return
+  plan.state = 'done'
+  planSummaryRef.value = planMsg.id
+  messages.value.push({
+    id: uid(),
+    role: 'assistant',
+    content: '',
+    status: 'streaming',
+    createdAt: Date.now(),
+  })
+  streaming.value = true
+  scrollToBottom()
+  persist()
+  runAiStream(++loadSeq)
+}
+
+/** 重试失败步：重置为 pending（result 清空）后重新启动；已产生的 assistant 消息留痕 */
+function retryPlanStep(planMsg: AiChatMessage, i: number) {
+  const plan = planMsg.plan
+  const step = plan?.steps[i]
+  if (!plan || plan.state !== 'executing' || !step || step.state !== 'failed') return
+  step.state = 'pending'
+  step.result = undefined
+  persist()
+  runPlanStep(planMsg, i)
+}
+
+/** 跳过失败步：记「用户跳过」，推进下一步或收尾（显式用户决策，落盘） */
+function skipPlanStep(planMsg: AiChatMessage, i: number) {
+  const plan = planMsg.plan
+  const step = plan?.steps[i]
+  if (!plan || plan.state !== 'executing' || !step || step.state !== 'failed') return
+  step.state = 'skipped'
+  step.result = '用户跳过'
+  persist()
+  if (i + 1 < plan.steps.length) runPlanStep(planMsg, i + 1)
+  else finishPlan(planMsg)
+}
+
+/** 终止计划：plan 转 cancelled，剩余步骤保持 pending（显式用户决策，落盘） */
+function abortPlan(planMsg: AiChatMessage) {
+  const plan = planMsg.plan
+  if (!plan || plan.state !== 'executing') return
+  plan.state = 'cancelled'
+  planRunRef.value = null
+  persist()
+}
+
+/** 重新规划：拼装「目标 + 各步进展 + 失败步详情与原因」调 ai_plan_generate，
+ *  新步骤数组替换失败步及后续（已完成步骤保留），plan 回 draft 再次经用户确认 */
+async function replan(planMsg: AiChatMessage, failedIndex: number) {
+  const plan = planMsg.plan
+  const failed = plan?.steps[failedIndex]
+  if (!plan || !failed || planning.value) return
+  const lines = [
+    `原始目标：${plan.goal}`,
+    '',
+    '已确认计划的执行进展：',
+    ...plan.steps.map((s, idx) => {
+      const label =
+        s.state === 'done' ? '已完成' : s.state === 'skipped' ? '已跳过' : s.state === 'failed' ? '失败' : '未执行'
+      return `${idx + 1}. [${label}] ${s.title}${s.result ? ` — ${s.result}` : ''}`
+    }),
+    '',
+    `第 ${failedIndex + 1} 步「${failed.title}」执行失败：${failed.detail}`,
+    `失败原因：${failed.result ?? '未知'}`,
+    '',
+    '请基于以上进展，重新规划从该步开始的剩余步骤（已完成步骤不要重复）。',
+  ]
+  planning.value = true
+  try {
+    const result = await aiPlanGenerate(scope.value, lines.join('\n'))
+    plan.steps = [
+      ...plan.steps.slice(0, failedIndex),
+      ...result.steps.map(s => ({
+        id: uid(),
+        title: s.title,
+        detail: s.detail,
+        state: 'pending' as const,
+      })),
+    ]
+    plan.currentIndex = failedIndex
+    plan.state = 'draft'
+    persist()
+    scrollToBottom()
+  } catch (e) {
+    const msg = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
+    if (msg !== '规划已取消') toast(`重新规划失败：${msg}`, 'err', 3000)
+  } finally {
+    planning.value = false
+  }
 }
 
 /** 发起流式请求（send 与提案裁决续跑共用）。工具提案仅在工作台会话下启用
@@ -737,7 +1164,8 @@ async function runAiStream(seq: number) {
   }
   if (seq !== loadSeq) return // 拉取期间切换了 scope，丢弃本次发送
   aiChatStream(scope.value, buildWireMessages(assets, memories), {
-    enableTools: scope.value !== 'global',
+    // finishPlan 总结轮不带工具：纯文本收尾，避免总结阶段再起提案循环
+    enableTools: scope.value !== 'global' && !planSummaryRef.value,
   }).catch(e => {
     if (seq !== loadSeq) return
     const last = messages.value[messages.value.length - 1]
@@ -791,9 +1219,31 @@ function pumpProposals() {
   }
   if (!awaitingContinue.value) return
   awaitingContinue.value = false
+  // 计划步执行中会话断开（提案因会话问题 rejected）：该步直接转 failed 等用户决策，
+  // 不再续跑让模型在断开的会话上空转（设计 §7 降级：不自动重试）
+  const run = planRunRef.value
+  if (run) {
+    const planMsg = messages.value.find(m => m.id === run.msgId)
+    const last = [...messages.value].reverse().find(m => m.role === 'assistant')
+    const disconnected = last?.toolProposals?.some(
+      p => p.state === 'rejected' && p.error?.includes('会话'),
+    )
+    if (planMsg?.plan && disconnected) {
+      planRunRef.value = null
+      failPlanStep(planMsg, run.stepIndex, '会话已断开')
+      return
+    }
+  }
   toolRound.value++
   if (toolRound.value > MAX_TOOL_ROUNDS) {
     toast(`已达到工具循环轮次上限（${MAX_TOOL_ROUNDS}），如需继续请重新提问`, 'warn', 3200)
+    // 计划步执行中超限：该步转 failed「工具轮次上限」，等用户决策
+    const run = planRunRef.value
+    if (run) {
+      planRunRef.value = null
+      const planMsg = messages.value.find(m => m.id === run.msgId)
+      if (planMsg?.plan) failPlanStep(planMsg, run.stepIndex, '工具轮次上限')
+    }
     return
   }
   continueToolRound()
@@ -973,11 +1423,20 @@ function resetProposalState() {
  * 理由：摘要由被删消息合并而来，删除后无法重建，宁可回退为原文携带。
  */
 function rollbackSummaryAfterCut(cutIndex: number) {
-  if (!summaryUpTo.value) return
-  const upIdx = messages.value.findIndex(m => m.id === summaryUpTo.value)
-  if (upIdx < 0 || cutIndex <= upIdx) {
-    summary.value = ''
-    summaryUpTo.value = ''
+  if (summaryUpTo.value) {
+    const upIdx = messages.value.findIndex(m => m.id === summaryUpTo.value)
+    if (upIdx < 0 || cutIndex <= upIdx) {
+      summary.value = ''
+      summaryUpTo.value = ''
+    }
+  }
+  // 计划随消息截断一并作废：清理指向已移除消息的计划内存态引用
+  // （设计 §6.7：重新生成/删除/编辑重发截断到 user 消息时，计划作废）
+  if (planRunRef.value && !messages.value.some(m => m.id === planRunRef.value!.msgId)) {
+    planRunRef.value = null
+  }
+  if (planSummaryRef.value && !messages.value.some(m => m.id === planSummaryRef.value)) {
+    planSummaryRef.value = null
   }
 }
 
@@ -1171,6 +1630,10 @@ function clearChat() {
   summary.value = ''
   summaryUpTo.value = ''
   reasoningManual.value.clear()
+  // 计划内存态一并清理（卡片随消息清空）
+  planMode.value = false
+  planRunRef.value = null
+  planSummaryRef.value = null
   if (isTauri) void aiClearChat(scope.value).catch(e => console.error('[AI] 清空失败:', e))
 }
 
@@ -1287,6 +1750,107 @@ const configHint = computed(() => {
           <div v-else-if="m.content" class="bubble-body">{{ m.content }}</div>
           <div v-else-if="m.status === 'streaming'" class="typing">
             <span></span><span></span><span></span>
+          </div>
+          <!-- 执行计划卡片（M4 Plan-and-Act）：挂在产生它的 assistant 消息位置，
+               draft 可编辑；步骤状态图标随执行驱动实时更新 -->
+          <div v-if="m.plan" class="plan-card" :class="m.plan.state">
+            <div class="plan-head">
+              <span class="plan-badge">
+                {{ m.plan.state === 'draft'
+                  ? '计划中'
+                  : m.plan.state === 'executing'
+                    ? '执行中'
+                    : m.plan.state === 'done'
+                      ? '已完成'
+                      : '已取消' }}
+              </span>
+              <span class="plan-goal" :title="m.plan.goal">🎯 {{ m.plan.goal }}</span>
+            </div>
+            <ol class="plan-steps">
+              <li
+                v-for="(s, si) in m.plan.steps"
+                :key="s.id"
+                class="plan-step"
+                :class="s.state"
+              >
+                <span class="plan-step-icon">
+                  <span v-if="s.state === 'running'" class="plan-dot"></span>
+                  <template v-else>
+                    {{ s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'skipped' ? '⊘' : '○' }}
+                  </template>
+                </span>
+                <div class="plan-step-body">
+                  <!-- draft 态：title/detail 可编辑（v-model 直绑源数据，确认即冻结快照） -->
+                  <template v-if="m.plan.state === 'draft'">
+                    <input
+                      v-model="s.title"
+                      class="plan-step-title-input"
+                      type="text"
+                      maxlength="50"
+                      placeholder="步骤简述"
+                    />
+                    <textarea
+                      v-model="s.detail"
+                      class="plan-step-detail-input"
+                      rows="2"
+                      placeholder="步骤详情（做什么、验证什么）"
+                    ></textarea>
+                  </template>
+                  <template v-else>
+                    <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
+                    <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
+                    <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
+                    <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
+                    <details
+                      v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
+                      class="plan-step-result"
+                    >
+                      <summary>结果</summary>
+                      <div class="plan-step-result-body">{{ s.result }}</div>
+                    </details>
+                  </template>
+                </div>
+              </li>
+            </ol>
+            <!-- 操作按钮行：draft → 确认/取消；executing 且有 failed 步 → 失败四按钮 -->
+            <div v-if="m.plan.state === 'draft'" class="plan-actions">
+              <button type="button" class="plan-btn primary" :disabled="planning" @click="confirmPlan(m)">
+                确认执行
+              </button>
+              <button type="button" class="plan-btn" :disabled="planning" @click="cancelPlan(m)">取消</button>
+            </div>
+            <div
+              v-else-if="m.plan.state === 'executing' && planFailedIndex(m.plan) >= 0"
+              class="plan-actions"
+            >
+              <button
+                type="button"
+                class="plan-btn primary"
+                :disabled="planning"
+                @click="retryPlanStep(m, planFailedIndex(m.plan))"
+              >
+                重试
+              </button>
+              <button
+                type="button"
+                class="plan-btn"
+                :disabled="planning"
+                @click="skipPlanStep(m, planFailedIndex(m.plan))"
+              >
+                跳过
+              </button>
+              <button type="button" class="plan-btn danger" :disabled="planning" @click="abortPlan(m)">
+                终止
+              </button>
+              <button
+                type="button"
+                class="plan-btn"
+                :disabled="planning"
+                @click="replan(m, planFailedIndex(m.plan))"
+              >
+                {{ planning ? '规划中…' : '重新规划' }}
+              </button>
+            </div>
           </div>
           <!-- 工具提案记录条：
                - propose_command：命令提案卡片（授权/拒绝/执行状态徽标）
@@ -1500,23 +2064,39 @@ const configHint = computed(() => {
         <option value="risky">低危自动</option>
         <option value="full">全自动</option>
       </select>
+      <!-- Plan 模式开关（仅工作台 scope；global 无终端可执行计划故置灰）。
+           消息级：仅作用于本次提交，发送后自动复位 -->
+      <button
+        v-if="appView === 'workbench'"
+        type="button"
+        class="plan-toggle"
+        :class="{ active: planMode }"
+        :disabled="scope === 'global' || streaming || planning"
+        :title="scope === 'global' ? '全局对话无终端可执行计划' : planMode ? '本次将先生成计划预览' : '规划模式：先生成计划，确认后执行'"
+        @click="planMode = !planMode"
+      >
+        Plan
+      </button>
       <input
         ref="inputRef"
         v-model="draft"
         class="input"
         type="text"
-        :disabled="!!configHint"
+        :disabled="!!configHint || planning"
         :placeholder="configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…')"
         @keydown="onKeydown"
       />
-      <button v-if="!streaming" class="send-btn" title="发送 (Enter)" @click="send()">
+      <button v-if="!streaming && !planning" class="send-btn" title="发送 (Enter)" @click="send()">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13" />
           <polygon points="22 2 15 22 11 13 2 9 22 2" />
         </svg>
       </button>
-      <button v-else class="stop-btn" title="停止生成" @click="stop">
+      <button v-else-if="streaming" class="stop-btn" title="停止生成" @click="stop">
+        <span class="stop-square"></span>
+      </button>
+      <button v-else class="stop-btn" title="取消规划" @click="cancelPlanning">
         <span class="stop-square"></span>
       </button>
     </div>
@@ -1867,6 +2447,203 @@ const configHint = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---- 执行计划卡片（M4 Plan-and-Act）：与授权弹窗同一视觉语言 ---- */
+.plan-card {
+  border: 1px solid rgba(86, 156, 214, 0.4);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  max-width: 94%;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plan-card.cancelled {
+  opacity: 0.55;
+}
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.plan-badge {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: #569cd6;
+}
+.plan-card.executing .plan-badge {
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.plan-card.done .plan-badge {
+  color: var(--green);
+}
+.plan-card.cancelled .plan-badge {
+  color: var(--muted);
+}
+.plan-goal {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.plan-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.plan-step {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.plan-step-icon {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  color: var(--muted);
+  user-select: none;
+}
+.plan-step.done .plan-step-icon {
+  color: var(--green);
+}
+.plan-step.failed .plan-step-icon {
+  color: #e57a7a;
+}
+.plan-step.skipped .plan-step-icon {
+  color: #e5a13a;
+}
+/* running 步：蓝色脉冲圆点（与「思考中…」同一脉冲动画） */
+.plan-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #569cd6;
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.plan-step-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plan-step-title {
+  color: var(--text);
+  font-weight: 500;
+}
+.plan-step.running .plan-step-title {
+  color: #569cd6;
+}
+.plan-step-detail {
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.plan-step-error {
+  color: #e57a7a;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.plan-step-result summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+.plan-step-result summary:hover {
+  color: var(--text);
+}
+.plan-step-result-body {
+  margin-top: 4px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* draft 态编辑输入框 */
+.plan-step-title-input,
+.plan-step-detail-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  color: var(--text);
+  outline: none;
+  font-family: inherit;
+}
+.plan-step-detail-input {
+  resize: vertical;
+  min-height: 32px;
+  line-height: 1.45;
+}
+.plan-step-title-input:focus,
+.plan-step-detail-input:focus {
+  border-color: #569cd6;
+}
+/* 操作按钮行 */
+.plan-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.plan-btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.plan-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+.plan-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.plan-btn.primary {
+  background: #569cd6;
+  border-color: #569cd6;
+  color: #0b1118;
+  font-weight: 600;
+}
+.plan-btn.danger {
+  border-color: rgba(229, 90, 90, 0.5);
+  color: #e57a7a;
+}
+
+/* Plan 模式开关：与权限档下拉同一弱化风格，激活时蓝色高亮 */
+.plan-toggle {
+  flex: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.plan-toggle.active {
+  color: #569cd6;
+  border-color: #569cd6;
+  font-weight: 600;
+}
+.plan-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* AI 消息头：logo + Agent */
