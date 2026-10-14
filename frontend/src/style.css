@@ -1651,7 +1651,7 @@ body{
 
 /* 快捷键提示 */
 .tp-empty .hints{margin-top:26px;display:flex;gap:20px;font-size:11.5px;color:var(--muted-2)}
-.tp-empty .hints span{display:inline-flex;align-items:center;gap:5px}
+.tp-empty .hints span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;flex:none}
 .tp-empty .hints kbd{
     display:inline-grid;place-items:center;
     min-width:18px;height:18px;padding:0 4px;
@@ -2792,6 +2792,18 @@ body{
 .st-num-unit input[type=number]{-moz-appearance:textfield}
 .st-unit-select{width:74px;flex:none}
 .st-unit-label{font-size:11px;color:#7d8590;white-space:nowrap}
+/* 密码复合控件（API 密钥等）：掩码输入 + 眼睛切换明文 */
+.st-pass{display:flex;align-items:center;gap:6px}
+.st-pass .st-input{font-family:var(--mono)}
+.st-eye{
+    width:30px;height:30px;flex:none;border-radius:7px;
+    border:1px solid var(--border);background:var(--panel-2);
+    color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center;
+    transition:border-color .13s,color .13s,background .13s;
+}
+.st-eye svg{width:15px;height:15px}
+.st-eye:hover{color:var(--text);border-color:#3a4c61;background:rgba(255,255,255,.03)}
+.st-eye:disabled{opacity:.4;cursor:not-allowed}
 .st-textarea{
     resize:vertical;min-height:72px;line-height:1.6;
     font-family:var(--mono);font-size:11.5px;text-align:left;

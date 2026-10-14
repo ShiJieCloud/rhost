@@ -11,7 +11,7 @@ import {
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
-import { aiClearMemories, aiHasApiKey, aiListMemories, aiListPromptAssets, aiRevealPromptDir, aiSaveMemories, aiSetApiKey, aiTestConnection, AI_MEMORY_CONTENT_MAX_CHARS, type AiMemoryItem, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
+import { aiClearMemories, aiGetApiKey, aiListMemories, aiListPromptAssets, aiRevealPromptDir, aiSaveMemories, aiSetApiKey, aiTestConnection, AI_MEMORY_CONTENT_MAX_CHARS, type AiMemoryItem, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
 import {
@@ -30,7 +30,7 @@ import {
 type CtrlKind =
   | 'segmented' | 'switch' | 'select' | 'range' | 'text' | 'color'
   | 'keys' | 'buttons' | 'numberUnit' | 'number' | 'textarea' | 'list' | 'exportOptions'
-  | 'assetList' | 'memoryList' | 'memoryAdd'
+  | 'assetList' | 'memoryList' | 'memoryAdd' | 'password'
 
 interface Opt { v: string; t: string }
 interface RowDef {
@@ -420,7 +420,7 @@ const PANELS: PanelDef[] = [
               { v: 'ollama', t: 'Ollama（本地）' },
             ] },
           { key: 'aiBaseUrl', title: '接口地址 Base URL', desc: 'OpenAI 兼容接口地址', kind: 'text', width: 240, placeholder: 'https://api.openai.com/v1', disabledKey: 'aiEnabled', keywords: 'AI API 地址 base url openai' },
-          { key: 'aiApiKey', title: 'API 密钥', desc: '已加密存储于系统钥匙串；Ollama 本地服务可留空', kind: 'text', width: 240, placeholder: 'sk-…', disabledKey: 'aiEnabled', keywords: 'AI API Key 密钥 token 凭据' },
+          { key: 'aiApiKey', title: 'API 密钥', desc: '已加密存储于系统钥匙串；Ollama 本地服务可留空', kind: 'password', width: 240, placeholder: 'sk-…', disabledKey: 'aiEnabled', keywords: 'AI API Key 密钥 token 凭据' },
           { key: 'aiModel', title: '模型', desc: '命令生成场景推荐使用中等规模模型，延迟更低', kind: 'text', width: 240, placeholder: 'gpt-4o-mini', disabledKey: 'aiEnabled', keywords: 'AI 模型 model' },
           { title: '测试连接', desc: '使用上方配置请求模型列表，验证地址与密钥是否可用', kind: 'buttons', disabledKey: 'aiEnabled', keywords: 'AI 测试 连接 test connection',
             actions: [{ id: 'testAiConnection', label: '测试连接' }] },
@@ -555,6 +555,12 @@ const noResults = computed(() => !!query.value.trim() && !displayPanels.value.le
 
 /* ---- 脏检测 ---- */
 function isDirty(key: keyof AppSettings): boolean {
+  // API 密钥：真实值在钥匙串（savedSettings 常态为空），按「与回显值比较」判定；
+  // 留空 = 不修改，视为未变更
+  if (key === 'aiApiKey') {
+    const v = draft.aiApiKey.trim()
+    return !!v && v !== apiKeyEcho.value
+  }
   return JSON.stringify(draft[key]) !== JSON.stringify(savedSettings[key])
 }
 function groupDirty(g: GroupDef): boolean {
@@ -785,21 +791,22 @@ async function save() {
     const cleaned = strVal(k).split('\n').map(l => l.trim()).filter(l => l !== '').join('\n')
     if (cleaned !== strVal(k)) setVal(k, cleaned)
   }
-  // API 密钥迁移：输入框有值 → 存入系统钥匙串，配置文件中不再保留明文（留空表示不修改）
+  // API 密钥：与钥匙串回显值一致 → 不动；改动/新增 → 写入钥匙串后保持回显；
+  // 留空 = 不修改（清空仅影响本次输入，不删除钥匙串），配置文件中不保留明文
   const apiKey = draft.aiApiKey.trim()
   let keyMigrated = false
-  if (apiKey) {
+  if (apiKey && apiKey !== apiKeyEcho.value) {
     if (isTauri) {
       try {
         await aiSetApiKey(apiKey)
-        apiKeySaved.value = true
         keyMigrated = true
       } catch (e) {
         toast(`API 密钥保存失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`, 'err', 3600)
         return
       }
     }
-    draft.aiApiKey = ''
+    apiKeyEcho.value = apiKey
+    apiKeySaved.value = true
   }
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
@@ -814,7 +821,7 @@ async function save() {
   }
 }
 function discard() {
-  Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
+  syncDraftFromSaved()
   toast('已放弃未保存的更改', 'info', 1600)
 }
 /* ---- 配置文件：导入 / 导出 / 重置（§7） ---- */
@@ -830,7 +837,22 @@ const cfgBusy = ref(false)
 const aiTesting = ref(false)
 /** 系统钥匙串中是否已保存 API Key（决定密钥输入框 placeholder） */
 const apiKeySaved = ref(false)
-if (isTauri) void aiHasApiKey().then(v => { apiKeySaved.value = v }).catch(() => {})
+/** 钥匙串回显值：明文反显进输入框，也是 isDirty 判定「改回原值=未修改」的基准 */
+const apiKeyEcho = ref('')
+if (isTauri) void aiGetApiKey().then(k => {
+  apiKeyEcho.value = k
+  apiKeySaved.value = !!k
+  if (k) draft.aiApiKey = k
+}).catch(() => {})
+
+/** 密码类输入的明文展示状态（key 级切换，默认掩码） */
+const revealedKeys = ref(new Set<string>())
+function toggleReveal(key: string) {
+  const next = new Set(revealedKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  revealedKeys.value = next
+}
 
 function timeStamp() {
   const d = new Date()
@@ -853,6 +875,8 @@ function ensureDesktop(): boolean {
 /** 导入/重置后把后端最新值同步进编辑草稿（savedSettings 已由 hydrate 刷新） */
 function syncDraftFromSaved() {
   Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
+  // API 密钥回显恢复：savedSettings 常态为空，恢复为钥匙串回显值
+  if (apiKeyEcho.value) draft.aiApiKey = apiKeyEcho.value
 }
 
 /**
@@ -1398,6 +1422,30 @@ function optionList(r: RowDef): Opt[] {
                       >
                       <span class="st-val">{{ numVal(r.key!) }}{{ r.unit }}</span>
                     </template>
+
+                    <!-- 密码（API 密钥等）：默认掩码显示，点眼睛切换明文 -->
+                    <div v-else-if="r.kind === 'password'" class="st-pass">
+                      <input
+                        class="st-input"
+                        :type="revealedKeys.has(r.key!) ? 'text' : 'password'"
+                        :style="{ width: (r.width ?? 200) + 'px' }"
+                        :value="strVal(r.key)"
+                        :placeholder="rowPlaceholder(r)"
+                        :disabled="rowDisabled(r)"
+                        spellcheck="false"
+                        autocomplete="off"
+                        @input="setVal(r.key!, ($event.target as HTMLInputElement).value)"
+                      >
+                      <button
+                        class="st-eye"
+                        type="button"
+                        :title="revealedKeys.has(r.key!) ? '隐藏' : '显示'"
+                        @click="toggleReveal(r.key!)"
+                      >
+                        <svg v-if="revealedKeys.has(r.key!)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><path d="M14.12 14.12a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      </button>
+                    </div>
 
                     <!-- 文本 -->
                     <input

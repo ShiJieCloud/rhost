@@ -180,11 +180,14 @@ fn app_config_file(app: &AppHandle) -> Result<PathBuf, String> {
 /// 前端传入的对话消息。
 /// M2.3 起支持 OpenAI 工具消息形态：assistant 可携带 `tool_calls`（模型历史中的提案），
 /// `tool` 角色消息回传执行结果（`tool_call_id` 关联）；content 允许为 null。
+/// 多模态（图片附件）：content 放宽为透传 JSON——纯文本仍为字符串，
+/// 含图消息为 OpenAI 兼容 content parts 数组（`[{type:"text"},{type:"image_url",...}]`），
+/// 后端不解释其结构，原样转发上游。
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AiMessage {
     pub(crate) role: String,
     #[serde(default)]
-    pub(crate) content: Option<String>,
+    pub(crate) content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,8 +330,38 @@ fn builtin_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "sftp_upload_file",
+                "description": "通过 SFTP 将本机文件上传到远程服务器（同名远端文件覆盖）。仅用于小文件（≤64MB）传输场景，如上传脚本、配置文件到服务器；远程文件内容读写请用 write_file/read_file，不要用此工具当编辑器。local_path 必须是本机已存在的文件路径。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "local_path": { "type": "string", "description": "本机源文件路径，如 /Users/me/a.tar.gz" },
+                        "remote_path": { "type": "string", "description": "远端目标文件绝对路径，如 /tmp/a.tar.gz" }
+                    },
+                    "required": ["local_path", "remote_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "sftp_download_file",
+                "description": "通过 SFTP 将远程服务器文件下载到本机（自动创建父目录）。仅用于小文件（≤64MB）传输场景，如拉取日志、结果文件到本地查看。local_path 建议填 ~/Downloads/ 下的路径。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "remote_path": { "type": "string", "description": "远端源文件绝对路径，如 /var/log/app.log" },
+                        "local_path": { "type": "string", "description": "本机目标路径，如 ~/Downloads/app.log" }
+                    },
+                    "required": ["remote_path", "local_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "propose_command",
-                "description": "向用户当前活动的终端提案一条命令。命令会完整展示给用户，经用户批准后写入终端并执行。仅在需要执行命令行操作、重启服务、安装软件等场景时调用。文件读写请使用 read_file / edit_file / write_file，不要用此工具执行 cat/sed/echo 重定向等文件操作。",
+                "description": "向用户当前活动的终端提案一条命令。命令会完整展示给用户，经用户批准后写入终端并执行。仅在需要执行命令行操作、重启服务、安装软件等场景时调用。文件读写请使用 read_file / edit_file / write_file，不要用此工具执行 cat/sed/echo 重定向等文件操作。文件传输只能使用 sftp_upload_file / sftp_download_file，禁止提案 scp、rsync、sftp 及 cat | ssh 管道类传输命令；超过 64MB 的文件直接告知用户通过 SFTP 文件面板手动操作。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -682,6 +715,8 @@ struct StreamAcc {
     tool_calls: std::collections::HashMap<usize, ToolCallAcc>,
     /// choices[0].finish_reason（如 "tool_calls" / "stop"）
     finish_reason: Option<String>,
+    /// 累积的正文增量（流式收集场景：规划生成需拼装完整响应后再做 JSON 解析）
+    content: String,
 }
 
 /// `ai-tool-calls` 事件载荷：透传给前端的工具提案
@@ -772,6 +807,7 @@ fn handle_sse_line(
     };
     if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
         if !c.is_empty() {
+            acc.content.push_str(c);
             let _ = app.emit(
                 "ai-token",
                 serde_json::json!({ "scope": scope, "kind": "content", "delta": c }),
@@ -816,6 +852,93 @@ fn acc_tool_call(acc: &mut StreamAcc, tc: &serde_json::Value) {
     {
         slot.arguments.push_str(args);
     }
+}
+
+/// 流式调用并收集完整正文（规划生成用）。
+///
+/// 与 [`run_stream`] 同源的 SSE 消费，但语义是「流式收集后整体解析」：
+/// - 只推 `ai-token` 增量（思考/正文），**不推** `ai-done` / `ai-tool-calls`——
+///   结束与提案一律通过返回值表达，避免与前端编排状态机相互干扰
+///   （上游内联错误帧仍透传 `ai-error`，属协议层硬失败，前端降级为普通 ReAct）；
+/// - 流结束（`[DONE]` 或对端关闭）返回累积正文，供 `parse_plan_json` 解析；
+/// - 不带工具定义（规划是一次纯文本结构化输出）。
+///
+/// 之所以用流式而非 [`chat_non_stream`]：思考模式模型单次规划可耗时数十秒，
+/// 非流式的固定超时容易误杀；流式既无整体超时，又能让规划过程在前端实时可见。
+async fn chat_stream_collect(
+    app: &AppHandle,
+    cfg: &AiCfg,
+    scope: &str,
+    sys_prompt: &str,
+    extra_sys: Option<&str>,
+    messages: Vec<AiMessage>,
+    token: CancellationToken,
+) -> Result<String, String> {
+    let mut wired: Vec<AiMessage> = Vec::with_capacity(messages.len() + 2);
+    wired.push(AiMessage {
+        role: "system".into(),
+        content: Some(serde_json::Value::String(sys_prompt.into())),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    // 规则等附加 system（注意力靠后：稳定提示词在前，约定在后）
+    if let Some(extra) = extra_sys {
+        wired.push(AiMessage {
+            role: "system".into(),
+            content: Some(serde_json::Value::String(extra.into())),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    wired.extend(messages);
+
+    let client = http_client()?;
+    let url = format!("{}/chat/completions", cfg.base_url);
+    let mut req = client.post(&url).json(&ChatRequest {
+        model: &cfg.model,
+        messages: &wired,
+        stream: true,
+        tools: None,
+    });
+    if let Some(key) = &cfg.api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = tokio::select! {
+        _ = token.cancelled() => return Err("规划已取消".to_string()),
+        r = req.send() => r.map_err(|e| format!("请求模型服务失败: {e}"))?,
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(300).collect();
+        return Err(format!("模型服务返回 HTTP {status}: {snippet}"));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut acc = StreamAcc::default();
+    loop {
+        let chunk = tokio::select! {
+            _ = token.cancelled() => return Err("规划已取消".to_string()),
+            next = stream.next() => next,
+        };
+        match chunk {
+            None => break, // 对端关闭流（未显式给 [DONE] 也视为完成）
+            Some(Err(e)) => return Err(format!("读取响应流失败: {e}")),
+            Some(Ok(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    handle_sse_line(app, scope, &line, &mut acc)?;
+                    if line_stops(&line) {
+                        return Ok(acc.content);
+                    }
+                }
+            }
+        }
+    }
+    Ok(acc.content)
 }
 
 /* =========================================================
@@ -903,13 +1026,13 @@ pub fn ai_set_api_key(key: String) -> Result<(), String> {
     store::keyring_save(AI_KEYRING_ACCOUNT, key)
 }
 
-/// 查询钥匙串中是否已保存 API Key（用于设置框 placeholder 文案）
+/// 读取钥匙串中的 API Key 明文（设置面板回显用；空串表示未保存）
 #[tauri::command]
-pub fn ai_has_api_key() -> bool {
+pub fn ai_get_api_key() -> String {
     store::keyring_get(AI_KEYRING_ACCOUNT)
         .ok()
         .flatten()
-        .is_some_and(|k| !k.trim().is_empty())
+        .unwrap_or_default()
 }
 
 /* =========================================================
@@ -1005,8 +1128,11 @@ struct NonStreamMessage {
     content: String,
 }
 
-/// 非流式对话调用（滚动摘要/记忆提取共用）：system 指令 + 消息，60s 超时，
-/// 取首个 choice 的 message.content；空内容报错
+/// 非流式对话调用（滚动摘要/记忆提取共用）：system 指令 + 消息，180s 超时，
+/// 取首个 choice 的 message.content；空内容报错。
+/// 超时取值：思考模式模型（如 qwen3-max 系列默认开启 thinking）在复杂输入下
+/// 单个请求可耗时 55~60s，用 60s 超时会稳定失败，故放宽到 180s。
+/// （规划生成已改用 [`chat_stream_collect`]，不再受固定超时约束）
 async fn chat_non_stream(
     cfg: &AiCfg,
     sys_prompt: &str,
@@ -1015,7 +1141,7 @@ async fn chat_non_stream(
     let mut wired: Vec<AiMessage> = Vec::with_capacity(messages.len() + 1);
     wired.push(AiMessage {
         role: "system".into(),
-        content: Some(sys_prompt.into()),
+        content: Some(serde_json::Value::String(sys_prompt.into())),
         tool_calls: None,
         tool_call_id: None,
     });
@@ -1033,9 +1159,9 @@ async fn chat_non_stream(
         req = req.bearer_auth(key);
     }
 
-    let resp = timeout(std::time::Duration::from_secs(60), req.send())
+    let resp = timeout(std::time::Duration::from_secs(180), req.send())
         .await
-        .map_err(|_| "请求超时（60s）".to_string())?
+        .map_err(|_| "请求超时（180s）".to_string())?
         .map_err(|e| format!("请求模型服务失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
@@ -1075,7 +1201,7 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
 
 /// 计划生成器指令：拆解用户目标为 3~8 步，严格输出 JSON 数组。
 /// 声明执行环境（SSH + 只读工具 + 授权写操作）使步骤落到工具可及范围。
-const PLANNER_PROMPT: &str = "你是运维任务规划器。请将用户的目标拆解为 3~8 个可执行步骤，输出严格的 JSON 数组，不要输出任何其他文本、解释或 markdown 代码围栏。\n执行环境：SSH 远程服务器；可用只读工具 read_file（读取文件内容）、list_directory（列出目录）、get_system_info（系统信息快照），以及经用户授权后的写操作（编辑文件、执行命令）。\n每个步骤是一个对象：{\"title\": \"步骤简述（不超过 50 字符）\", \"detail\": \"该步具体要做什么、如何验证结果\"}。\n要求：步骤按执行顺序排列；先观察诊断、后修改验证；每步可通过上述工具独立完成；不要包含无法通过命令行完成的步骤。";
+const PLANNER_PROMPT: &str = "你是运维任务规划器。请将用户的目标拆解为 3~8 个可执行步骤，输出严格的 JSON 数组，不要输出任何其他文本、解释或 markdown 代码围栏。\n执行环境：SSH 远程服务器；可用只读工具 read_file（读取文件内容）、list_directory（列出目录）、get_system_info（系统信息快照），以及经用户授权后的写操作（编辑文件、执行命令）。\n每个步骤是一个对象：{\"title\": \"一句话描述该步骤要做什么（不超过 50 字符，须自描述、完整动作，作为 todo 展示给用户）\", \"detail\": \"执行参考：具体做什么、如何验证结果（不展示给用户，仅供执行时参考）\"}。\n要求：步骤按执行顺序排列；先观察诊断、后修改验证；title 之间信息不重复，各自聚焦本步动作；每步可通过上述工具独立完成；不要包含无法通过命令行完成的步骤。";
 
 /// 计划步数范围：少于 3 步无需规划（普通 ReAct 即可），
 /// 多于 8 步注入膨胀且模型长程规划质量显著下降
@@ -1147,35 +1273,111 @@ fn parse_plan_json(raw: &str) -> Result<Vec<PlanStepOut>, String> {
     Ok(steps)
 }
 
-/// 生成执行计划（Plan-and-Act）：非流式单次调用（复用摘要链路，不带工具定义），
-/// 模型输出经 parse_plan_json 宽松解析。
+/// 规划输入是否为空：`content` 兼容字符串（纯文本）与 content parts 数组（含图片）两种形态
+fn plan_content_is_empty(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
+/// 生成执行计划（Plan-and-Act）：流式调用并按 scope 实时推送增量（前端把规划过程
+/// 展示在「执行过程」区），流结束后对累积正文做宽松 JSON 解析。
+/// `content` 为 user 消息内容：字符串（纯文本，文本/代码附件已内联为 `<file>` 块）
+/// 或 content parts 数组（含图片时的多模态形态），与对话链路同构。
 /// 取消令牌登记进 cancels（与对话流同一 scope 键）：中止/新请求顶替时取消在飞规划。
 #[tauri::command]
 pub async fn ai_plan_generate(
     app: AppHandle,
     scope: String,
-    question: String,
+    content: serde_json::Value,
     state: State<'_, AiState>,
 ) -> Result<PlanGenResult, String> {
-    if question.trim().is_empty() {
+    if plan_content_is_empty(&content) {
         return Err("规划输入为空".to_string());
     }
     let cfg = read_ai_settings(&app)?;
     let token = state.register(&scope);
     let messages = vec![AiMessage {
         role: "user".into(),
-        content: Some(question),
+        content: Some(content),
         tool_calls: None,
         tool_call_id: None,
     }];
-    let result = tokio::select! {
-        _ = token.cancelled() => Err("规划已取消".to_string()),
-        r = chat_non_stream(&cfg, PLANNER_PROMPT, messages) => {
-            r.and_then(|raw| parse_plan_json(&raw))
-        }
-    };
+    let rules_sys = plan_rules_system(&app);
+    let result = chat_stream_collect(
+        &app,
+        &cfg,
+        &scope,
+        PLANNER_PROMPT,
+        rules_sys.as_deref(),
+        messages,
+        token.clone(),
+    )
+    .await
+    .and_then(|raw| parse_plan_json(&raw));
     state.unregister(&scope, &token);
     result.map(|steps| PlanGenResult { steps })
+}
+
+/// 规划轮注入的用户自定义规则 system 文本（无启用规则时返回 None）。
+///
+/// 与对话轮同口径：设置唯一真相源在 app_config.json 的 settings 节，
+/// 直接读 `aiRulesEnabled`（默认 true）/ `aiRulesDisabled`（文件名黑名单），
+/// 扫描 ai/rules/ 目录、单文件 8KB 截断，总预算 16KB UTF-8 超出丢弃靠后。
+/// 尾部固定追加结构化输出防护语，避免规则干扰规划 JSON 解析。
+fn plan_rules_system(app: &AppHandle) -> Option<String> {
+    const BUDGET: usize = 16 * 1024;
+    let path = app_config_file(app).ok()?;
+    let s = &persisted::load_full(&path).settings;
+    if !s.get("aiRulesEnabled").and_then(|v| v.as_bool()).unwrap_or(true) {
+        return None;
+    }
+    let disabled: Vec<String> = s
+        .get("aiRulesDisabled")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let dir = prompt_asset_dir(app, "rules").ok()?;
+    let all = scan_prompt_dir(&dir);
+    let files: Vec<&PromptAsset> = all
+        .iter()
+        .filter(|a| !disabled.contains(&a.file_name))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+    let mut parts: Vec<String> = Vec::new();
+    for a in files {
+        let cut = if a.truncated { "，内容已截断" } else { "" };
+        let block = format!("## {}（rules/{}{}）\n\n{}", a.name, a.file_name, cut, a.content);
+        let bytes = block.len();
+        if used + bytes > BUDGET {
+            dropped += 1;
+            continue;
+        }
+        used += bytes;
+        parts.push(block);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut content = format!("# 用户自定义规则（遵循以下约定响应）\n\n{}", parts.join("\n\n"));
+    if dropped > 0 {
+        content.push_str(&format!("\n\n（其余 {dropped} 个文件因总量超限未注入）"));
+    }
+    content.push_str("\n\n注意：以上规则不改变输出格式要求，仍须只输出 JSON 步骤数组。");
+    Some(content)
 }
 
 /* =========================================================
@@ -1525,7 +1727,7 @@ mod tests {
     fn builtin_tools_shape() {
         let v = builtin_tools();
         let arr = v.as_array().expect("tools 应为数组");
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 8);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -1538,11 +1740,16 @@ mod tests {
                 "get_system_info",
                 "edit_file",
                 "write_file",
+                "sftp_upload_file",
+                "sftp_download_file",
                 "propose_command"
             ]
         );
+        // sftp 工具需两个路径参数
+        assert_eq!(arr[5]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
+        assert_eq!(arr[6]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
         // propose_command 为最后一个，需含 command 参数
-        assert_eq!(arr[5]["function"]["parameters"]["required"][0], "command");
+        assert_eq!(arr[7]["function"]["parameters"]["required"][0], "command");
         // read_file / list_directory 需 path 参数
         assert_eq!(arr[0]["function"]["parameters"]["required"][0], "path");
         assert_eq!(arr[1]["function"]["parameters"]["required"][0], "path");
@@ -1674,6 +1881,19 @@ mod tests {
     }
 
     #[test]
+    fn plan_content_empty_detection() {
+        // 纯文本：空白视为空，非空文本放行
+        assert!(plan_content_is_empty(&serde_json::Value::String("   ".into())));
+        assert!(!plan_content_is_empty(&serde_json::Value::String("排查磁盘".into())));
+        // 多模态 content parts 数组：空数组视为空，非空放行
+        assert!(plan_content_is_empty(&serde_json::json!([])));
+        assert!(!plan_content_is_empty(&serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+        ])));
+        assert!(plan_content_is_empty(&serde_json::Value::Null));
+    }
+
+    #[test]
     fn ai_message_tool_wire_roundtrip() {
         // assistant tool_calls 消息（content null）与 tool 结果消息序列化往返
         let msgs: Vec<AiMessage> = serde_json::from_str(
@@ -1694,6 +1914,35 @@ mod tests {
         let back = serde_json::to_value(&msgs).unwrap();
         assert!(back[1].get("tool_calls").is_none());
         assert_eq!(back[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn ai_message_multimodal_content_parts_roundtrip() {
+        // 含图 user 消息：content 为 content parts 数组，原样透传（后端不解释结构）
+        let raw = r#"[
+            {"role":"user","content":[
+                {"type":"text","text":"这张图报什么错？"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+            ]}
+        ]"#;
+        let msgs: Vec<AiMessage> = serde_json::from_str(raw).expect("反序列化失败");
+        let parts = msgs[0].content.as_ref().unwrap().as_array().expect("应为数组");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,iVBORw0KGgo=");
+        // 序列化往返后结构不变
+        let back = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(back[0]["content"], serde_json::from_str::<serde_json::Value>(raw).unwrap()[0]["content"]);
+    }
+
+    #[test]
+    fn ai_message_text_content_stays_string() {
+        // 纯文本消息 content 仍为字符串（不升级为数组），序列化形态与既有契约一致
+        let msgs: Vec<AiMessage> =
+            serde_json::from_str(r#"[{"role":"user","content":"你好"}]"#).expect("反序列化失败");
+        assert_eq!(msgs[0].content.as_ref().unwrap().as_str(), Some("你好"));
+        let back = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(back[0]["content"], "你好");
     }
 
     /* -------- M3.2 技能/规则提示资产 -------- */

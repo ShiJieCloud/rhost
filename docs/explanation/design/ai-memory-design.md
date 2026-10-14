@@ -4,7 +4,7 @@
 >
 > created: 2026-10-12 12:15:04
 >
-> updated: 2026-10-12 12:15:04
+> updated: 2026-10-13 11:01:33
 >
 > author:
 
@@ -159,7 +159,7 @@ pub async fn ai_extract_memories(app: AppHandle, messages: Vec<AiMessage>) -> Re
 - `ai_list_memories`：读取 `memory.json`，不存在返回空 Vec，解析失败返回空 Vec（失败无害）；不报错；
 - `ai_save_memories`：覆盖写入 `memory.json`（`tmp + rename` 原子写）；写入前按 `aiMemoryLimit` 淘汰最旧（从头部移除至 ≤ limit）；`create_dir_all` 自动创建目录；
 - `ai_clear_memories`：删除 `memory.json`，不存在视为成功（对齐 `ai_clear_chat`）；
-- `ai_extract_memories`：非流式调用（对齐 `ai_summarize` 的 60s timeout、非流式响应体解析）；输入为提取指令 + 当前记忆清单 + 新对话片段，输出为 JSON 数组字符串（模型直接输出 JSON，前端解析）；返回 `String` 而非 `Vec<MemoryItem>`——模型输出可能不完美，前端负责解析、校验、合并、生成 id；
+- `ai_extract_memories`：非流式调用（对齐 `ai_summarize` 的 180s timeout、非流式响应体解析）；输入为提取指令 + 当前记忆清单 + 新对话片段，输出为 JSON 数组字符串（模型直接输出 JSON，前端解析）；返回 `String` 而非 `Vec<MemoryItem>`——模型输出可能不完美，前端负责解析、校验、合并、生成 id；
 - 四个命令按既有 IPC 先例登记 `slow_span!` 埋点；记忆内容不入日志。
 
 提取指令（`EXTRACT_MEMORIES_PROMPT`）要点：

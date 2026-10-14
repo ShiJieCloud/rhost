@@ -7,6 +7,7 @@ import { toast } from '../composables/useToast'
 import { matchHighRisk } from '../lib/aiRisk'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { isTauri } from '../lib/tauri'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import AppLogo from './AppLogo.vue'
 import AiMarkdown from './AiMarkdown.vue'
 import {
@@ -25,12 +26,17 @@ import {
   aiStopChat,
   aiSummarize,
   listenAiEvents,
+  type AiAttachment,
   type AiChatMessage,
+  type AiContentPart,
+  type AiImageAttachment,
   type AiMemoryItem,
   type AiPlan,
+  type AiPlanStep,
   type AiPromptAsset,
   type AiPromptAssets,
   type AiScope,
+  type AiTextAttachment,
   type AiToolExecResult,
   type AiToolProposal,
   type AiWireMessage,
@@ -54,6 +60,13 @@ const draft = ref('')
 const streaming = ref(false)
 /** 终端选中文本引用块（右键「添加到 AI 对话」产生），随下次发送并入 user 消息 */
 const quote = ref<{ text: string; lines: number } | null>(null)
+/** 待发送的附件（内存态，多模态输入：图片 + 文本/代码文件）：发送后随消息落盘并清空 */
+const attachments = ref<AiAttachment[]>([])
+/** 隐藏的文件选择 input（点击 + 触发） */
+const fileInputEl = ref<HTMLInputElement | null>(null)
+/** 输入区聚焦/拖拽悬停高亮（仅视觉反馈） */
+const composerFocused = ref(false)
+const dragActive = ref(false)
 /** 滚动摘要：覆盖 summaryUpTo 及之前的全部历史，组装上下文时以 system 注入 */
 const summary = ref('')
 const summaryUpTo = ref('')
@@ -65,9 +78,12 @@ const editFromId = ref<string | null>(null)
 let summarizing = false
 /** 记忆提取请求进行中（防重入） */
 let extracting = false
-/** reasoning 手动展开/收起状态：msg id → true(展开) / false(收起)；未在 map 中则跟随自动行为 */
+/** 执行过程展开/收起手动状态：回复组首消息 id → true(展开)/false(收起)；未在 map 中则跟随自动行为 */
+const traceManual = ref<Map<string, boolean>>(new Map())
+/** 每轮思考过程展开/收起手动状态：消息 id → true/false；未在 map 中则跟随自动行为
+ *  （自动：reasoning 流式中且该轮正文未到达 → 展开+脉冲；正文到达 → 收起） */
 const reasoningManual = ref<Map<string, boolean>>(new Map())
-const inputRef = ref<HTMLInputElement | null>(null)
+const inputRef = ref<HTMLTextAreaElement | null>(null)
 const scrollEl = ref<HTMLElement | null>(null)
 let unlisten: UnlistenFn | null = null
 /** 跨 scope 切换的版本号：使旧 scope 的迟到事件失效 */
@@ -92,6 +108,41 @@ const planSummaryRef = ref<string | null>(null)
 /** 斜杠命令：消息以 "/plan " 开头强制走规划模式（优先级高于 Toggle 开关） */
 const PLAN_CMD_RE = /^\/plan\s+/
 
+/* ---------- 任务耗时（回复组维度） ---------- */
+
+/** 每秒自增的节拍：让「任务耗时」在流式期间实时刷新（落定后改用持久化的 elapsedMs） */
+const nowTick = ref(0)
+let tickTimer: number | undefined
+watch(
+  () => streaming.value || planning.value,
+  busy => {
+    if (tickTimer !== undefined) {
+      window.clearInterval(tickTimer)
+      tickTimer = undefined
+    }
+    if (!busy) return
+    tickTimer = window.setInterval(() => {
+      nowTick.value++
+    }, 1000)
+  },
+)
+onUnmounted(() => {
+  if (tickTimer !== undefined) window.clearInterval(tickTimer)
+})
+
+/** 毫秒 → 耗时文案：省略高位零段、最少保留秒，如 `21m 27s` / `1h 2m 3s` */
+function fmtDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const parts: string[] = []
+  if (h) parts.push(`${h}h`)
+  if (h || m) parts.push(`${m}m`)
+  parts.push(`${s}s`)
+  return parts.join(' ')
+}
+
 function uid(): string {
   return crypto.randomUUID()
 }
@@ -105,6 +156,45 @@ const sessionAllowlist = new Map<string, Set<string>>()
 /** agent 执行权限档（会话级内存态、不持久化）：manual=全部弹窗（默认）、
  *  risky=低危自动执行高危弹窗、full=全自动。切 scope 回落 manual（watch scope） */
 const execPermission = ref<'manual' | 'risky' | 'full'>('manual')
+
+/* 权限档自定义下拉：原生 select 无法渲染图标与两行描述，改为按钮 + 上弹菜单 */
+type PermLevel = 'manual' | 'risky' | 'full'
+/** 权限档元数据：manual=盾（全防护）、risky=盾+勾（低危放行）、full=盾+斜杠（撤销防护） */
+const PERM_LEVELS: { value: PermLevel; label: string; desc: string }[] = [
+  { value: 'manual', label: '手动审批', desc: '所有命令执行前都需人工确认' },
+  { value: 'risky', label: '低危自动', desc: '低危命令自动执行，高危仍需确认' },
+  { value: 'full', label: '完全访问', desc: '全部命令自动执行，不再弹窗确认' },
+]
+const permOpen = ref(false)
+const permWrapRef = ref<HTMLElement | null>(null)
+const currentPermLabel = computed(
+  () => PERM_LEVELS.find(l => l.value === execPermission.value)?.label ?? '',
+)
+
+function pickPerm(v: PermLevel) {
+  execPermission.value = v
+  permOpen.value = false
+}
+function onPermDocMouseDown(e: MouseEvent) {
+  const el = permWrapRef.value
+  if (el && !el.contains(e.target as Node)) permOpen.value = false
+}
+function onPermKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') permOpen.value = false
+}
+watch(permOpen, (v) => {
+  if (v) {
+    document.addEventListener('mousedown', onPermDocMouseDown, true)
+    document.addEventListener('keydown', onPermKeydown, true)
+  } else {
+    document.removeEventListener('mousedown', onPermDocMouseDown, true)
+    document.removeEventListener('keydown', onPermKeydown, true)
+  }
+})
+onUnmounted(() => {
+  document.removeEventListener('mousedown', onPermDocMouseDown, true)
+  document.removeEventListener('keydown', onPermKeydown, true)
+})
 
 /** 正在自动执行的提案（竞态防护）：applyProposal 为异步，ai-tool-calls 与
  *  ai-done 几乎同时到达，pumpProposals 若只看 state==='pending' 会把执行中的
@@ -124,35 +214,205 @@ function hasPendingProposal(): boolean {
   return messages.value.some(m => m.toolProposals?.some(p => p.state === 'pending'))
 }
 
-/** 是否为回复组尾（下一条非 assistant 或已是末条）：组 = 一次逻辑回复，
- *  复制/重新生成等操作按钮只出现在组尾——重新生成本就截断到对应 user 消息重跑整组 */
-function isGroupTail(i: number): boolean {
-  const next = messages.value[i + 1]
-  return !next || next.role !== 'assistant'
+/* ---------- 回复组（一次用户输入触发的连续 assistant 消息） ---------- */
+
+/** 执行过程区轮次：一条 assistant 消息 = 一轮（ReAct 轮 / 计划步骤轮 / 续跑轮 / 总结轮）。
+ *  轮次内容固定三段：思考过程（独立折叠）→ 规划轨迹/正文 → 工具卡片；
+ *  结果确认前（promoted=false）本轮正文渲染在轮次槽位内，确认后仅末轮正文晋升至结果区 */
+interface AiRound {
+  key: string
+  /** 消息代理引用（思考折叠状态按消息 id 存取） */
+  m: AiChatMessage
+  /** 本轮正文已晋升至结果区（不再在轮次内渲染，避免同文两处同显） */
+  promoted: boolean
+  /** Plan 执行步下标（planner/总结轮无此字段；旧数据无 → 无步骤分隔条） */
+  stepIndex?: number
+  /** 是否该步骤的首个轮次（渲染步骤分隔条） */
+  stepStart: boolean
 }
 
-/* ---------- 推理可视化 ---------- */
-
-/** reasoning 是否正在流式接收（思考阶段：有 reasoning、无 content、正在 streaming） */
-function isReasoningStreaming(m: { status: string; reasoning?: string; content: string }): boolean {
-  return m.status === 'streaming' && !!m.reasoning && !m.content
+/** 组末条下标：从 start 起连续 assistant 消息的最后一条 */
+function groupEnd(start: number): number {
+  let i = start
+  while (i + 1 < messages.value.length && messages.value[i + 1].role === 'assistant') i++
+  return i
 }
 
-/** reasoning 是否应展开：手动操作优先，否则思考阶段自动展开、content 到达后自动收起 */
-function isReasoningOpen(m: { id: string; status: string; reasoning?: string; content: string }): boolean {
+/** 组首条下标：从 end 起向前找连续 assistant 消息的第一条 */
+function groupStartOf(end: number): number {
+  let s = end
+  while (s - 1 >= 0 && messages.value[s - 1].role === 'assistant') s--
+  return s
+}
+
+/** 是否回复组首条（assistant 且前一条非 assistant）：仅组首渲染整组 */
+function isGroupLead(i: number): boolean {
+  const m = messages.value[i]
+  if (!m || m.role !== 'assistant') return false
+  const prev = messages.value[i - 1]
+  return !prev || prev.role !== 'assistant'
+}
+
+/** 组末条状态：驱动 assistant 气泡（error/streaming）与打字动画 */
+function groupStatus(start: number): AiChatMessage['status'] {
+  return messages.value[groupEnd(start)]?.status ?? 'done'
+}
+
+/** 组任务是否活跃：任一条流式中、存在未落定（pending）的工具提案、或组内计划执行中。
+ *  覆盖续跑轮间 / 授权等待 / 工具执行 / 计划步间（含失败步待决策）等「末条非 streaming」
+ *  的任务空窗，避免执行过程区在多段流串行期间反复折叠展开（闪烁） */
+function groupActive(start: number): boolean {
+  const end = groupEnd(start)
+  for (let i = start; i <= end; i++) {
+    const m = messages.value[i]
+    if (m.status === 'streaming') return true
+    if (m.toolProposals?.some(p => p.state === 'pending')) return true
+  }
+  return groupPlan(start)?.state === 'executing'
+}
+
+/** 结果是否已确认：组落定（非活跃）即确认；Plan 总结轮流式中首轮 token 即确认
+ *  （planSummaryRef 指向该组组首，总结正文直接流入结果区，无晋升搬迁）。
+ *  未确认时结果区恒空，组内一切消息（含流式中的当前轮）只渲染在执行过程区 */
+function groupResultConfirmed(start: number): boolean {
+  if (!groupActive(start)) return true
+  return !!planSummaryRef.value && planSummaryRef.value === messages.value[start]?.id
+}
+
+/** 最终结果：组末条正文（仅结果确认后可见） */
+function groupResult(start: number): string {
+  return messages.value[groupEnd(start)]?.content.trim() ?? ''
+}
+
+/** 组内挂载的计划（取最新一条） */
+function groupPlan(start: number): AiPlan | undefined {
+  for (let i = groupEnd(start); i >= start; i--) {
+    const p = messages.value[i].plan
+    if (p) return p
+  }
+  return undefined
+}
+
+/** 无 AI 最终回复时：本地拼装计划各步 title + result 作为任务总结 */
+function localPlanSummary(plan: AiPlan): string {
+  const label = (s: AiPlanStep) =>
+    s.state === 'done'
+      ? '完成'
+      : s.state === 'failed'
+        ? '失败'
+        : s.state === 'skipped'
+          ? '跳过'
+          : '未执行'
+  return plan.steps
+    .map((s, i) => `- ${i + 1}. [${label(s)}] ${s.title}${s.result ? ` — ${s.result}` : ''}`)
+    .join('\n')
+}
+
+/** 结果区文本：仅结果确认后产生——优先 AI 最终回复（末轮正文）；
+ *  无则计划已落定时用本地步骤总结；均无则空（结果区恒空规则） */
+function groupResultText(start: number): string {
+  if (!groupResultConfirmed(start)) return ''
+  const r = groupResult(start)
+  if (r) return r
+  const plan = groupPlan(start)
+  if (plan && (plan.state === 'done' || plan.state === 'cancelled')) return localPlanSummary(plan)
+  return ''
+}
+
+/** 本轮任务耗时（ms）：运行中实时计算（依赖 nowTick 节拍），落定后用持久化 elapsedMs */
+function groupElapsedMs(start: number): number {
+  void nowTick.value // 建立响应式依赖：流式期间每秒重算
+  const last = messages.value[groupEnd(start)]
+  const user = messages.value[start - 1]
+  if (!last) return 0
+  if (last.status === 'streaming') return Date.now() - (user?.createdAt ?? last.createdAt)
+  return last.elapsedMs ?? (user ? last.createdAt - user.createdAt : 0)
+}
+
+/** 执行过程区轮次：按消息顺序逐轮推导（含流式中的当前轮）。
+ *  末轮正文在结果确认后标记 promoted——由结果区渲染，轮次内不再重复显示 */
+function groupRounds(start: number): AiRound[] {
+  const end = groupEnd(start)
+  const confirmed = groupResultConfirmed(start)
+  const rounds: AiRound[] = []
+  let prevStep: number | undefined
+  for (let i = start; i <= end; i++) {
+    const m = messages.value[i]
+    rounds.push({
+      key: m.id,
+      m,
+      promoted: i === end && confirmed && !!m.content.trim(),
+      stepIndex: m.stepIndex,
+      stepStart: m.stepIndex !== undefined && m.stepIndex !== prevStep,
+    })
+    prevStep = m.stepIndex
+  }
+  return rounds
+}
+
+/** 执行过程区是否有可见内容（决定任务耗时行是否可点击展开） */
+function hasTrace(start: number): boolean {
+  return groupRounds(start).some(
+    r =>
+      !!r.m.reasoning?.trim() ||
+      !!r.m.trace ||
+      !!r.m.toolProposals?.length ||
+      (!!r.m.content.trim() && !r.promoted),
+  )
+}
+
+/** 执行过程是否展开：手动优先；自动 = 任务活跃且结果区尚未出现内容。
+ *  Plan 总结轮 content 开始到达 → 结果区出现 → 收起（提前于任务落定）；
+ *  其余一切落定场景（含中止/失败）在活跃结束瞬间收起 */
+function isTraceOpen(start: number): boolean {
+  const lead = messages.value[start]
+  if (!lead) return false
+  const manual = traceManual.value.get(lead.id)
+  if (manual !== undefined) return manual
+  return groupActive(start) && !groupResultText(start)
+}
+
+/** 用户手动切换执行过程展开/收起 */
+function toggleTrace(start: number) {
+  const lead = messages.value[start]
+  if (!lead) return
+  traceManual.value.set(lead.id, !isTraceOpen(start))
+  resampleAnchors() // 折叠区高度变化 → 大纲锚点重采样
+}
+
+/** 该轮思考是否处于「思考中」自动态：reasoning 流式中且该轮正文未到达 */
+function reasoningThinking(m: AiChatMessage): boolean {
+  return !!(m.status === 'streaming' && m.reasoning?.trim() && !m.content.trim())
+}
+
+/** 每轮思考过程是否展开：手动优先；自动 = 思考中（展开+脉冲），正文到达即收起 */
+function isReasoningOpen(m: AiChatMessage): boolean {
   const manual = reasoningManual.value.get(m.id)
   if (manual !== undefined) return manual
-  return isReasoningStreaming(m)
+  return reasoningThinking(m)
 }
 
-/** 用户手动切换 reasoning 展开/收起 */
-function toggleReasoning(id: string) {
-  const msg = messages.value.find(m => m.id === id)
-  if (!msg) return
-  reasoningManual.value.set(id, !isReasoningOpen(msg))
+/** 用户手动切换某轮思考过程展开/收起（进入手动模式，不再受自动逻辑覆盖） */
+function toggleReasoning(m: AiChatMessage) {
+  reasoningManual.value.set(m.id, !isReasoningOpen(m))
+  resampleAnchors() // 思考条目高度变化 → 大纲锚点重采样
 }
 
 /* ---------- 持久化 ---------- */
+
+/** 会话标题：取首条 user 消息文本前 20 字符；纯附件消息（无文本）取「图片」或文件名 */
+function chatTitle(msgs: AiChatMessage[]): string | undefined {
+  const first = msgs.find(m => m.role === 'user')
+  if (!first) return undefined
+  return (
+    first.content.slice(0, 20) ||
+    (first.images?.length
+      ? '图片'
+      : first.files?.length
+        ? first.files[0].name.slice(0, 20)
+        : undefined)
+  )
+}
 
 /** 落盘：streaming 态转为 stopped（应用崩溃/重载后的中间态收敛） */
 function persist() {
@@ -160,7 +420,7 @@ function persist() {
   const cleaned = messages.value.map(m =>
     m.status === 'streaming' ? { ...m, status: 'stopped' as const } : m,
   )
-  const title = cleaned.find(m => m.role === 'user')?.content.slice(0, 20)
+  const title = chatTitle(cleaned)
   void aiSaveChat(scope.value, {
     version: 1,
     scope: scope.value,
@@ -179,6 +439,7 @@ async function loadRecord(s: AiScope) {
     summary.value = ''
     summaryUpTo.value = ''
     extractedUpTo.value = ''
+    traceManual.value.clear()
     reasoningManual.value.clear()
     return
   }
@@ -208,6 +469,7 @@ async function loadRecord(s: AiScope) {
     summary.value = ''
     summaryUpTo.value = ''
     extractedUpTo.value = ''
+    traceManual.value.clear()
     reasoningManual.value.clear()
   }
   scrollToBottom()
@@ -242,7 +504,7 @@ watch(scope, (s, oldS) => {
       void aiSaveChat(oldS, {
         version: 1,
         scope: oldS,
-        title: cleaned.find(m => m.role === 'user')?.content.slice(0, 20),
+        title: chatTitle(cleaned),
         updatedAt: Date.now(),
         messages: cleaned,
         summary: summary.value || undefined,
@@ -256,6 +518,9 @@ watch(scope, (s, oldS) => {
   planning.value = false
   planRunRef.value = null
   planSummaryRef.value = null
+  // 输入区上下文 chip 随 scope 清理（终端引用 + 图片附件）
+  quote.value = null
+  attachments.value = []
   // 取消旧会话在飞的只读工具 exec 任务，防止后端堆积（旧 scope 非 global 时才需取消）
   // 注意：ai_cancel_execs 需要后端 session_id（backendId），不是前端 scope
   if (oldS && oldS !== 'global') {
@@ -271,7 +536,7 @@ onMounted(async () => {
   if (!isTauri) return
   unlisten = await listenAiEvents({
     onToken: e => {
-      if (e.scope !== scope.value || !streaming.value) return
+      if (e.scope !== scope.value || !(streaming.value || planning.value)) return
       const last = messages.value[messages.value.length - 1]
       if (!last || last.role !== 'assistant') return
       if (e.kind === 'reasoning') {
@@ -279,7 +544,7 @@ onMounted(async () => {
       } else {
         last.content += e.delta
       }
-      scrollToBottom()
+      followScroll()
     },
     onDone: e => {
       if (e.scope !== scope.value) return
@@ -293,6 +558,7 @@ onMounted(async () => {
         if (!last.content) last.content = `请求失败：${e.message}`
       }
       streaming.value = false
+      stampElapsed()
       // 计划步执行中请求失败 → 该步转 failed，等用户决策
       const run = planRunRef.value
       if (run) {
@@ -302,6 +568,8 @@ onMounted(async () => {
       }
       planSummaryRef.value = null
       persist()
+      // 错误落定产生部分结果（非计划场景）→ 晋升滚动（守卫内）
+      if (groupResultText(groupStartOf(messages.value.length - 1))) scrollToResult()
     },
     onToolCalls: e => {
       // 工具提案（M2.3）：写入当前流式 assistant 消息并先落盘防崩溃丢失；
@@ -322,10 +590,11 @@ onMounted(async () => {
         }
       })
       // 按工具名路由分流：
-      // - propose_command / edit_file / write_file：走授权路径（权限档决定自动/弹窗）
+      // - propose_command / edit_file / write_file / sftp_upload_file / sftp_download_file：
+      //   走授权路径（权限档决定自动/弹窗）
       // - 只读工具（read_file / list_directory / get_system_info）：自动执行，无需授权
       const allow = sessionAllowlist.get(scope.value)
-      const WRITE_TOOLS = ['propose_command', 'edit_file', 'write_file']
+      const WRITE_TOOLS = ['propose_command', 'edit_file', 'write_file', 'sftp_upload_file', 'sftp_download_file']
       for (const p of last.toolProposals) {
         if (p.state !== 'pending') continue
         if (WRITE_TOOLS.includes(p.name)) {
@@ -356,18 +625,40 @@ onMounted(async () => {
 
 onUnmounted(() => unlisten?.())
 
+/** 写入本轮回复组总耗时（组末条落定时刻 - 组前 user 消息发送时刻）。
+ *  每次流结束时覆盖组末条；工具循环/计划逐步续跑会追加新末条，最终末条持有整组耗时 */
+function stampElapsed() {
+  const msgs = messages.value
+  const end = msgs.length - 1
+  if (end < 1 || msgs[end].role !== 'assistant') return
+  let start = end
+  while (start - 1 >= 0 && msgs[start - 1].role === 'assistant') start--
+  const user = msgs[start - 1]
+  if (!user || user.role !== 'user') return
+  msgs[end].elapsedMs = Date.now() - user.createdAt
+}
+
 function finishStreaming(status: 'done' | 'stopped') {
+  const start = groupStartOf(messages.value.length - 1)
+  const before = groupResultText(start)
   const last = messages.value[messages.value.length - 1]
   if (last && last.role === 'assistant') last.status = status
   streaming.value = false
+  stampElapsed()
   persist()
   scrollToBottom()
   // 提案调度：pending 入队弹窗；无 pending 且本轮已裁决完 → 自动续跑
   pumpProposals()
   // 计划步落定判定（pumpProposals 之后：有提案则续跑链推进，无提案才可能落定）
   maybeAdvancePlan(status)
-  // finishPlan 总结轮无工具无续跑，流结束即清除标记
-  if (planSummaryRef.value) planSummaryRef.value = null
+  // finishPlan 总结轮无工具无续跑，流结束即清除标记。
+  // maybeAdvancePlan 刚启动总结轮时（finishPlan 已置标记并发起请求）streaming=true，
+  // 不得在同一次调用里清除——否则 runAiStream 异步续上后读到 null，
+  // 总结轮会带着工具与空计划上下文发出（表象：总结轮继续执行工具、重复干活）
+  if (planSummaryRef.value && !streaming.value) planSummaryRef.value = null
+  // 晋升滚动：落定产生了此前不存在的最终结果（ReAct/单轮确认晋升、中止部分结果）→
+  // 守卫内平滑滚动补偿上移；工具轮末尾续跑链已同步推进（结果区回空）不会误触
+  if (!before && groupResultText(start)) scrollToResult()
   void maybeSummarize()
   // 记忆提取仅在正常完成后触发（中止/错误轮次内容不完整，不提取）
   if (status === 'done') void maybeExtractMemories()
@@ -504,10 +795,37 @@ function mergeMemories(existing: AiMemoryItem[], extracted: string[]): AiMemoryI
 
 /* ---------- 发送 ---------- */
 
+/** 把文本/代码附件内联为 `<file name="…">…</file>` 块（置于用户文本之后）。
+ *  文件名去除引号/尖括号，避免破坏块标记；无文件时原样返回 */
+function withFileBlocks(content: string, files?: AiTextAttachment[]): string {
+  if (!files?.length) return content
+  const blocks = files
+    .map(f => `<file name="${f.name.replace(/["<>]/g, '')}">\n${f.text}\n</file>`)
+    .join('\n\n')
+  return content.trim() ? `${content}\n\n${blocks}` : blocks
+}
+
+/** 组装 user 消息内容：文本/代码附件内联为 `<file>` 块；含图片时返回 content parts
+ *  （文本在前、图片在后），否则返回字符串。对话 wire 装配与规划生成共用同一口径 */
+function buildUserContent(
+  text: string,
+  images?: AiImageAttachment[],
+  files?: AiTextAttachment[],
+): string | AiContentPart[] {
+  const body = withFileBlocks(text, files)
+  if (!images?.length) return body
+  const parts: AiContentPart[] = []
+  if (body.trim()) parts.push({ type: 'text', text: body })
+  for (const img of images) parts.push({ type: 'image_url', image_url: { url: img.dataUrl } })
+  return parts
+}
+
 function buildWireMessages(assets?: AiPromptAssets, memories?: AiMemoryItem[]): AiWireMessage[] {
   // 仅把已成形的消息发给模型；空回复/错误回复不进上下文（带提案的空正文 assistant 除外）
   const usable = messages.value.filter(
-    m => m.status !== 'streaming' && (m.content.trim() || m.toolProposals?.length),
+    m =>
+      m.status !== 'streaming' &&
+      (m.content.trim() || m.toolProposals?.length || m.images?.length || m.files?.length),
   )
   // 摘要覆盖点之后的消息原文携带；覆盖点之前的以 system 摘要注入
   const idx = summaryUpTo.value ? usable.findIndex(m => m.id === summaryUpTo.value) : -1
@@ -529,6 +847,12 @@ function buildWireMessages(assets?: AiPromptAssets, memories?: AiMemoryItem[]): 
       for (const p of m.toolProposals) {
         wired.push({ role: 'tool', tool_call_id: p.id, content: toolResultOf(p) })
       }
+      continue
+    }
+    // 含附件 user 消息：文本文件内联为 <file> 块；有图片时装配为 content parts
+    // （文本在前、图片在后；纯文本文件消息仍保持字符串 content，不升级为数组）
+    if (m.role === 'user' && (m.images?.length || m.files?.length)) {
+      wired.push({ role: 'user', content: buildUserContent(m.content, m.images, m.files) })
       continue
     }
     wired.push({ role: m.role, content: m.content })
@@ -607,7 +931,7 @@ function buildPlanSystem(): AiWireMessage | null {
   if (!step) return null
   const head = `【执行计划】（第 ${i + 1}/${n} 步，用户已确认，须严格遵守）\n目标：${plan.goal.slice(0, PLAN_GOAL_MAX_CHARS)}\n步骤进展：\n`
   const tail =
-    `\n约束：专注完成当前步骤；禁止擅自新增不在计划内的动作；确需偏离时先向用户说明并获得同意；本步完成后用一句话总结本步结果。`
+    `\n约束：专注完成当前步骤；禁止擅自新增不在计划内的动作；确需偏离时先向用户说明并获得同意；文件创建与修改必须使用 write_file/edit_file 工具，禁止通过 shell 重定向或 heredoc 写文件；本步完成后用一句话总结本步结果；只执行当前步骤对应的动作，未到后续步骤不要提前执行；若本步目标已达成或已被先前步骤/本轮工具结果覆盖，直接输出结论文本结束本轮，禁止重复执行同一动作。`
   const parts: string[] = []
   plan.steps.forEach((s, idx) => {
     if (idx < i) parts.push(`${idx + 1}. [已完成] ${s.title} — ${s.result ?? ''}`)
@@ -718,8 +1042,92 @@ function readonlyLabel(name: string): string {
       get_system_info: '系统信息',
       edit_file: '编辑文件',
       write_file: '写入文件',
+      sftp_upload_file: '上传文件',
+      sftp_download_file: '下载文件',
     }[name] ?? name
   )
+}
+
+/** SFTP 传输提案的路径对（上传：本地→远端；下载：远端→本地） */
+function sftpPaths(p: AiToolProposal): { local: string; remote: string } | null {
+  try {
+    const v = JSON.parse(p.args)
+    const local = typeof v?.local_path === 'string' ? v.local_path : ''
+    const remote = typeof v?.remote_path === 'string' ? v.remote_path : ''
+    return local && remote ? { local, remote } : null
+  } catch {
+    return null
+  }
+}
+
+/** 字节数人性化显示（KB/MB，一位小数） */
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+/** AI 执行 SFTP 传输的体积上限：大文件长耗时易阻塞对话链路，引导模型走终端命令 */
+const SFTP_AI_MAX_BYTES = 64 * 1024 * 1024
+
+/** 下载落盘路径黑名单：本机敏感目录不作为 AI 传输目标（前缀匹配，~ 已按家目录展开判断） */
+const SFTP_AI_LOCAL_DENY = ['/.ssh/', '/.gnupg/', '/.config/gcloud/', '/Library/Keychains/']
+
+/** SFTP 传输提案执行：复用 SFTP 面板同款 IPC 命令（task 机制 + Channel 进度），
+ *  进度实时写回 p.progress 驱动卡片进度条；预检失败直接落 rejected */
+async function runSftpTransfer(p: AiToolProposal) {
+  const sid = activeSession.value?.backendId
+  if (!sid || activeSession.value?.state !== 'online') {
+    p.state = 'rejected'
+    p.error = '无可用会话或会话已断开'
+    return
+  }
+  const paths = sftpPaths(p)
+  if (!paths) {
+    p.state = 'rejected'
+    p.error = '参数缺少 local_path / remote_path'
+    return
+  }
+  const isUpload = p.name === 'sftp_upload_file'
+  // 本地敏感目录黑名单（仅下载写盘方向需要；上传只读本地）。
+  // 后端会展开 ~，此处对原始路径与家目录形式均做前缀匹配
+  if (!isUpload && SFTP_AI_LOCAL_DENY.some(d => paths.local.includes(d))) {
+    p.state = 'rejected'
+    p.error = '下载目标位于本机敏感目录，已拒绝'
+    return
+  }
+  if (!isTauri) {
+    p.state = 'rejected'
+    p.error = '非桌面环境无法执行 SFTP 传输'
+    return
+  }
+  const taskId = Date.now()
+  // 预检通过：进入执行态（卡片显示传输中，进度条实时刷新）
+  p.state = 'accepted'
+  const channel = new Channel<{ transferred: number; total: number; speed: number; done: boolean }>()
+  channel.onmessage = m => {
+    p.progress = m.done ? { ...m, speed: 0 } : m
+  }
+  try {
+    await invoke(isUpload ? 'sftp_upload' : 'sftp_download', {
+      sessionId: sid,
+      taskId,
+      localPath: paths.local,
+      remotePath: paths.remote,
+      chunkKb: null,
+      resume: false,
+      // 体积上限由后端在打开目标文件写入前预检拒绝：既避免残留文件，也保证错误文案准确
+      maxBytes: SFTP_AI_MAX_BYTES,
+      channel,
+    })
+    p.state = 'accepted'
+    p.execOutput = isUpload
+      ? `已上传 ${humanBytes(p.progress?.transferred ?? 0)} → ${paths.remote}`
+      : `已下载 ${humanBytes(p.progress?.transferred ?? 0)} → ${paths.local}`
+  } catch (e) {
+    p.state = 'rejected'
+    p.error = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
+  }
 }
 
 /** 工具参数展示（get_system_info 无参数，其余取 path） */
@@ -767,7 +1175,13 @@ function toolResultOf(p: AiToolProposal): string {
   // 只读工具：直接返回输出文本（模型据此理解远程环境）
   if (p.name !== 'propose_command') {
     if (p.error) return JSON.stringify({ error: p.error })
-    return p.execOutput ?? '(无输出)'
+    if (p.execOutput?.trim()) return p.execOutput
+    // 成功落定但无标准输出（write_file/edit_file 静默成功最典型）：
+    // 显式给成功信号，避免模型因「无输出」误判未生效而重复执行同一动作
+    if (p.state === 'accepted') {
+      return JSON.stringify({ success: true, note: '工具执行成功，无标准输出' })
+    }
+    return '(无输出)'
   }
   // propose_command：既有结构化 JSON 格式
   if (p.state === 'accepted') {
@@ -797,7 +1211,7 @@ function buildSessionContext(): AiWireMessage | null {
 
 function send(override?: string) {
   const input = (override ?? draft.value).trim()
-  if (!input || streaming.value || planning.value) return
+  if ((!input && !attachments.value.length) || streaming.value || planning.value) return
 
   // 编辑重发：截断发生在真正发送时（填回时不截断，用户可能取消编辑）
   if (editFromId.value) {
@@ -832,12 +1246,16 @@ function send(override?: string) {
 
   // 规划模式检测（优先级：/plan 命令 > Toggle 开关 > 默认 ReAct；仅工作台 scope）
   const usePlan = scope.value !== 'global' && (PLAN_CMD_RE.test(input) || planMode.value)
+  // 附件快照（发送即清空）；按类型拆分：图片走 content parts，文本文件内联为 <file> 块
+  const atts = attachments.value.slice()
+  const imgs = atts.filter(a => a.kind === 'image')
+  const files = atts.filter(a => a.kind === 'text')
   // Toggle 为消息级：无论本次是否规划，提交后自动复位回默认
   planMode.value = false
 
   // 终端引用块并入本次 user 消息（引用在前，问题在后；模型对标记内内容按上下文对待）
   let text = usePlan ? input.replace(PLAN_CMD_RE, '').trim() : input
-  if (!text) return // "/plan" 后无实际内容
+  if (!text && !atts.length) return // "/plan" 后无实际内容，且无附件
   if (quote.value) {
     text = `<terminal-output>\n${quote.value.text}\n</terminal-output>\n\n${text}`
     quote.value = null
@@ -848,11 +1266,15 @@ function send(override?: string) {
     id: uid(),
     role: 'user',
     content: text,
+    images: imgs.length ? imgs : undefined,
+    files: files.length ? files : undefined,
     status: 'done',
     createdAt: Date.now(),
   })
   streaming.value = true
+  scrolledUp.value = false // 用户主动发送：恢复底部跟随
   draft.value = ''
+  attachments.value = []
   scrollToBottom()
   persist() // 先落盘用户消息，防止崩溃丢失
 
@@ -878,8 +1300,9 @@ function send(override?: string) {
   }
 
   // 规划模式分流：先生成计划卡片，确认后再进入 ReAct 循环
+  // 规划与对话同构：附件（文本内联 / 图片 content parts）一并交给 Planner 参考
   if (usePlan) {
-    void sendPlanned(seq, text)
+    void sendPlanned(seq, text, buildUserContent(text, imgs, files))
     return
   }
 
@@ -896,9 +1319,10 @@ function send(override?: string) {
 }
 
 /** 规划模式发送：调用 ai_plan_generate 生成计划卡片（draft）。
+ *  content 与对话链路同构（文本/代码附件已内联，含图片时为 content parts）。
  *  失败降级：toast + 占位消息转普通流式回复（自动按 ReAct 发送，用户输入不丢失）；
- *  用户取消：移除占位与 user 消息，原文填回输入框 */
-async function sendPlanned(seq: number, text: string) {
+ *  用户取消：移除占位与 user 消息，原文与附件一并填回输入框 */
+async function sendPlanned(seq: number, text: string, content: string | AiContentPart[]) {
   const placeholder: AiChatMessage = {
     id: uid(),
     role: 'assistant',
@@ -913,11 +1337,20 @@ async function sendPlanned(seq: number, text: string) {
   streaming.value = false
   planning.value = true
   try {
-    const result = await aiPlanGenerate(scope.value, text)
+    const result = await aiPlanGenerate(scope.value, content)
     if (seq !== loadSeq) return
-    placeholder.status = 'done'
-    placeholder.plan = {
-      goal: text,
+    // 经 reactive 代理修改：placeholder 是 push 前的裸对象，直接改其属性不触发
+    // 响应式，会导致 activePlanMsg 不更新、计划面板不渲染、content/status 不刷新
+    // （重载后从持久化数据全新渲染才可见）。必须取数组里的代理引用来改。
+    const msg = messages.value.find(m => m.id === placeholder.id)
+    if (!msg) return
+    msg.status = 'done'
+    // 执行过程区不放 Planner 原文（JSON 拼装过程，可读性差且可能露出 JSON），
+    // 替换为生成的步骤列表；正文清空避免与计划卡片重复
+    msg.trace = result.steps.map((s, i) => `${i + 1}. ${s.title}`).join('\n')
+    msg.content = ''
+    msg.plan = {
+      goal: text || '（含附件）',
       steps: result.steps.map(s => ({
         id: uid(),
         title: s.title,
@@ -927,17 +1360,22 @@ async function sendPlanned(seq: number, text: string) {
       currentIndex: 0,
       state: 'draft',
     }
+    stampElapsed()
     persist()
     scrollToBottom()
   } catch (e) {
     if (seq !== loadSeq) return
-    const msg = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
-    if (msg === '规划已取消') {
-      // 用户取消：移除占位与 user 消息，原文填回输入框（输入不丢失）
+    const errMsg = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
+    if (errMsg === '规划已取消') {
+      // 用户取消：移除占位与 user 消息，原文与附件一并填回输入框（输入不丢失）
       messages.value = messages.value.filter(m => m.id !== placeholder.id)
       const lastMsg = messages.value[messages.value.length - 1]
       if (lastMsg?.role === 'user') {
         draft.value = lastMsg.content
+        attachments.value = [
+          ...(lastMsg.images ?? []).map(img => ({ ...img, kind: 'image' as const })),
+          ...(lastMsg.files ?? []),
+        ]
         messages.value.pop()
       }
       persist()
@@ -945,6 +1383,13 @@ async function sendPlanned(seq: number, text: string) {
     }
     // 规划失败：toast + 占位转普通流式回复（自动按 ReAct 发送）
     toast('计划生成失败，已按普通模式发送', 'warn', 2600)
+    // 丢弃规划阶段的半成品流式正文（避免混入 ReAct 回复正文/上行历史）
+    const m = messages.value.find(x => x.id === placeholder.id)
+    if (m) {
+      m.content = ''
+      m.trace = undefined
+      m.status = 'streaming'
+    }
     streaming.value = true
     runAiStream(seq)
   } finally {
@@ -957,13 +1402,18 @@ function planFailedIndex(plan: AiPlan): number {
   return plan.steps.findIndex(s => s.state === 'failed')
 }
 
-/** 活动计划（最新 draft/executing）：展示在输入框上方的可折叠面板；
- *  done/cancelled 历史计划留在消息流中纯展示 */
+/** 活动计划：展示在输入框上方的可折叠面板。
+ *  draft/executing 始终展示；done 自动消失（无需确认），由变更文件列表面板接替；
+ *  cancelled 在用户确认收尾（acknowledged）前仍悬浮展示。 */
 const activePlanMsg = computed<AiChatMessage | null>(
   () =>
     [...messages.value]
       .reverse()
-      .find(m => m.plan && (m.plan.state === 'draft' || m.plan.state === 'executing')) ?? null,
+      .find(m => m.plan && (
+        m.plan.state === 'draft' ||
+        m.plan.state === 'executing' ||
+        (m.plan.state === 'cancelled' && !m.plan.acknowledged)
+      )) ?? null,
 )
 /** 面板折叠态（内存态）：新计划出现自动展开，用户手动切换后保持 */
 const planCollapsed = ref(false)
@@ -973,6 +1423,180 @@ watch(
     planCollapsed.value = false
   },
 )
+/** 面板标题：折叠 + 执行中时展示当前正在执行的步骤（随步骤更新），其余展示目标 */
+const planHeadTitle = computed(() => {
+  const plan = activePlanMsg.value?.plan
+  if (!plan) return ''
+  if (planCollapsed.value && plan.state === 'executing') {
+    const step = plan.steps[Math.min(plan.currentIndex, plan.steps.length - 1)]
+    if (step) return step.title
+  }
+  return plan.goal
+})
+/** 面板徽标文本：draft 计划中 / executing 执行中 / done 已完成 / cancelled 已取消 */
+const planBadgeText = computed(() => {
+  const s = activePlanMsg.value?.plan?.state
+  return s === 'draft' ? '计划中' : s === 'executing' ? '执行中' : s === 'done' ? '已完成' : '已取消'
+})
+/** 面板进度文本：draft 待确认 / executing 第 X/N 步 / done N/N · 已完成 / cancelled 已取消 */
+const planProgressText = computed(() => {
+  const plan = activePlanMsg.value?.plan
+  if (!plan) return ''
+  const n = plan.steps.length
+  if (plan.state === 'draft') return `${n} 步 · 待确认`
+  if (plan.state === 'executing') return `第 ${Math.min(plan.currentIndex + 1, n)}/${n} 步`
+  if (plan.state === 'done') return `${n}/${n} · 已完成`
+  return '已取消'
+})
+/** 用户确认收尾：done/cancelled 后标记 acknowledged，悬浮面板消失（不进消息流） */
+function acknowledgePlan(planMsg: AiChatMessage) {
+  const plan = planMsg.plan
+  if (!plan || (plan.state !== 'done' && plan.state !== 'cancelled')) return
+  plan.acknowledged = true
+  persist()
+}
+
+/* ---- 计划完成后的变更文件列表面板：接替计划面板，用户确认后消失 ---- */
+
+/** 单文件变更统计（同一路径多次编辑累加） */
+interface PlanFileChange {
+  path: string
+  added: number
+  removed: number
+}
+
+/** 解析已接受 propose_command 命令中的常见文件写入模式（尽力识别）：
+ *  heredoc、`>`/`>>` 重定向、tee、sed -i、touch、cp/mv 目标。
+ *  能确定行数的给出行数（heredoc 正文行数、echo/printf 的 \n 转义个数），否则按 0 计仅展示路径 */
+function extractShellWriteFiles(cmd: string): Array<{ path: string; added: number }> {
+  const out: Array<{ path: string; added: number }> = []
+  const push = (path: string | undefined, added: number) => {
+    if (!path || path.startsWith('-') || path.startsWith('/dev/')) return
+    out.push({ path, added })
+  }
+  // heredoc 正文整体剥离，行数留给同段的 tee/重定向目标关联
+  const bodies: number[] = []
+  const stripped = cmd.replace(
+    /<<-?\s*['"]?(\w[\w-]*)['"]?[^\n]*\n([\s\S]*?)\n[ \t]*\1(?=\n|$)/g,
+    (_m, _tag: string, body: string) => {
+      bodies.push(body ? body.split('\n').length : 0)
+      return ' \x00 '
+    },
+  )
+  for (const seg of stripped.split(/&&|\|\||[;\n|]/)) {
+    const added = seg.includes('\x00') ? (bodies.shift() ?? 0) : 0
+    // sed -i 's/…/…/' /path：目标为末位参数（sed 脚本中可能含 >，需先于重定向判定）
+    if (/\bsed\s+(?:-\S+\s+)*-i(?:\.\S*)?\s/.test(seg)) {
+      push(seg.trim().split(/\s+/).pop()?.replace(/^['"]|['"]$/g, ''), 0)
+      continue
+    }
+    let m = seg.match(/\btee\s+(?:-\S+\s+)*(["']?)([^\s;&|'"<>]+)\1/)
+    if (m) {
+      push(m[2], added)
+      continue
+    }
+    // 输出重定向（排除 2>、&> 等文件描述符重定向）
+    m = seg.match(/(?:^|[^\d&>])>>?\s*(["']?)([^\s;&|'"<>]+)\1/)
+    if (m) {
+      let n = added
+      if (!n) {
+        const em = seg.match(/\b(?:echo|printf)\s+(?:-\S+\s+)*(['"])((?:\\.|(?!\1)[\s\S])*)\1/)
+        n = em ? em[2].split(/\\n/).length : 0
+      }
+      push(m[2], n)
+      continue
+    }
+    if (/\btouch\s/.test(seg)) {
+      for (const t of seg.trim().split(/\s+/).slice(1)) push(t.replace(/^['"]|['"]$/g, ''), 0)
+      continue
+    }
+    m = seg.match(/\b(?:cp|mv)\s+(?:-\S+\s+)*(["']?)([^\s;&|'"<>]+)\1\s+(["']?)([^\s;&|'"<>]+)\3\s*$/)
+    if (m) push(m[4], 0)
+  }
+  return out
+}
+
+/** 收集本次计划任务（计划消息所在回复组）内的文件变更，按路径聚合 +n/-n：
+ *  1) 已接受的 edit_file/write_file 提案（行数精确）
+ *  2) 已接受的 propose_command 中识别出的写文件模式（尽力识别，行数不确定时为 0）
+ *  执行失败（error）或被拒绝的提案不计入 */
+function collectPlanFiles(m: AiChatMessage): PlanFileChange[] {
+  const idx = messages.value.indexOf(m)
+  if (idx < 0) return []
+  const end = groupEnd(idx)
+  const byPath = new Map<string, PlanFileChange>()
+  const merge = (path: string, added: number, removed: number) => {
+    const cur = byPath.get(path)
+    if (cur) {
+      cur.added += added
+      cur.removed += removed
+    } else {
+      byPath.set(path, { path, added, removed })
+    }
+  }
+  for (let i = idx; i <= end; i++) {
+    for (const p of messages.value[i].toolProposals ?? []) {
+      if (p.state !== 'accepted' || p.error) continue
+      if (p.name === 'edit_file' || p.name === 'write_file') {
+        let path = ''
+        try {
+          const v = JSON.parse(p.args)
+          path = typeof v?.path === 'string' ? v.path : ''
+        } catch {
+          continue
+        }
+        if (!path) continue
+        merge(
+          path,
+          countLines(fileEditNew(p)),
+          p.name === 'edit_file' ? countLines(fileEditOld(p)) : 0,
+        )
+      } else if (p.name === 'propose_command') {
+        try {
+          const v = JSON.parse(p.args)
+          const cmd = typeof v?.command === 'string' ? v.command : ''
+          if (!cmd) continue
+          for (const f of extractShellWriteFiles(cmd)) merge(f.path, f.added, 0)
+        } catch {
+          continue
+        }
+      }
+    }
+  }
+  return [...byPath.values()]
+}
+
+/** 变更文件面板目标消息：done + 有变更 + 未确认（取最新一条） */
+const planFilesMsg = computed<AiChatMessage | null>(
+  () =>
+    [...messages.value]
+      .reverse()
+      .find(
+        m =>
+          m.plan &&
+          m.plan.state === 'done' &&
+          !m.plan.filesAcknowledged &&
+          collectPlanFiles(m).length > 0,
+      ) ?? null,
+)
+/** 变更文件列表（模板直接使用，避免重复聚合） */
+const planFiles = computed<PlanFileChange[]>(
+  () => (planFilesMsg.value ? collectPlanFiles(planFilesMsg.value) : []),
+)
+/** 面板折叠态（内存态）：新面板出现自动展开 */
+const planFilesCollapsed = ref(false)
+watch(
+  () => planFilesMsg.value?.id,
+  () => {
+    planFilesCollapsed.value = false
+  },
+)
+/** 用户确认变更文件列表：标记后面板消失 */
+function acknowledgePlanFiles(msg: AiChatMessage) {
+  if (!msg.plan) return
+  msg.plan.filesAcknowledged = true
+  persist()
+}
 
 /** 取消规划：后端 cancels 同 scope 键，aiPlanGenerate 返回「规划已取消」交 catch 处理 */
 function cancelPlanning() {
@@ -1017,6 +1641,7 @@ function runPlanStep(planMsg: AiChatMessage, i: number) {
     content: '',
     status: 'streaming',
     createdAt: Date.now(),
+    stepIndex: i,
   })
   streaming.value = true
   scrollToBottom()
@@ -1071,7 +1696,8 @@ function failPlanStep(planMsg: AiChatMessage, i: number, reason: string) {
   scrollToBottom()
 }
 
-/** 全部步骤落定：plan 转 done，发起总结轮（注入全部步骤摘要、不带工具，纯文本收尾） */
+/** 全部步骤落定：plan 转 done，发起总结轮（注入全部步骤摘要、不带工具，纯文本收尾）。
+ *  总结轮关闭思考：各步结果已注入上下文，纯文本归纳无需推理 */
 function finishPlan(planMsg: AiChatMessage) {
   const plan = planMsg.plan
   if (!plan) return
@@ -1169,7 +1795,7 @@ async function replan(planMsg: AiChatMessage, failedIndex: number) {
 
 /** 发起流式请求（send 与提案裁决续跑共用）。工具提案仅在工作台会话下启用
  *  （全局对话无终端可写）；请求失败写入最后一条 assistant 消息。
- *  技能/规则资产与记忆每轮重新拉取：无缓存实时读，下一轮即最新 */
+ *  技能/规则资产与记忆每轮重新拉取：无缓存实时读，下一轮即最新。 */
 async function runAiStream(seq: number) {
   let assets: AiPromptAssets | undefined
   let memories: AiMemoryItem[] | undefined
@@ -1194,7 +1820,8 @@ async function runAiStream(seq: number) {
   })
 }
 
-/** 提案裁决后的自动续跑：追加新的 assistant 流式消息再发起请求 */
+/** 提案裁决后的自动续跑：追加新的 assistant 流式消息再发起请求。
+ *  计划步执行中的续跑轮继承当前步下标（过程区内归入同一步骤分隔条之下）。 */
 function continueToolRound() {
   const seq = ++loadSeq
   messages.value.push({
@@ -1203,6 +1830,7 @@ function continueToolRound() {
     content: '',
     status: 'streaming',
     createdAt: Date.now(),
+    stepIndex: planRunRef.value?.stepIndex,
   })
   streaming.value = true
   scrollToBottom()
@@ -1220,10 +1848,10 @@ function pumpProposals() {
   if (last?.toolProposals) {
     for (const p of last.toolProposals) {
       // 只读工具已在 autoRunning 中（autoExecReadonly 同步 add），不会进入此分支；
-      // 写操作（propose_command / edit_file / write_file）需弹窗授权
+      // 写操作（propose_command / edit_file / write_file / sftp_*_file）需弹窗授权
       if (
         p.state === 'pending' &&
-        ['propose_command', 'edit_file', 'write_file'].includes(p.name) &&
+        ['propose_command', 'edit_file', 'write_file', 'sftp_upload_file', 'sftp_download_file'].includes(p.name) &&
         !autoRunning.has(p)
       ) {
         proposalQueue.value.push({ msgId: last.id, proposal: p })
@@ -1375,6 +2003,9 @@ async function applyProposal(p: AiToolProposal, choice: 'once' | 'session' | 're
         }
       }
     }
+  } else if (p.name === 'sftp_upload_file' || p.name === 'sftp_download_file') {
+    // SFTP 传输：复用 SFTP 面板 IPC（task + Channel 进度），不写终端
+    await runSftpTransfer(p)
   } else {
     // edit_file / write_file：经 exec channel 执行，不写入 PTY
     const sid = activeSession.value?.backendId
@@ -1487,20 +2118,25 @@ function regenerate(m: AiChatMessage) {
   send(userContent)
 }
 
-/** 编辑重发：仅填回输入框并聚焦，截断推迟到真正发送时 */
+/** 编辑重发：仅填回输入框并聚焦，截断推迟到真正发送时；附件一并回填保持一致 */
 function startEdit(m: AiChatMessage) {
   if (streaming.value) return
   editFromId.value = m.id
   draft.value = m.content
+  attachments.value = [
+    ...(m.images ?? []).map(img => ({ ...img, kind: 'image' as const })),
+    ...(m.files ?? []),
+  ]
   nextTick(() => inputRef.value?.focus())
 }
 
-/** 删除 user 消息及紧随其后的 assistant 回复，不弹确认框 */
+/** 删除 user 消息及其整个 assistant 回复组（连续 assistant 消息），不弹确认框 */
 function deleteMessage(m: AiChatMessage) {
   if (streaming.value) return
   const idx = messages.value.indexOf(m)
   if (idx < 0) return
-  const count = messages.value[idx + 1]?.role === 'assistant' ? 2 : 1
+  const count =
+    messages.value[idx + 1]?.role === 'assistant' ? groupEnd(idx + 1) - idx + 1 : 1
   messages.value.splice(idx, count)
   rollbackSummaryAfterCut(idx)
   persist()
@@ -1646,11 +2282,15 @@ function clearChat() {
   editFromId.value = null
   summary.value = ''
   summaryUpTo.value = ''
+  traceManual.value.clear()
   reasoningManual.value.clear()
   // 计划内存态一并清理（卡片随消息清空）
   planMode.value = false
   planRunRef.value = null
   planSummaryRef.value = null
+  // 输入区上下文 chip 一并清理
+  quote.value = null
+  attachments.value = []
   if (isTauri) void aiClearChat(scope.value).catch(e => console.error('[AI] 清空失败:', e))
 }
 
@@ -1673,17 +2313,557 @@ watch(aiQuote, q => {
   nextTick(() => inputRef.value?.focus())
 })
 
+// 文本域自增高：草稿变化（输入/清空/填回）后重算高度
+watch(draft, () => nextTick(autoGrow))
+
+/** 用户上翻守卫阈值（px）：消息区滚动位置距底部超过该值即视为上翻中 */
+const STICK_THRESHOLD_PX = 80
+/** 用户上翻中（流式 token / 晋升滚动共用的同一口径），由 scroll 事件维护 */
+const scrolledUp = ref(false)
+
+function onChatScroll() {
+  const el = scrollEl.value
+  if (!el) return
+  scrolledUp.value = el.scrollHeight - el.scrollTop - el.clientHeight > STICK_THRESHOLD_PX
+  scheduleSpy() // 会话大纲 scroll-spy：rAF 节流，仅导轨显示期间生效
+}
+
 function scrollToBottom() {
   nextTick(() => {
     if (scrollEl.value) scrollEl.value.scrollTop = scrollEl.value.scrollHeight
   })
 }
 
+/** 任务驱动滚动（流式 token 逐帧跟随）：用户上翻查看历史时不劫持视口 */
+function followScroll() {
+  if (scrolledUp.value) return
+  scrollToBottom()
+}
+
+/** 晋升滚动：最终结果首次出现时平滑滚动至底部（结果区顶部）补偿上移；
+ *  用户上翻期间禁止，保持其当前阅读位置 */
+function scrollToResult() {
+  if (scrolledUp.value) return
+  nextTick(() =>
+    scrollEl.value?.scrollTo({ top: scrollEl.value.scrollHeight, behavior: 'smooth' }),
+  )
+}
+
+/* ---------- 会话大纲（刻度导轨）：消息列表的只读派生视图，无持久化、无手动开关 ---------- */
+
+/** 大纲条目：每条 user 消息（回复组锚点）派生一条 */
+interface OutlineEntry {
+  /** 锚点消息 id = user 消息 id */
+  id: string
+  /** 派生标题（已扁平化、长度兜底） */
+  title: string
+  /** 组执行状态（悬浮标签内状态点用色） */
+  state: 'waiting' | 'running' | 'done' | 'error' | 'stopped'
+}
+
+/** 内联 `<file name="…">…</file>` 附件块匹配（与多模态发送装配格式对应） */
+const FILE_BLOCK_RE = /<file name="[^"]*">[\s\S]*?<\/file>/g
+
+/** 标题派生：剔除附件块 → 空白折叠 → 空串回退（图片/首个文件名/空消息）→ 截断 60 字符 */
+function outlineTitle(m: AiChatMessage): string {
+  let t = m.content.replace(FILE_BLOCK_RE, '').replace(/\s+/g, ' ').trim()
+  if (!t) {
+    if (m.images?.length) t = '「图片」'
+    else if (m.files?.length) t = m.files[0].name
+    else t = '「（空消息）」'
+  }
+  return t.slice(0, 60)
+}
+
+/** 大纲条目派生：与渲染层 v2 同一分组口径（user 消息 + 紧随的连续 assistant 回复组） */
+const outlineEntries = computed<OutlineEntry[]>(() => {
+  const msgs = messages.value
+  const out: OutlineEntry[] = []
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    if (m.role !== 'user') continue
+    let state: OutlineEntry['state'] = 'waiting'
+    if (msgs[i + 1]?.role === 'assistant') {
+      const end = groupEnd(i + 1)
+      let anyStreaming = false
+      for (let j = i + 1; j <= end; j++) {
+        if (msgs[j].status === 'streaming') {
+          anyStreaming = true
+          break
+        }
+      }
+      const last = msgs[end]
+      if (anyStreaming) state = 'running'
+      else if (last.status === 'error') state = 'error'
+      else if (last.status === 'stopped') state = 'stopped'
+      else state = 'done'
+    }
+    out.push({ id: m.id, title: outlineTitle(m), state })
+  }
+  return out
+})
+
+/** 导轨显示所需的面板最小宽度（px）：760 消息区 + 两侧各 34px（22 导轨 + 12 间距）；
+ *  左侧 margin 放不下导轨时整体隐藏，避免遮挡消息正文 */
+const RAIL_MIN_WIDTH_PX = 828
+/** 面板宽度是否达到导轨显示门槛（ResizeObserver 维护，初值 true 避免宽屏初始闪烁） */
+const railWidthOk = ref(true)
+/** 导轨显示门槛：对话轮数 > 3（第 4 条 user 消息出现）且面板够宽才渲染，否则恒隐藏 */
+const showRail = computed(() => outlineEntries.value.length > 3 && railWidthOk.value)
+
+/** 当前激活刻度（scroll-spy 推导的最近条目 id） */
+const activeOutlineId = ref('')
+/** 悬浮标签：hover/focus 刻度时显示（fixed 定位，导轨右缘 + 14px，与刻度垂直对中） */
+const outlineTip = ref<{ x: number; y: number; entry: OutlineEntry } | null>(null)
+/** 导轨内部滚动容器 */
+const railEl = ref<HTMLElement | null>(null)
+/** 导轨淡出遮罩状态：可滚 / 贴顶 / 贴底 */
+const railCanScroll = ref(false)
+const railAtTop = ref(true)
+const railAtBottom = ref(true)
+
+/** 激活条目下标（-1 = 无激活） */
+const activeOutlineIndex = computed(() =>
+  outlineEntries.value.findIndex(e => e.id === activeOutlineId.value),
+)
+/** 已读（past）刻度集合：激活条目之前的全部条目 */
+const pastOutlineIds = computed(() => {
+  const s = new Set<string>()
+  for (let i = 0; i < activeOutlineIndex.value; i++) s.add(outlineEntries.value[i].id)
+  return s
+})
+
+/** 锚点位置缓存（性能关键）：offsetTop 只在布局变化时改变，滚动本身不改变——
+ *  采样时机一次性读取缓存为升序数组，帧回调零布局读取、仅二分查找 */
+let anchorTops: { id: string; top: number }[] = []
+
+/** 采样锚点位置：以消息区内容坐标系（rect 推导，与定位基准无关）记录各锚点 top */
+function sampleAnchors() {
+  const el = scrollEl.value
+  if (!el) {
+    anchorTops = []
+    return
+  }
+  const scrollRect = el.getBoundingClientRect()
+  const arr: { id: string; top: number }[] = []
+  for (const e of outlineEntries.value) {
+    const node = el.querySelector(`[data-mid="${e.id}"]`) as HTMLElement | null
+    if (!node) continue // 锚点缺失（极端时序）：跳过该条
+    const r = node.getBoundingClientRect()
+    arr.push({ id: e.id, top: r.top - scrollRect.top + el.scrollTop })
+  }
+  arr.sort((a, b) => a.top - b.top)
+  anchorTops = arr
+}
+
+/** 当前刻度保持可见：active 变化后校正导轨内部滚动（上下各留 6px 余量） */
+function ensureActiveTickVisible() {
+  const rail = railEl.value
+  const idx = activeOutlineIndex.value
+  if (!rail || idx < 0) return
+  const tick = rail.children[idx] as HTMLElement | undefined
+  if (!tick) return
+  const M = 6
+  const railRect = rail.getBoundingClientRect()
+  const tr = tick.getBoundingClientRect()
+  const y = tr.top - railRect.top + rail.scrollTop
+  if (y < rail.scrollTop + M) rail.scrollTop = y - M
+  else if (y + tr.height > rail.scrollTop + rail.clientHeight - M)
+    rail.scrollTop = y + tr.height - rail.clientHeight + M
+}
+
+function setActiveOutline(id: string) {
+  if (activeOutlineId.value === id) return
+  activeOutlineId.value = id
+  ensureActiveTickVisible()
+}
+
+/** scroll-spy 激活计算：激活线 = 可视高度 × 0.34（偏视口上 1/3，符合阅读视线）；
+ *  取最后一个 top <= scrollTop + 激活线 的条目为 active；贴底 40px 内强制末条 active */
+function updateActiveOutline() {
+  const el = scrollEl.value
+  if (!el || !anchorTops.length) return
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+    setActiveOutline(anchorTops[anchorTops.length - 1].id)
+    return
+  }
+  const line = el.scrollTop + el.clientHeight * 0.34
+  let lo = 0
+  let hi = anchorTops.length - 1
+  let ans = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (anchorTops[mid].top <= line) {
+      ans = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  setActiveOutline(anchorTops[ans >= 0 ? ans : 0].id)
+}
+
+/** rAF 节流：滚动事件只置位，帧回调内统一计算 */
+let spyRaf = 0
+function scheduleSpy() {
+  if (!showRail.value || spyRaf) return
+  spyRaf = requestAnimationFrame(() => {
+    spyRaf = 0
+    updateActiveOutline()
+  })
+}
+
+/** 导轨淡出遮罩状态同步（随导轨滚动、采样、条目变化） */
+function syncRailFades() {
+  const rail = railEl.value
+  if (!rail) return
+  railCanScroll.value = rail.scrollHeight > rail.clientHeight + 1
+  railAtTop.value = rail.scrollTop <= 1
+  railAtBottom.value = rail.scrollTop + rail.clientHeight >= rail.scrollHeight - 1
+}
+
+function onRailScroll() {
+  syncRailFades()
+  outlineTip.value = null // 导轨内部滚动时立即收起标签，避免错位
+}
+
+/** 重采样 + 激活重算 + 遮罩同步（DOM 变化后下一帧执行） */
+function resampleAnchors() {
+  nextTick(() => {
+    if (!showRail.value) return
+    sampleAnchors()
+    updateActiveOutline()
+    syncRailFades()
+  })
+}
+
+/** 点击刻度：平滑滚动定位到对应 user 消息（锚点缺失静默不滚动），并伴随 1.1s 闪烁反馈 */
+function scrollToOutline(e: OutlineEntry) {
+  const el = scrollEl.value
+  const node = el?.querySelector(`[data-mid="${e.id}"]`) as HTMLElement | null
+  if (!node) return
+  node.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  node.classList.remove('flash')
+  void node.offsetWidth // 强制重启动画
+  node.classList.add('flash')
+  window.setTimeout(() => node.classList.remove('flash'), 1150)
+}
+
+function showOutlineTip(e: OutlineEntry, ev: MouseEvent | FocusEvent) {
+  const tick = ev.currentTarget as HTMLElement
+  const shell = tick.closest('.rail-shell') as HTMLElement | null
+  if (!shell) return
+  const sr = shell.getBoundingClientRect()
+  const tr = tick.getBoundingClientRect()
+  outlineTip.value = { x: sr.right + 14, y: tr.top + tr.height / 2, entry: e }
+}
+
+function hideOutlineTip() {
+  outlineTip.value = null
+}
+
+/** 重采样时机：导轨挂载（含第 4 轮出现/切换 scope 恢复）即首次采样，不等首次滚动 */
+watch(showRail, v => {
+  if (v) {
+    resampleAnchors()
+  } else {
+    activeOutlineId.value = ''
+    anchorTops = []
+    outlineTip.value = null
+  }
+})
+/** 重采样时机：大纲结构变化（锚点增删、编辑重发、删除整组、清空） */
+watch(() => outlineEntries.value.map(e => e.id).join(','), resampleAnchors)
+/** 重采样时机：任务落定瞬间折叠区自动收起改变组总高度（流式 token 追加不触发） */
+watch(
+  () => streaming.value || planning.value,
+  (busy, prev) => {
+    if (prev && !busy) resampleAnchors()
+  },
+)
+/** 切换 scope：导轨内部滚动位置与高亮随会话重置（条目 watcher 负责重采样） */
+watch(scope, () => {
+  activeOutlineId.value = ''
+  anchorTops = []
+  outlineTip.value = null
+  if (railEl.value) railEl.value.scrollTop = 0
+})
+
+/** 重采样时机：chat-wrap 宽度变化（消息区换行高度重排 / 左侧 margin 变化；token 追加不触发） */
+const chatWrapEl = ref<HTMLElement | null>(null)
+let chatResizeObs: ResizeObserver | null = null
+let lastChatWidth = 0
+onMounted(() => {
+  if (chatWrapEl.value) {
+    lastChatWidth = chatWrapEl.value.clientWidth
+    railWidthOk.value = lastChatWidth >= RAIL_MIN_WIDTH_PX
+    chatResizeObs = new ResizeObserver(() => {
+      const w = chatWrapEl.value?.clientWidth ?? 0
+      railWidthOk.value = w >= RAIL_MIN_WIDTH_PX
+      if (w === lastChatWidth) return
+      lastChatWidth = w
+      resampleAnchors()
+    })
+    chatResizeObs.observe(chatWrapEl.value)
+  }
+  window.addEventListener('resize', resampleAnchors)
+})
+onUnmounted(() => {
+  chatResizeObs?.disconnect()
+  window.removeEventListener('resize', resampleAnchors)
+  if (spyRaf) cancelAnimationFrame(spyRaf)
+})
+
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  // 组合输入（中文/日文输入法）期间回车不发送，避免选词误发
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     send()
   }
+}
+
+/* ---------- 附件（多模态输入）：图片 + 文本/代码文件，粘贴 / 拖拽 / 选择三入口 ---------- */
+
+/** 允许的图片 MIME（主流模型 vision 支持的范围；gif 取首帧） */
+const IMAGE_ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+/** 单图原始大小上限：防超大文件读入内存（正常截图/照片远小于此） */
+const IMAGE_MAX_RAW_BYTES = 8 * 1024 * 1024
+/** 长边上限：超出按比例缩放（视觉模型推荐上限，降低 token 与传输体积） */
+const IMAGE_MAX_EDGE = 1568
+/** 单图压缩后上限 */
+const IMAGE_MAX_ENCODED_BYTES = 2 * 1024 * 1024
+/** 单条消息图片数量上限 */
+const IMAGE_MAX_COUNT = 4
+/** 单条消息附件合计上限 */
+const IMAGE_TOTAL_MAX_BYTES = 6 * 1024 * 1024
+
+/** 允许的文本/代码文件扩展名（小写含点，如 '.ts'） */
+const FILE_ALLOWED_EXTS = [
+  // 文本 / 文档
+  '.txt', '.md', '.markdown', '.log', '.csv', '.tsv', '.rst', '.adoc', '.tex',
+  // 配置 / 数据
+  '.json', '.json5', '.yaml', '.yml', '.toml', '.ini', '.conf', '.cfg', '.env',
+  '.properties', '.xml', '.plist', '.editorconfig',
+  // 代码
+  '.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.vue', '.svelte',
+  '.rs', '.go', '.java', '.kt', '.kts', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs',
+  '.rb', '.php', '.swift', '.scala', '.sh', '.bash', '.zsh', '.fish', '.bat', '.ps1',
+  '.sql', '.graphql', '.gql', '.proto', '.lua', '.pl', '.pm', '.r', '.dart', '.ex', '.exs',
+  '.html', '.htm', '.css', '.scss', '.sass', '.less', '.styl', '.vim',
+  '.gradle', '.cmake', '.tf', '.tfvars', '.hcl', '.diff', '.patch', '.mk',
+]
+/** 无扩展名的常见文本/配置文件名（整名小写匹配） */
+const FILE_ALLOWED_NAMES = ['dockerfile', 'makefile', 'rakefile', 'gemfile', 'procfile', 'brewfile']
+/** 单文件原始大小上限：内容内联进上下文，过大推高 token 成本 */
+const FILE_MAX_RAW_BYTES = 1024 * 1024
+/** 单条消息文本/代码文件数量上限 */
+const FILE_MAX_COUNT = 4
+/** 二进制守卫检查的字符数（只查头部，兼顾性能与准确性） */
+const FILE_BINARY_SCAN_CHARS = 8192
+/** `<input accept>` 值：图片 MIME + 文本/代码扩展名（由白名单派生，避免手工维护） */
+const FILE_ACCEPT = [...IMAGE_ALLOWED_TYPES, ...FILE_ALLOWED_EXTS].join(',')
+
+/** 多行文本域最大增高像素（约 6 行） */
+const COMPOSER_MAX_HEIGHT = 132
+
+/** data URL 的近似字节数（去掉头部后按 base64 4 字符 3 字节换算） */
+function dataUrlBytes(dataUrl: string): number {
+  const i = dataUrl.indexOf(',')
+  if (i < 0) return 0
+  return Math.floor((dataUrl.length - i - 1) * 3 / 4)
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(new Error('读取失败'))
+    r.readAsDataURL(file)
+  })
+}
+
+/** 采集单个图片文件：白名单 → 原始大小 → 解码 → 缩放/重编码 → 体积与数量校验 → 入列 */
+async function addImageFile(file: File, name?: string) {
+  if (!IMAGE_ALLOWED_TYPES.includes(file.type)) {
+    toast('不支持的图片格式（仅 png / jpeg / webp / gif）', 'warn', 2600)
+    return
+  }
+  if (file.size > IMAGE_MAX_RAW_BYTES) {
+    toast('图片过大（原始超过 8MB）', 'warn', 2600)
+    return
+  }
+  if (attachments.value.filter(a => a.kind === 'image').length >= IMAGE_MAX_COUNT) {
+    toast(`最多添加 ${IMAGE_MAX_COUNT} 张图片`, 'warn', 2600)
+    return
+  }
+  try {
+    const bmp = await createImageBitmap(file)
+    const longEdge = Math.max(bmp.width, bmp.height)
+    let dataUrl: string
+    let w = bmp.width
+    let h = bmp.height
+    if (longEdge > IMAGE_MAX_EDGE) {
+      // 缩放重编码：保持原 MIME（PNG 保文字清晰；GIF 取首帧转 PNG）
+      const scale = IMAGE_MAX_EDGE / longEdge
+      w = Math.max(1, Math.round(bmp.width * scale))
+      h = Math.max(1, Math.round(bmp.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('canvas 不可用')
+      ctx.drawImage(bmp, 0, 0, w, h)
+      const mime = file.type === 'image/gif' ? 'image/png' : file.type
+      dataUrl = canvas.toDataURL(mime, mime === 'image/jpeg' ? 0.85 : undefined)
+    } else {
+      dataUrl = await readFileAsDataUrl(file)
+    }
+    bmp.close()
+    const sizeBytes = dataUrlBytes(dataUrl)
+    if (sizeBytes > IMAGE_MAX_ENCODED_BYTES) {
+      toast('图片过大（压缩后超过 2MB）', 'warn', 2600)
+      return
+    }
+    const total = attachments.value.reduce((n, a) => n + a.sizeBytes, 0)
+    if (total + sizeBytes > IMAGE_TOTAL_MAX_BYTES) {
+      toast('附件合计超过 6MB', 'warn', 2600)
+      return
+    }
+    attachments.value.push({
+      id: uid(),
+      kind: 'image',
+      dataUrl,
+      name: name || file.name || '粘贴的图片',
+      sizeBytes,
+      width: w,
+      height: h,
+    })
+  } catch {
+    toast('图片解码失败', 'warn', 2600)
+  }
+}
+
+/** 取文件小写扩展名（含点）；无扩展名返回空串 */
+function fileExt(name: string): string {
+  const i = name.lastIndexOf('.')
+  return i >= 0 ? name.slice(i).toLowerCase() : ''
+}
+
+/** 是否属于白名单文本/代码文件（按扩展名或整名判定） */
+function isAllowedTextFile(file: File): boolean {
+  const lower = file.name.toLowerCase()
+  if (FILE_ALLOWED_NAMES.includes(lower)) return true
+  return FILE_ALLOWED_EXTS.includes(fileExt(lower))
+}
+
+/** 内容二进制守卫：含 NUL 字节视为二进制，拒绝（防改扩展名绕过白名单） */
+function looksBinary(text: string): boolean {
+  return text.slice(0, FILE_BINARY_SCAN_CHARS).includes('\u0000')
+}
+
+/** 采集单个文本/代码文件：白名单 → 原始大小 → UTF-8 读取 → 二进制守卫 → 入列 */
+async function addTextFile(file: File) {
+  if (!isAllowedTextFile(file)) {
+    toast(`不支持的文本/代码文件：${file.name}`, 'warn', 3000)
+    return
+  }
+  if (file.size > FILE_MAX_RAW_BYTES) {
+    toast(`文件过大（${file.name} 超过 1MB）`, 'warn', 3000)
+    return
+  }
+  if (attachments.value.filter(a => a.kind === 'text').length >= FILE_MAX_COUNT) {
+    toast(`最多添加 ${FILE_MAX_COUNT} 个文件`, 'warn', 2600)
+    return
+  }
+  try {
+    const text = await file.text()
+    if (looksBinary(text)) {
+      toast(`文件疑似二进制，已拒绝：${file.name}`, 'warn', 3000)
+      return
+    }
+    attachments.value.push({
+      id: uid(),
+      kind: 'text',
+      name: file.name || '未命名文件',
+      sizeBytes: file.size,
+      text,
+    })
+  } catch {
+    toast(`文件读取失败：${file.name}`, 'warn', 3000)
+  }
+}
+
+/** 按类型分流：图片走压缩链路，白名单文本/代码文件走文本读入链路 */
+async function addFiles(files: File[]) {
+  for (const f of files) {
+    if (f.type.startsWith('image/')) await addImageFile(f)
+    else await addTextFile(f)
+  }
+}
+
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter(a => a.id !== id)
+}
+
+/** 入口一：选择文件（点击 + 触发隐藏 input） */
+function pickFiles() {
+  fileInputEl.value?.click()
+}
+
+function onFilePicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = '' // 清空以允许重复选择同一文件
+  void addFiles(files)
+}
+
+/** 入口二：粘贴（剪贴板截图/图片）；命中图片时阻止二进制粘入文本域 */
+function onPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items
+  if (!items) return
+  const files: File[] = []
+  for (const it of items) {
+    if (it.kind === 'file' && it.type.startsWith('image/')) {
+      const f = it.getAsFile()
+      if (f) files.push(f)
+    }
+  }
+  if (files.length) {
+    e.preventDefault()
+    void addFiles(files)
+  }
+}
+
+/** 入口三：拖拽（dragover 进出需计数，避免子元素间抖动导致高亮闪烁） */
+let dragDepth = 0
+function onDragEnter(e: DragEvent) {
+  if (!e.dataTransfer?.types?.includes('Files')) return
+  dragDepth++
+  dragActive.value = true
+}
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragActive.value = false
+}
+function onDragOver(e: DragEvent) {
+  if (e.dataTransfer?.types?.includes('Files')) e.preventDefault()
+}
+function onDrop(e: DragEvent) {
+  dragDepth = 0
+  dragActive.value = false
+  // 只收图片与白名单文本/代码文件，其余静默忽略（拖拽常混入无关文件）
+  const files = Array.from(e.dataTransfer?.files ?? []).filter(
+    f => f.type.startsWith('image/') || isAllowedTextFile(f),
+  )
+  if (files.length) void addFiles(files)
+}
+
+/** 多行文本域自增高（1~6 行，超出内部滚动） */
+function autoGrow() {
+  const el = inputRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT)}px`
 }
 
 const quickHints = ['nginx 502 怎么排查？', '解释这条日志的含义', '生成一个 systemd service 文件']
@@ -1713,8 +2893,9 @@ const configHint = computed(() => {
       </button>
     </Teleport>
 
-    <!-- 消息列表 -->
-    <div ref="scrollEl" class="chat-scroll">
+    <!-- 消息列表：chat-wrap 全宽容器（刻度导轨定位基准），chat-scroll 760px 限宽居中（原布局） -->
+    <div ref="chatWrapEl" class="chat-wrap">
+      <div ref="scrollEl" class="chat-scroll" @scroll="onChatScroll">
       <template v-if="messages.length === 0">
         <div class="empty">
           <div class="empty-title">AI 助手</div>
@@ -1731,207 +2912,292 @@ const configHint = computed(() => {
       </template>
 
       <template v-else>
-        <!-- 回复组：同一问题触发的连续 assistant 消息（工具循环中间轮 + 最终回答）
-             视觉合并为一个连续回复——仅首条显示 logo 头，组内间距收紧 -->
-        <div
-          v-for="(m, i) in messages"
-          :key="m.id"
-          class="bubble"
-          :class="[m.role, m.status, { grouped: i > 0 && m.role === 'assistant' && messages[i - 1].role === 'assistant' }]"
-        >
-          <!-- AI 消息头：项目 logo + Agent 标识 -->
-          <div v-if="m.role === 'assistant'" class="msg-head">
-            <span class="agent-logo">
-              <AppLogo />
-            </span>
-            <span class="agent-name">Agent</span>
-          </div>
-          <!-- 思考过程：流式时自动展开，content 到达后自动收起；用户可手动切换 -->
-          <div v-if="m.reasoning" class="reasoning" :class="{ open: isReasoningOpen(m) }">
-            <div class="reasoning-toggle" @click="toggleReasoning(m.id)">
-              <span class="reasoning-arrow">›</span>
-              <span class="reasoning-label">思考过程</span>
-              <span v-if="isReasoningStreaming(m)" class="reasoning-thinking">思考中…</span>
+        <template v-for="(m, i) in messages" :key="m.id">
+          <!-- 用户消息（data-mid 为会话大纲定位锚点） -->
+          <div v-if="m.role === 'user'" class="bubble user" :data-mid="m.id">
+            <!-- 图片附件（多模态输入）：缩略图行 -->
+            <div v-if="m.images?.length" class="bubble-images">
+              <img
+                v-for="img in m.images"
+                :key="img.id"
+                :src="img.dataUrl"
+                :alt="img.name"
+                :title="img.name"
+                class="bubble-thumb"
+              />
             </div>
-            <div v-show="isReasoningOpen(m)" class="reasoning-body">
-              <AiMarkdown :content="m.reasoning" />
+            <!-- 文本/代码文件附件：文件名 chip 行 -->
+            <div v-if="m.files?.length" class="bubble-files">
+              <span v-for="f in m.files" :key="f.id" class="bubble-file" :title="f.name">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                </svg>
+                <span class="bubble-file-name">{{ f.name }}</span>
+              </span>
+            </div>
+            <div v-if="m.content" class="bubble-body">{{ m.content }}</div>
+            <div v-show="!streaming" class="bubble-foot">
+              <button class="foot-btn" title="编辑重发" @click="startEdit(m)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+                </svg>
+              </button>
+              <button class="foot-btn" title="复制" @click="copyText(m.content)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
+              </button>
+              <button class="foot-btn danger" title="删除" @click="deleteMessage(m)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+              </button>
             </div>
           </div>
-          <!-- AI 正文 markdown 渲染；用户消息保持纯文本 -->
-          <AiMarkdown
-            v-if="m.role === 'assistant' && m.content"
-            :content="m.content"
-            :terminal-ready="terminalReady"
-            @terminal="onTerminalIntent"
-          />
-          <div v-else-if="m.content" class="bubble-body">{{ m.content }}</div>
-          <div v-else-if="m.status === 'streaming'" class="typing">
-            <span></span><span></span><span></span>
-          </div>
-          <!-- 历史计划卡片（已落定的 done/cancelled）：纯展示留痕。
-               活动计划（draft/executing）在输入框上方可折叠面板中展示与交互 -->
-          <div v-if="m.plan && (m.plan.state === 'done' || m.plan.state === 'cancelled')" class="plan-card" :class="m.plan.state">
-            <div class="plan-head">
-              <span class="plan-badge">{{ m.plan.state === 'done' ? '已完成' : '已取消' }}</span>
-              <span class="plan-goal" :title="m.plan.goal">🎯 {{ m.plan.goal }}</span>
-            </div>
-            <ol class="plan-steps">
-              <li
-                v-for="(s, si) in m.plan.steps"
-                :key="s.id"
-                class="plan-step"
-                :class="s.state"
-              >
-                <span class="plan-step-icon">
-                  {{ s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'skipped' ? '⊘' : '○' }}
-                </span>
-                <div class="plan-step-body">
-                  <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
-                  <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
-                  <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
-                  <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
-                  <details
-                    v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
-                    class="plan-step-result"
-                  >
-                    <summary>结果</summary>
-                    <div class="plan-step-result-body">{{ s.result }}</div>
-                  </details>
-                </div>
-              </li>
-            </ol>
-          </div>
-          <!-- 工具提案记录条：
-               - propose_command：命令提案卡片（授权/拒绝/执行状态徽标）
-               - edit_file / write_file：文件编辑卡片（授权/执行状态徽标 + 变更预览）
-               - 只读工具：轻量观察卡片（无授权交互，可折叠输出） -->
+
+          <!-- AI 回复组：同一问题触发的连续 assistant 消息（工具循环中间轮 / 计划各步 /
+               收尾总结）合并渲染为一个回复——整组仅组首渲染，执行过程统一收进可折叠区域 -->
           <div
-            v-for="p in m.toolProposals"
-            :key="p.id"
-            class="proposal"
-            :class="[p.state, { 'readonly-tool': !['propose_command','edit_file','write_file'].includes(p.name) }]"
+            v-else-if="isGroupLead(i)"
+            class="bubble assistant"
+            :class="groupStatus(i)"
           >
-            <!-- propose_command 命令提案卡片 -->
-            <template v-if="p.name === 'propose_command'">
-              <div class="proposal-head">
-                <span class="proposal-tag">命令执行</span>
-                <span class="proposal-state">
-                  {{ p.state === 'pending'
-                    ? '等待授权'
-                    : p.state === 'accepted'
-                      ? p.error ? '执行失败' : p.allowedSession ? '已执行 · 会话允许' : '已执行'
-                      : p.state === 'rejected' ? '已拒绝' : '已失效' }}
-                </span>
-              </div>
-              <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
-              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
-              <pre class="proposal-cmd">{{ proposalCommand(p) }}</pre>
-            </template>
-            <!-- edit_file / write_file 文件编辑卡片：两行布局，与只读工具卡片统一 -->
-            <template v-else-if="p.name === 'edit_file' || p.name === 'write_file'">
-              <div class="proposal-head">
-                <span class="proposal-tag">{{ readonlyLabel(p.name) }}</span>
-                <span class="proposal-state">
-                  {{ p.state === 'pending'
-                    ? '等待授权'
-                    : p.state === 'accepted'
-                      ? p.error ? '执行失败' : '已执行'
-                      : p.state === 'rejected' ? '已拒绝' : '已失效' }}
-                </span>
-              </div>
-              <div class="file-edit-row">
-                <span class="proposal-args">{{ readonlyArgs(p) }}</span>
-                <span class="line-diff">
-                  <span class="diff-add">+{{ countLines(fileEditNew(p)) }}</span>
-                  <template v-if="p.name === 'edit_file'">
-                    <span class="diff-del">-{{ countLines(fileEditOld(p)) }}</span>
-                  </template>
-                </span>
-              </div>
-              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
-              <details v-if="p.execOutput" class="readonly-output">
-                <summary>输出（{{ p.execOutput.length }} 字符）</summary>
-                <pre class="proposal-cmd">{{ p.execOutput }}</pre>
-              </details>
-            </template>
-            <!-- 只读工具观察卡片 -->
-            <template v-else>
-              <div class="proposal-head">
-                <span class="proposal-tag readonly-tag">{{ readonlyLabel(p.name) }}</span>
-                <span class="proposal-args">{{ readonlyArgs(p) }}</span>
-                <span class="proposal-state">
-                  {{ p.error ? '执行失败' : p.execOutput ? '已观察' : '执行中…' }}
-                </span>
-              </div>
-              <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
-              <details v-if="p.execOutput" class="readonly-output">
-                <summary>输出（{{ p.execOutput.length }} 字符）</summary>
-                <pre class="proposal-cmd">{{ p.execOutput }}</pre>
-              </details>
-            </template>
-          </div>
-          <!-- 消息底栏：streaming 期间整体隐藏；hover 淡入。
-               回复组内仅最后一条显示（组 = 一次逻辑回复，重新生成语义即重跑整组） -->
-          <div v-if="m.role === 'user'" v-show="!streaming" class="bubble-foot">
-            <button class="foot-btn" title="编辑重发" @click="startEdit(m)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-              </svg>
-            </button>
-            <button class="foot-btn" title="复制" @click="copyText(m.content)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-              </svg>
-            </button>
-            <button class="foot-btn danger" title="删除" @click="deleteMessage(m)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              </svg>
-            </button>
-          </div>
-          <div v-if="m.role === 'assistant'" v-show="!streaming && isGroupTail(i)" class="bubble-foot">
-            <button v-if="m.content" class="foot-btn" title="复制全文" @click="copyText(m.content)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-              </svg>
-            </button>
-            <button
-              v-if="m.status === 'done' || m.status === 'stopped' || m.status === 'error'"
-              class="foot-btn"
-              title="重新生成"
-              @click="regenerate(m)"
+            <!-- AI 消息头：项目 logo + Agent 标识 -->
+            <div class="msg-head">
+              <span class="agent-logo">
+                <AppLogo />
+              </span>
+              <span class="agent-name">Agent</span>
+            </div>
+            <!-- 任务耗时行：整组耗时；点击展开/收起执行过程（无过程则不可点） -->
+            <div
+              class="task-meta"
+              :class="{ clickable: hasTrace(i) }"
+              @click="hasTrace(i) && toggleTrace(i)"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="23 4 23 10 17 10" />
-                <polyline points="1 20 1 14 7 14" />
-                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              <svg class="task-clock" width="11" height="11" viewBox="0 0 24 24" fill="none"
+                   stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <polyline points="12 7 12 12 15 14" />
               </svg>
-            </button>
-            <span v-if="m.status === 'stopped'" class="stopped-tag">已中止</span>
+              <span class="task-elapsed">任务耗时 {{ fmtDuration(groupElapsedMs(i)) }}</span>
+              <span v-if="groupActive(i)" class="task-running">执行中…</span>
+              <span v-if="hasTrace(i)" class="trace-arrow" :class="{ open: isTraceOpen(i) }">›</span>
+            </div>
+            <!-- 执行过程折叠区（v2）：按轮次分组（一条 assistant 消息 = 一轮），
+                 结果确认前一切轮次内容（含流式中的当前轮正文）只渲染在此区内 -->
+            <div v-show="isTraceOpen(i)" class="trace">
+              <template v-for="r in groupRounds(i)" :key="r.key">
+                <!-- Plan 步骤分隔条：标识该轮所属执行步骤 -->
+                <div v-if="r.stepStart" class="round-sep">
+                  <span class="round-sep-num">步骤 {{ (r.stepIndex ?? 0) + 1 }}/{{ groupPlan(i)?.steps.length }}</span>
+                  <span class="round-sep-title">{{ groupPlan(i)?.steps[r.stepIndex ?? 0]?.title }}</span>
+                </div>
+                <!-- 思考过程（每轮独立折叠）：自动 = 思考中展开+脉冲、正文到达收起；手动点击优先 -->
+                <div v-if="r.m.reasoning" class="trace-block">
+                  <div class="trace-label reasoning-toggle" @click="toggleReasoning(r.m)">
+                    <span>思考过程</span>
+                    <span v-if="reasoningThinking(r.m)" class="think-pulse">思考中…</span>
+                    <span class="trace-arrow" :class="{ open: isReasoningOpen(r.m) }">›</span>
+                  </div>
+                  <div v-show="isReasoningOpen(r.m)" class="trace-body">
+                    <AiMarkdown :content="r.m.reasoning ?? ''" />
+                  </div>
+                </div>
+                <div v-if="r.m.trace" class="trace-block">
+                  <div class="trace-label">规划</div>
+                  <pre class="trace-pre">{{ r.m.trace }}</pre>
+                </div>
+                <!-- 轮次正文：结果确认后末轮正文晋升至结果区，此处不再渲染（防同文两处同显） -->
+                <div v-if="r.m.content.trim() && !r.promoted" class="trace-block">
+                  <div class="trace-body">
+                    <AiMarkdown :content="r.m.content" />
+                  </div>
+                </div>
+                <div v-if="r.m.toolProposals?.length" class="trace-block">
+                  <!-- 工具提案记录条：
+                       - propose_command：命令提案卡片（授权/拒绝/执行状态徽标）
+                       - edit_file / write_file：文件编辑卡片（授权/执行状态徽标 + 变更预览）
+                       - 只读工具：轻量观察卡片（无授权交互，可折叠输出） -->
+                  <div
+                    v-for="p in r.m.toolProposals"
+                    :key="p.id"
+                    class="proposal"
+                    :class="[p.state, { 'readonly-tool': !['propose_command','edit_file','write_file','sftp_upload_file','sftp_download_file'].includes(p.name) }]"
+                  >
+                    <template v-if="p.name === 'propose_command'">
+                      <div class="proposal-head">
+                        <span class="proposal-tag">命令执行</span>
+                        <span class="proposal-state">
+                          {{ p.state === 'pending'
+                            ? '等待授权'
+                            : p.state === 'accepted'
+                              ? p.error ? '执行失败' : p.allowedSession ? '已执行 · 会话允许' : '已执行'
+                              : p.state === 'rejected' ? '已拒绝' : '已失效' }}
+                        </span>
+                      </div>
+                      <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
+                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <pre class="proposal-cmd">{{ proposalCommand(p) }}</pre>
+                    </template>
+                    <template v-else-if="p.name === 'edit_file' || p.name === 'write_file'">
+                      <div class="proposal-head">
+                        <span class="proposal-tag">{{ readonlyLabel(p.name) }}</span>
+                        <span class="proposal-state">
+                          {{ p.state === 'pending'
+                            ? '等待授权'
+                            : p.state === 'accepted'
+                              ? p.error ? '执行失败' : '已执行'
+                              : p.state === 'rejected' ? '已拒绝' : '已失效' }}
+                        </span>
+                      </div>
+                      <div class="file-edit-row">
+                        <span class="proposal-args">{{ readonlyArgs(p) }}</span>
+                        <span class="line-diff">
+                          <span class="diff-add">+{{ countLines(fileEditNew(p)) }}</span>
+                          <template v-if="p.name === 'edit_file'">
+                            <span class="diff-del">-{{ countLines(fileEditOld(p)) }}</span>
+                          </template>
+                        </span>
+                      </div>
+                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <details v-if="p.execOutput" class="readonly-output">
+                        <summary>输出（{{ p.execOutput.length }} 字符）</summary>
+                        <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+                      </details>
+                    </template>
+                    <template v-else-if="p.name === 'sftp_upload_file' || p.name === 'sftp_download_file'">
+                      <div class="proposal-head">
+                        <span class="proposal-tag">{{ p.name === 'sftp_upload_file' ? '⬆ 上传文件' : '⬇ 下载文件' }}</span>
+                        <span class="proposal-state">
+                          {{ p.state === 'pending'
+                            ? '等待授权'
+                            : p.state === 'accepted'
+                              ? p.error ? '执行失败' : !p.execOutput ? '传输中…' : '已传输'
+                              : p.state === 'rejected' ? '已拒绝' : '已失效' }}
+                        </span>
+                      </div>
+                      <div v-if="sftpPaths(p)" class="file-edit-row sftp-paths">
+                        <code class="sftp-local">{{ sftpPaths(p)!.local }}</code>
+                        <span class="sftp-arrow">→</span>
+                        <code class="sftp-remote">{{ sftpPaths(p)!.remote }}</code>
+                      </div>
+                      <!-- 传输进度条（执行中实时更新；total 未知时不显示） -->
+                      <div v-if="p.progress?.total" class="sftp-progress">
+                        <div class="sftp-progress-bar">
+                          <div
+                            class="sftp-progress-fill"
+                            :style="{ width: Math.min(100, Math.round((p.progress.transferred / p.progress.total) * 100)) + '%' }"
+                          ></div>
+                        </div>
+                        <span class="sftp-progress-text">
+                          {{ humanBytes(p.progress.transferred) }} / {{ humanBytes(p.progress.total) }}
+                          <template v-if="p.progress.speed"> · {{ humanBytes(p.progress.speed) }}/s</template>
+                        </span>
+                      </div>
+                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                    </template>
+                    <template v-else>
+                      <div class="proposal-head">
+                        <span class="proposal-tag readonly-tag">{{ readonlyLabel(p.name) }}</span>
+                        <span class="proposal-args">{{ readonlyArgs(p) }}</span>
+                        <span class="proposal-state">
+                          {{ p.error ? '执行失败' : p.execOutput ? '已观察' : '执行中…' }}
+                        </span>
+                      </div>
+                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <details v-if="p.execOutput" class="readonly-output">
+                        <summary>输出（{{ p.execOutput.length }} 字符）</summary>
+                        <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+                      </details>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <!-- 结果分隔线：与执行过程区隔开，凸显最终结果（结果确认前恒不出现） -->
+            <div v-if="groupResultText(i)" class="result-divider"></div>
+            <!-- 最终结果：AI 最终回复（确认晋升 / 总结轮直接流入）；无则计划落定后本地步骤总结 -->
+            <AiMarkdown
+              v-if="groupResultText(i)"
+              :content="groupResultText(i)"
+              :terminal-ready="terminalReady"
+              @terminal="onTerminalIntent"
+            />
+            <!-- 计划不进消息流：done/cancelled 由输入框上方悬浮面板展示至用户确认收尾 -->
+            <!-- 消息底栏：streaming 期间整体隐藏；hover 淡入。整组仅此一处 -->
+            <div v-show="!streaming" class="bubble-foot">
+              <button v-if="groupResultText(i)" class="foot-btn" title="复制全文" @click="copyText(groupResultText(i))">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
+              </button>
+              <button
+                v-if="groupStatus(i) === 'done' || groupStatus(i) === 'stopped' || groupStatus(i) === 'error'"
+                class="foot-btn"
+                title="重新生成"
+                @click="regenerate(m)"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="23 4 23 10 17 10" />
+                  <polyline points="1 20 1 14 7 14" />
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+              </button>
+              <span v-if="groupStatus(i) === 'stopped'" class="stopped-tag">已中止</span>
+            </div>
           </div>
-        </div>
+        </template>
       </template>
+      </div>
+
+      <!-- 会话大纲刻度导轨：轮数 > 3 自动出现（≤3 轮恒不渲染），纯派生无手动开关 -->
+      <div
+        v-if="showRail"
+        class="rail-shell"
+        :class="{ 'can-scroll': railCanScroll, 'at-top': railAtTop, 'at-bottom': railAtBottom }"
+      >
+        <div class="rail-fade top"></div>
+        <div ref="railEl" class="rail" @scroll="onRailScroll">
+          <button
+            v-for="e in outlineEntries"
+            :key="e.id"
+            type="button"
+            class="tick"
+            :class="{ past: pastOutlineIds.has(e.id), active: e.id === activeOutlineId }"
+            :aria-label="e.title"
+            @click="scrollToOutline(e)"
+            @mouseenter="showOutlineTip(e, $event)"
+            @mouseleave="hideOutlineTip"
+            @focus="showOutlineTip(e, $event)"
+            @blur="hideOutlineTip"
+          ></button>
+        </div>
+        <div class="rail-fade bottom"></div>
+      </div>
     </div>
 
-    <!-- 终端引用块（右键「添加到 AI 对话」产生） -->
-    <div v-if="quote" class="quote-bar">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="4 17 10 11 4 5" />
-        <line x1="12" y1="19" x2="20" y2="19" />
-      </svg>
-      <span class="quote-label">终端引用 · {{ quote.lines }} 行</span>
-      <span class="quote-preview">{{ quote.text.split('\n')[0] }}</span>
-      <button class="quote-remove" title="移除引用" @click="quote = null">✕</button>
-    </div>
+    <!-- 大纲悬浮标签：fixed 定位 teleport 到 body（刻度无文字，标签是标题的唯一载体） -->
+    <Teleport to="body">
+      <div
+        v-if="outlineTip"
+        class="rail-tip"
+        :style="{ left: outlineTip.x + 'px', top: outlineTip.y + 'px' }"
+      >
+        <span class="rail-tip-dot" :class="outlineTip.entry.state"></span>
+        <span class="rail-tip-text">{{ outlineTip.entry.title }}</span>
+      </div>
+    </Teleport>
 
     <!-- 活动计划面板（M4 Plan-and-Act）：固定在输入框上方，执行进展始终可见；
          可折叠展开；授权弹窗出现时让位隐藏（授权优先，裁决完自动恢复） -->
@@ -1942,13 +3208,11 @@ const configHint = computed(() => {
     >
       <div class="plan-panel-head" @click="planCollapsed = !planCollapsed">
         <span class="plan-badge">
-          {{ activePlanMsg.plan.state === 'draft' ? '计划中' : '执行中' }}
+          {{ planBadgeText }}
         </span>
-        <span class="plan-goal" :title="activePlanMsg.plan.goal">🎯 {{ activePlanMsg.plan.goal }}</span>
+        <span class="plan-goal" :title="planHeadTitle">🎯 {{ planHeadTitle }}</span>
         <span class="plan-progress">
-          {{ activePlanMsg.plan.state === 'draft'
-            ? `${activePlanMsg.plan.steps.length} 步 · 待确认`
-            : `第 ${Math.min(activePlanMsg.plan.currentIndex + 1, activePlanMsg.plan.steps.length)}/${activePlanMsg.plan.steps.length} 步` }}
+          {{ planProgressText }}
         </span>
         <span class="plan-collapse-arrow" :class="{ open: !planCollapsed }">›</span>
       </div>
@@ -1967,7 +3231,7 @@ const configHint = computed(() => {
               </template>
             </span>
             <div class="plan-step-body">
-              <!-- draft 态：title/detail 可编辑（v-model 直绑源数据，确认即冻结快照） -->
+              <!-- draft 态：title 可编辑（一句话 todo，v-model 直绑源数据，确认即冻结快照） -->
               <template v-if="activePlanMsg.plan.state === 'draft'">
                 <input
                   v-model="s.title"
@@ -1976,25 +3240,9 @@ const configHint = computed(() => {
                   maxlength="50"
                   placeholder="步骤简述"
                 />
-                <textarea
-                  v-model="s.detail"
-                  class="plan-step-detail-input"
-                  rows="2"
-                  placeholder="步骤详情（做什么、验证什么）"
-                ></textarea>
               </template>
               <template v-else>
                 <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
-                <div v-if="s.detail" class="plan-step-detail">{{ s.detail }}</div>
-                <!-- 失败原因直接可见；done/skipped 结果折叠展示 -->
-                <div v-if="s.state === 'failed' && s.result" class="plan-step-error">{{ s.result }}</div>
-                <details
-                  v-else-if="s.result && (s.state === 'done' || s.state === 'skipped')"
-                  class="plan-step-result"
-                >
-                  <summary>结果</summary>
-                  <div class="plan-step-result-body">{{ s.result }}</div>
-                </details>
               </template>
             </div>
           </li>
@@ -2050,6 +3298,54 @@ const configHint = computed(() => {
             {{ planning ? '规划中…' : '重新规划' }}
           </button>
         </div>
+        <!-- cancelled → 确认收尾：面板消失（done 自动消失，由变更文件列表面板接替） -->
+        <div
+          v-else-if="activePlanMsg.plan.state === 'cancelled'"
+          class="plan-actions"
+        >
+          <button
+            type="button"
+            class="plan-btn primary"
+            @click="acknowledgePlan(activePlanMsg)"
+          >
+            确认
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 计划完成后的变更文件列表面板（接替计划面板）：左侧文件名，右侧 +n/-n；
+         可折叠，用户确认后消失；授权弹窗出现时让位隐藏 -->
+    <div
+      v-if="planFilesMsg && !authorizing"
+      class="plan-panel done files-panel"
+      :class="{ collapsed: planFilesCollapsed }"
+    >
+      <div class="plan-panel-head" @click="planFilesCollapsed = !planFilesCollapsed">
+        <span class="plan-badge">已完成</span>
+        <span class="plan-goal">变更文件</span>
+        <span class="plan-progress">{{ planFiles.length }} 个文件</span>
+        <span class="plan-collapse-arrow" :class="{ open: !planFilesCollapsed }">›</span>
+      </div>
+      <div v-show="!planFilesCollapsed" class="plan-panel-body">
+        <ul class="files-list">
+          <li v-for="f in planFiles" :key="f.path" class="files-row">
+            <span class="files-path" :title="f.path">{{ f.path }}</span>
+            <span class="files-diff">
+              <span v-if="f.added > 0" class="diff-add">+{{ f.added }}</span>
+              <span v-if="f.removed > 0" class="diff-del">-{{ f.removed }}</span>
+            </span>
+          </li>
+        </ul>
+        <div class="plan-actions">
+          <button
+            type="button"
+            class="plan-btn primary"
+            @click="acknowledgePlanFiles(planFilesMsg)"
+          >
+            确认
+          </button>
+        </div>
       </div>
     </div>
 
@@ -2074,7 +3370,11 @@ const configHint = computed(() => {
          数字键/Enter/Esc 快捷裁决，未裁决不能继续输入 -->
     <div v-if="authorizing" class="auth-wrap" role="alertdialog" aria-modal="true">
       <div class="auth-title">
-        ⚠ {{ authorizing.proposal.name === 'propose_command' ? '是否允许执行这个命令？' : '是否允许修改这个文件？' }}
+        ⚠ {{ authorizing.proposal.name === 'propose_command'
+          ? '是否允许执行这个命令？'
+          : authorizing.proposal.name === 'sftp_upload_file' || authorizing.proposal.name === 'sftp_download_file'
+            ? '是否允许传输这个文件？'
+            : '是否允许修改这个文件？' }}
       </div>
       <!-- propose_command：显示命令 -->
       <template v-if="authorizing.proposal.name === 'propose_command'">
@@ -2101,6 +3401,17 @@ const configHint = computed(() => {
           </span>
         </p>
       </template>
+      <!-- sftp_upload_file / sftp_download_file：路径对展示 -->
+      <template v-else-if="authorizing.proposal.name === 'sftp_upload_file' || authorizing.proposal.name === 'sftp_download_file'">
+        <p class="auth-sub">
+          AI 请求{{ authorizing.proposal.name === 'sftp_upload_file' ? '将本机文件上传到' : '下载远端文件到本机' }}当前 SSH 会话对应服务器
+        </p>
+        <p class="auth-sub file-edit-line" v-if="sftpPaths(authorizing.proposal)">
+          <code class="sftp-local">{{ sftpPaths(authorizing.proposal)!.local }}</code>
+          <span class="sftp-arrow">→</span>
+          <code class="sftp-remote">{{ sftpPaths(authorizing.proposal)!.remote }}</code>
+        </p>
+      </template>
       <div class="auth-choices">
         <button type="button" class="auth-choice" @click="resolveCurrent('once')">
           <span class="auth-num">1</span>仅本次执行<span class="auth-key">↵</span>
@@ -2119,55 +3430,189 @@ const configHint = computed(() => {
       </div>
     </div>
 
-    <!-- 输入区 -->
-    <div class="chat-input">
-      <!-- agent 执行权限档（仅工作台 scope）：manual 弱化默认，risky/full 变色提醒放权态 -->
-      <select
-        v-if="appView === 'workbench'"
-        v-model="execPermission"
-        class="perm-select"
-        :class="{ elevated: execPermission !== 'manual' }"
-        title="命令执行授权档：每次确认 / 低危自动 / 全自动"
-      >
-        <option value="manual">手动确认</option>
-        <option value="risky">低危自动</option>
-        <option value="full">全自动</option>
-      </select>
-      <!-- Plan 模式开关（仅工作台 scope；global 无终端可执行计划故置灰）。
-           消息级：仅作用于本次提交，发送后自动复位 -->
-      <button
-        v-if="appView === 'workbench'"
-        type="button"
-        class="plan-toggle"
-        :class="{ active: planMode }"
-        :disabled="scope === 'global' || streaming || planning"
-        :title="scope === 'global' ? '全局对话无终端可执行计划' : planMode ? '本次将先生成计划预览' : '规划模式：先生成计划，确认后执行'"
-        @click="planMode = !planMode"
-      >
-        Plan
-      </button>
-      <input
+    <!-- 输入区（composer）：大圆角容器；顶部上下文 chip 行 + 多行文本域 + 底部工具行。
+         粘贴 / 拖拽附件在此容器内捕获 -->
+    <div
+      class="composer"
+      :class="{ focus: composerFocused, dragging: dragActive }"
+      @paste="onPaste"
+      @dragenter="onDragEnter"
+      @dragover="onDragOver"
+      @dragleave="onDragLeave"
+      @drop.prevent="onDrop"
+    >
+      <!-- 上下文 chip 行：终端引用 + 附件（图片缩略图 / 文件图标） -->
+      <div v-if="quote || attachments.length" class="ctx-strip">
+        <div v-if="quote" class="ctx-chip quote-chip">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+          <span class="ctx-label">终端引用 · {{ quote.lines }} 行</span>
+          <span class="ctx-preview">{{ quote.text.split('\n')[0] }}</span>
+          <button class="ctx-remove" title="移除引用" @click="quote = null">✕</button>
+        </div>
+        <div
+          v-for="a in attachments"
+          :key="a.id"
+          class="ctx-chip"
+          :class="a.kind === 'text' ? 'file-chip' : 'img-chip'"
+          :title="a.name"
+        >
+          <img v-if="a.kind === 'image'" class="ctx-thumb" :src="a.dataUrl" :alt="a.name" />
+          <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
+          <span class="ctx-preview">{{ a.name }}</span>
+          <button class="ctx-remove" :title="a.kind === 'text' ? '移除文件' : '移除图片'" @click="removeAttachment(a.id)">✕</button>
+        </div>
+      </div>
+
+      <!-- 多行文本域：Enter 发送、Shift+Enter 换行；1~6 行自增高后内部滚动 -->
+      <textarea
         ref="inputRef"
         v-model="draft"
-        class="input"
-        type="text"
+        class="composer-input"
+        rows="1"
         :disabled="!!configHint || planning"
         :placeholder="configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…')"
         @keydown="onKeydown"
-      />
-      <button v-if="!streaming && !planning" class="send-btn" title="发送 (Enter)" @click="send()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="22" y1="2" x2="11" y2="13" />
-          <polygon points="22 2 15 22 11 13 2 9 22 2" />
-        </svg>
-      </button>
-      <button v-else-if="streaming" class="stop-btn" title="停止生成" @click="stop">
-        <span class="stop-square"></span>
-      </button>
-      <button v-else class="stop-btn" title="取消规划" @click="cancelPlanning">
-        <span class="stop-square"></span>
-      </button>
+        @focus="composerFocused = true"
+        @blur="composerFocused = false"
+      ></textarea>
+
+      <!-- 底部工具行：左侧 + 附件 / 权限档 / Plan，右侧发送（绿色圆形）/ 停止 -->
+      <div class="composer-bar">
+        <button
+          type="button"
+          class="icon-btn"
+          title="上传附件"
+          :disabled="!!configHint || planning || streaming"
+          @click="pickFiles"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+        <!-- agent 执行权限档（仅工作台 scope）：自定义下拉，每档带图标 + 标签/描述两行；
+             manual 弱化默认，risky/full 变色提醒放权态 -->
+        <div
+          v-if="appView === 'workbench'"
+          ref="permWrapRef"
+          class="perm-wrap"
+          :class="{ elevated: execPermission !== 'manual' }"
+        >
+          <button
+            type="button"
+            class="perm-trigger"
+            title="命令执行授权档：手动审批 / 低危自动 / 完全访问"
+            @click="permOpen = !permOpen"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"
+              />
+              <path v-if="execPermission === 'risky'" d="m9 12 2 2 4-4" />
+              <path v-else-if="execPermission === 'full'" d="m4 4 16 16" />
+            </svg>
+            <span>{{ currentPermLabel }}</span>
+            <svg
+              class="perm-caret"
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="m18 15-6-6-6 6" />
+            </svg>
+          </button>
+          <div v-if="permOpen" class="perm-menu">
+            <button
+              v-for="lv in PERM_LEVELS"
+              :key="lv.value"
+              type="button"
+              class="perm-item"
+              :class="{ active: execPermission === lv.value }"
+              @click="pickPerm(lv.value)"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"
+                />
+                <path v-if="lv.value === 'risky'" d="m9 12 2 2 4-4" />
+                <path v-else-if="lv.value === 'full'" d="m4 4 16 16" />
+              </svg>
+              <span class="perm-item-text">
+                <span class="perm-item-label">{{ lv.label }}</span>
+                <span class="perm-item-desc">{{ lv.desc }}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+        <!-- Plan 模式开关（仅工作台 scope；global 无终端可执行计划故置灰）。
+             消息级：仅作用于本次提交，发送后自动复位 -->
+        <button
+          v-if="appView === 'workbench'"
+          type="button"
+          class="plan-toggle"
+          :class="{ active: planMode }"
+          :disabled="scope === 'global' || streaming || planning"
+          :title="scope === 'global' ? '全局对话无终端可执行计划' : planMode ? '本次将先生成计划预览' : '规划模式：先生成计划，确认后执行'"
+          @click="planMode = !planMode"
+        >
+          Plan
+        </button>
+        <div class="bar-spacer"></div>
+        <button v-if="!streaming && !planning" class="send-btn" title="发送 (Enter)" @click="send()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="19" x2="12" y2="5" />
+            <polyline points="5 12 12 5 19 12" />
+          </svg>
+        </button>
+        <button v-else-if="streaming" class="stop-btn" title="停止生成" @click="stop">
+          <span class="stop-square"></span>
+        </button>
+        <button v-else class="stop-btn" title="取消规划" @click="cancelPlanning">
+          <span class="stop-square"></span>
+        </button>
+        <!-- 隐藏文件选择 input（点击 + 触发）：图片 MIME + 文本/代码扩展名 -->
+        <input
+          ref="fileInputEl"
+          type="file"
+          :accept="FILE_ACCEPT"
+          multiple
+          class="file-hidden"
+          @change="onFilePicked"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -2182,9 +3627,18 @@ const configHint = computed(() => {
   overflow: hidden;
 }
 
-/* 消息列表 */
+/* 消息列表包裹：全宽容器，仅作刻度导轨定位基准（消息区 760px 限宽居中在 .chat-scroll 上） */
+.chat-wrap {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  position: relative;
+  display: flex;
+}
+/* 消息列表（布局同会话大纲引入前：760px 限宽居中、padding 12px；导轨不占消息区空间） */
 .chat-scroll {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 10px 12px;
@@ -2201,6 +3655,144 @@ const configHint = computed(() => {
 .chat-scroll::-webkit-scrollbar-thumb {
   background: #1c2836;
   border-radius: 3px;
+}
+
+/* ---------- 会话大纲刻度导轨 ---------- */
+/* 导轨容器：置于消息区（760px 居中）左侧 margin 空隙，右缘距消息区左缘 12px；
+   414px = 760/2 + 22 导轨宽 + 12 间距；面板过窄（margin 不足）时由宽度阈值整体隐藏 */
+.rail-shell {
+  position: absolute;
+  left: calc(50% - 414px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  max-height: 215px; /* 10×14 行高 + 9×7 间距 + 12 上下内边距 = 最多 10 个刻度可见 */
+  display: flex;
+  animation: rail-in 0.16s ease-out;
+}
+@keyframes rail-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.rail {
+  overflow-y: auto;
+  scrollbar-width: none;
+  max-height: inherit;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 6px 0;
+}
+.rail::-webkit-scrollbar { display: none; }
+/* 上下淡出遮罩：可滚且未贴顶/贴底时提示还能继续滚（与面板背景同色渐变） */
+.rail-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 16px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.rail-fade.top { top: 0; background: linear-gradient(180deg, var(--panel), transparent); }
+.rail-fade.bottom { bottom: 0; background: linear-gradient(0deg, var(--panel), transparent); }
+.rail-shell.can-scroll:not(.at-top) .rail-fade.top { opacity: 1; }
+.rail-shell.can-scroll:not(.at-bottom) .rail-fade.bottom { opacity: 1; }
+/* 刻度：行高 14px 扩大 hover/focus 热区（横线自身仅 2~3px，热区不足难以命中） */
+.tick {
+  height: 14px;
+  width: 100%;
+  flex: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+.tick::before {
+  content: '';
+  display: block;
+  width: 16px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border);
+  transition:
+    width 0.26s cubic-bezier(0.4, 0, 0.2, 1),
+    height 0.26s cubic-bezier(0.4, 0, 0.2, 1),
+    background 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.tick.past::before { background: var(--muted-2); }
+.tick:hover::before,
+.tick:focus-visible::before {
+  width: 20px;
+  background: var(--muted);
+}
+.tick.active::before {
+  width: 22px;
+  height: 3px;
+  background: rgb(var(--accent-rgb));
+}
+.tick.active:hover::before,
+.tick.active:focus-visible::before {
+  width: 22px;
+  background: rgb(var(--accent-rgb));
+}
+/* 大纲悬浮标签（teleport 到 body）：状态点 + 标题，单行省略 */
+.rail-tip {
+  position: fixed;
+  transform: translateY(-50%);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 240px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  animation: rail-tip-in 0.16s ease-out;
+}
+@keyframes rail-tip-in {
+  from { opacity: 0; transform: translate(-5px, -50%); }
+  to { opacity: 1; transform: translate(0, -50%); }
+}
+.rail-tip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+.rail-tip-dot.waiting { background: var(--rhost-status-idle); }
+.rail-tip-dot.running {
+  background: var(--rhost-status-processing);
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.rail-tip-dot.done { background: var(--rhost-status-success); }
+.rail-tip-dot.error { background: var(--rhost-status-error); }
+.rail-tip-dot.stopped { background: var(--rhost-status-warning); }
+.rail-tip-text {
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 大纲定位：锚点距消息区顶 40px 呼吸位；点击刻度后目标 bubble 闪烁反馈 */
+.chat-scroll .bubble.user { scroll-margin-top: 40px; }
+.bubble.user.flash .bubble-body,
+.bubble.user.flash .bubble-images,
+.bubble.user.flash .bubble-files {
+  border-radius: 10px;
+  animation: outline-flash 1.1s ease-out;
+}
+@keyframes outline-flash {
+  0% { box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.2); }
+  100% { box-shadow: 0 0 0 8px rgba(var(--accent-rgb), 0); }
 }
 
 /* 空态 */
@@ -2274,6 +3866,52 @@ const configHint = computed(() => {
 .bubble.user .bubble-foot {
   justify-content: flex-end;
 }
+/* 用户消息图片附件缩略图行 */
+.bubble-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+/* 用户消息文本/代码文件附件行 */
+.bubble-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+.bubble-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 240px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.bubble-file svg {
+  flex-shrink: 0;
+  color: var(--green);
+}
+.bubble-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bubble-thumb {
+  width: 84px;
+  height: 84px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+}
 .bubble.assistant {
   align-self: stretch;
   background: transparent;
@@ -2282,15 +3920,6 @@ const configHint = computed(() => {
 }
 .bubble.assistant.error .md {
   color: #e57a7a;
-}
-/* 回复组内的后续消息（工具循环中间轮）：无独立 logo 头，间距收紧为连续回复
-   （flex gap 14px - 8px = 视觉 6px，与提案卡片的内部间距一致） */
-.bubble.assistant.grouped {
-  margin-top: -8px;
-  padding-top: 0;
-}
-.bubble.assistant.grouped .msg-head {
-  display: none;
 }
 /* ---------- 命令授权弹窗（输入框上方，占据布局不遮挡消息） ---------- */
 .auth-wrap {
@@ -2505,6 +4134,52 @@ const configHint = computed(() => {
   color: var(--muted);
   font-size: 11.5px;
 }
+/* SFTP 传输：路径对 + 进度条 */
+.sftp-paths {
+  flex-wrap: wrap;
+  font-size: 11.5px;
+}
+.sftp-paths code,
+.file-edit-line code {
+  font-family: var(--mono);
+  color: var(--muted);
+  word-break: break-all;
+}
+.sftp-local {
+  color: var(--muted);
+}
+.sftp-remote {
+  color: var(--text);
+}
+.sftp-arrow {
+  color: var(--accent);
+  flex: none;
+}
+.sftp-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+.sftp-progress-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.sftp-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.sftp-progress-text {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
 /* 弹窗中文件编辑单行布局 */
 .file-edit-line {
   display: flex;
@@ -2518,40 +4193,11 @@ const configHint = computed(() => {
   white-space: nowrap;
 }
 
-/* ---- 执行计划卡片（M4 Plan-and-Act）：与授权弹窗同一视觉语言 ---- */
-.plan-card {
-  border: 1px solid rgba(86, 156, 214, 0.4);
-  border-radius: 10px;
-  padding: 8px 10px;
-  margin-top: 6px;
-  max-width: 94%;
-  background: var(--panel-2);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.plan-card.cancelled {
-  opacity: 0.55;
-}
-.plan-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-}
+/* ---- 执行计划（M4 Plan-and-Act）：悬浮面板 + 步骤列表 ---- */
 .plan-badge {
   flex-shrink: 0;
   font-weight: 600;
   color: #569cd6;
-}
-.plan-card.executing .plan-badge {
-  animation: reasoning-pulse 1.2s ease-in-out infinite;
-}
-.plan-card.done .plan-badge {
-  color: var(--green);
-}
-.plan-card.cancelled .plan-badge {
-  color: var(--muted);
 }
 .plan-goal {
   overflow: hidden;
@@ -2612,33 +4258,8 @@ const configHint = computed(() => {
 .plan-step.running .plan-step-title {
   color: #569cd6;
 }
-.plan-step-detail {
-  color: var(--muted);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.plan-step-error {
-  color: #e57a7a;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.plan-step-result summary {
-  cursor: pointer;
-  color: var(--muted);
-  user-select: none;
-}
-.plan-step-result summary:hover {
-  color: var(--text);
-}
-.plan-step-result-body {
-  margin-top: 4px;
-  color: var(--muted);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
 /* draft 态编辑输入框 */
-.plan-step-title-input,
-.plan-step-detail-input {
+.plan-step-title-input {
   width: 100%;
   box-sizing: border-box;
   background: var(--panel);
@@ -2650,18 +4271,13 @@ const configHint = computed(() => {
   outline: none;
   font-family: inherit;
 }
-.plan-step-detail-input {
-  resize: vertical;
-  min-height: 32px;
-  line-height: 1.45;
-}
-.plan-step-title-input:focus,
-.plan-step-detail-input:focus {
+.plan-step-title-input:focus {
   border-color: #569cd6;
 }
-/* 操作按钮行 */
+/* 操作按钮行（规划面板 / 文件变更面板共用）：按钮统一靠右对齐 */
 .plan-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
 }
@@ -2696,11 +4312,11 @@ const configHint = computed(() => {
 /* ---- 活动计划面板：固定输入框上方，可折叠，授权弹窗出现时让位（v-if 隐藏） ---- */
 .plan-panel {
   flex-shrink: 0;
-  /* 与授权弹窗/输入区同宽居中 */
-  width: 100%;
-  max-width: 760px;
+  /* 与输入框同宽居中；上与消息区、下与输入框各留 8px 空白（下方由 composer 上 margin 叠加） */
+  width: calc(100% - 20px);
+  max-width: 740px;
   box-sizing: border-box;
-  margin: 0 auto 6px;
+  margin: 8px auto 0;
   border: 1px solid rgba(86, 156, 214, 0.4);
   border-radius: 10px;
   background: var(--panel);
@@ -2719,8 +4335,16 @@ const configHint = computed(() => {
 .plan-panel-head .plan-badge {
   animation: reasoning-pulse 1.2s ease-in-out infinite;
 }
-.plan-panel.draft .plan-badge {
+.plan-panel.draft .plan-badge,
+.plan-panel.done .plan-badge,
+.plan-panel.cancelled .plan-badge {
   animation: none;
+}
+.plan-panel.done .plan-badge {
+  color: var(--green);
+}
+.plan-panel.cancelled .plan-badge {
+  color: var(--muted);
 }
 .plan-progress {
   margin-left: auto;
@@ -2743,6 +4367,38 @@ const configHint = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* ---- 变更文件列表面板：左侧路径（超长省略），右侧 +n/-n ---- */
+.files-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.files-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  color: var(--text);
+}
+.files-diff {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--mono);
 }
 
 /* Plan 模式开关：与权限档下拉同一弱化风格，激活时蓝色高亮 */
@@ -2795,62 +4451,9 @@ const configHint = computed(() => {
   color: var(--text);
 }
 
-/* 思考过程（流式时自动展开，content 到达后自动收起；› 指示展开方向） */
-.reasoning {
-  margin-bottom: 6px;
-  font-size: 11px;
-}
-.reasoning-toggle {
-  cursor: pointer;
-  color: var(--muted-2);
-  user-select: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.reasoning-arrow {
-  font-size: 12px;
-  line-height: 1;
-  transition: transform 0.15s;
-}
-.reasoning.open .reasoning-arrow {
-  transform: rotate(90deg);
-}
-.reasoning.open .reasoning-toggle {
-  margin-bottom: 4px;
-}
-.reasoning-thinking {
-  color: var(--accent);
-  animation: reasoning-pulse 1.2s ease-in-out infinite;
-}
 @keyframes reasoning-pulse {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
-}
-.reasoning-body {
-  color: var(--muted);
-  border-left: 2px solid var(--border);
-  padding-left: 8px;
-}
-
-/* 流式等待动画 */
-.typing {
-  display: inline-flex;
-  gap: 4px;
-  padding: 4px 2px;
-}
-.typing span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--muted-2);
-  animation: typing-blink 1.2s infinite ease-in-out;
-}
-.typing span:nth-child(2) { animation-delay: 0.2s; }
-.typing span:nth-child(3) { animation-delay: 0.4s; }
-@keyframes typing-blink {
-  0%, 60%, 100% { opacity: 0.25; }
-  30% { opacity: 1; }
 }
 
 .bubble-foot {
@@ -2891,38 +4494,78 @@ const configHint = computed(() => {
   margin-left: 4px;
 }
 
-/* 终端引用块 */
-.quote-bar {
+/* 输入区（composer）：大圆角容器，含上下文 chip 行 + 多行文本域 + 底部工具行 */
+.composer {
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 6px;
+  margin: 8px auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel-2);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  /* 与消息列表同宽居中 */
+  width: calc(100% - 20px);
+  max-width: 740px;
+  box-sizing: border-box;
+}
+.composer.focus {
+  border-color: var(--green);
+}
+/* 拖拽悬停：高亮提示可放置图片 */
+.composer.dragging {
+  border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(61, 220, 132, 0.25);
+}
+
+/* 上下文 chip 行：终端引用 + 图片附件（有则显示，可换行） */
+.ctx-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ctx-chip {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 6px 10px 0;
-  padding: 4px 8px;
+  max-width: 240px;
+  padding: 3px 6px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--panel-2);
+  background: var(--panel);
   color: var(--muted-2);
   font-size: 11px;
 }
-.quote-bar svg {
+.ctx-chip svg {
   color: var(--green);
   flex-shrink: 0;
 }
-.quote-label {
+.ctx-label {
   flex-shrink: 0;
   color: var(--green);
 }
-.quote-preview {
+.ctx-preview {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--mono);
   font-size: 10.5px;
 }
-.quote-remove {
+.quote-chip .ctx-preview,
+.file-chip .ctx-preview {
+  font-family: var(--mono);
+}
+.ctx-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.ctx-remove {
   flex-shrink: 0;
   border: none;
   background: transparent;
@@ -2932,68 +4575,276 @@ const configHint = computed(() => {
   padding: 1px 4px;
   border-radius: 4px;
 }
-.quote-remove:hover {
+.ctx-remove:hover {
   color: var(--text);
   background: rgba(255, 255, 255, 0.06);
 }
 
-/* 输入区 */
-.chat-input {
-  flex-shrink: 0;
-  padding: 8px 10px;
-  border-top: 1px solid var(--border);
+/* 多行文本域：无边框融入 composer，1~6 行自增高后内部滚动 */
+.composer-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: none;
+  background: transparent;
+  padding: 2px 2px;
+  font-size: 12px;
+  line-height: 1.45;
+  font-family: inherit;
+  color: var(--text);
+  outline: none;
+  max-height: 132px;
+  overflow-y: auto;
+}
+.composer-input::placeholder {
+  color: var(--muted-2);
+}
+.composer-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 底部工具行 */
+.composer-bar {
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--panel);
-  /* 与消息列表同宽居中 */
-  width: 100%;
-  max-width: 760px;
-  margin: 0 auto;
-  box-sizing: border-box;
 }
-.input {
+.bar-spacer {
   flex: 1;
-  min-width: 0;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--text);
-  outline: none;
-  transition: border-color 0.15s;
 }
-/* agent 执行权限档下拉：manual 弱化融入输入区，放权档黄色警示 */
-.perm-select {
-  flex: none;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 6px 4px;
+/* ---- 回复组头部：任务耗时行 + 执行过程折叠区 ---- */
+/* 任务耗时行：整组耗时，可点击展开执行过程 */
+.task-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
   font-size: 11px;
   color: var(--muted);
+  user-select: none;
+}
+.task-meta.clickable {
+  cursor: pointer;
+}
+.task-meta.clickable:hover {
+  color: var(--text);
+}
+.task-clock {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.task-elapsed {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.task-running {
+  color: var(--accent);
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.trace-arrow {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted-2);
+  transition: transform 0.15s;
+}
+.trace-arrow.open {
+  transform: rotate(90deg);
+}
+/* 执行过程折叠区：左侧竖线串联思考/规划/工具记录 */
+.trace {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding-left: 9px;
+  border-left: 2px solid var(--border);
+}
+.trace-block {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+.trace-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted-2);
+  letter-spacing: 0.02em;
+}
+.trace-body {
+  color: var(--muted);
+}
+/* Plan 步骤分隔条：执行过程区内标识该组轮次所属的执行步骤 */
+.round-sep {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 2px 0;
+  font-size: 10.5px;
+  color: var(--muted-2);
+}
+.round-sep-num {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--muted);
+}
+.round-sep-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 每轮思考过程折叠标签：可点击切换（手动优先于自动展开/收起） */
+.reasoning-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+.reasoning-toggle:hover {
+  color: var(--text);
+}
+/* 思考中脉冲标签（该轮 reasoning 流式且正文未到达时的自动展开态标识） */
+.think-pulse {
+  color: var(--accent);
+  animation: reasoning-pulse 1.2s ease-in-out infinite;
+}
+.trace-pre {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
+}
+/* 结果分隔线：隔开执行过程与最终结果 */
+.result-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0 0 8px;
+}
+/* 附件（+）图标按钮 */
+.icon-btn {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+/* 隐藏的文件选择 input */
+.file-hidden {
+  display: none;
+}
+/* agent 执行权限档下拉：触发按钮弱化融入输入区，放权档黄色警示；菜单上弹 */
+.perm-wrap {
+  flex: none;
+  position: relative;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+}
+.perm-wrap.elevated {
+  color: var(--yellow);
+}
+.perm-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: inherit;
   outline: none;
   cursor: pointer;
 }
-.perm-select.elevated {
-  color: var(--yellow);
+.perm-wrap.elevated .perm-trigger {
   border-color: var(--yellow);
 }
-.input::placeholder {
-  color: var(--muted-2);
-}
-.input:focus {
-  border-color: var(--green);
-}
-.input:disabled {
+.perm-caret {
+  margin-left: 2px;
   opacity: 0.6;
-  cursor: not-allowed;
+}
+.perm-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 210px;
+  width: max-content;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 1000;
+}
+.perm-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.perm-item:hover {
+  background: var(--hover);
+}
+.perm-item.active {
+  color: var(--yellow);
+}
+.perm-item svg {
+  flex: none;
+  margin-top: 1px;
+}
+.perm-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.perm-item-label {
+  font-size: 12px;
+  line-height: 1.3;
+}
+.perm-item-desc {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--muted);
+  white-space: nowrap;
 }
 .send-btn {
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: 50%;
   display: grid;
   place-items: center;
   background: var(--green);

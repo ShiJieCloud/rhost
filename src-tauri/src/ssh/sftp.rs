@@ -382,6 +382,7 @@ impl SshSession {
         remote_path: String,
         chunk_kb: Option<u32>,
         resume: Option<bool>,
+        max_bytes: Option<u64>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let chunk = chunk_kb
@@ -428,6 +429,20 @@ impl SshSession {
                     )
                 })?
                 .len();
+
+            // 体积上限预检：在打开远端文件写入前拒绝，避免生成残留的远端空/截断文件
+            if let Some(max) = max_bytes {
+                if total > max {
+                    return Err((
+                        SshError::TransferRejected(format!(
+                            "文件 {:.1}MB 超过 AI 传输上限（64MB），请通过 SFTP 文件面板手动传输，不要使用 scp/rsync 等命令行传输",
+                            total as f64 / 1024.0 / 1024.0
+                        )),
+                        0u64,
+                        total,
+                    ));
+                }
+            }
 
             // 断点续传：探测远端已有大小，决定续写起点
             let remote_size = match sftp.lstat(&remote_path).await {
@@ -551,6 +566,7 @@ impl SshSession {
         local_path: String,
         chunk_kb: Option<u32>,
         resume: Option<bool>,
+        max_bytes: Option<u64>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let chunk = chunk_kb
@@ -595,6 +611,20 @@ impl SshSession {
                 })?
                 .attrs;
             let total = attrs.size.unwrap_or(0);
+
+            // 体积上限预检：在创建本地文件前拒绝，避免生成残留的本地空/截断文件
+            if let Some(max) = max_bytes {
+                if total > max {
+                    return Err((
+                        SshError::TransferRejected(format!(
+                            "文件 {:.1}MB 超过 AI 传输上限（64MB），请通过 SFTP 文件面板手动传输，不要使用 scp/rsync 等命令行传输",
+                            total as f64 / 1024.0 / 1024.0
+                        )),
+                        0u64,
+                        total,
+                    ));
+                }
+            }
 
             // 断点续传：探测本地已有大小，决定续写起点
             let local_size = tokio::fs::metadata(&local)

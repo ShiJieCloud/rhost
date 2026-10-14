@@ -105,6 +105,9 @@ pub enum SshError {
     Closed,
     #[error("传输已取消")]
     Cancelled,
+    /// 传输因业务规则被拒绝（如超出体积上限），payload 直接透传给前端展示
+    #[error("{0}")]
+    TransferRejected(String),
     /// 端口转发错误：payload 携带前后端约定的协议前缀（`TUNNEL_RUNNING:` /
     /// `TUNNEL_BAD_RULE:` / `TUNNEL_PORT_IN_USE:` / `TUNNEL_REMOTE_DENIED:` /
     /// `TUNNEL_LIMIT:`），前端据此分流 toast 文案与批量策略，不得改为普通文案

@@ -109,6 +109,10 @@ pub fn run() {
             .resizable(true)
             .decorations(cfg!(target_os = "macos"))
             .transparent(cfg!(target_os = "macos"))
+            // 关闭 Tauri 的拖放处理器：Tauri 默认拦截 OS 文件拖放并改发自身事件，
+            // 使 webview 收不到携带 File 的 HTML5 drop 事件。AI 输入区依赖 HTML5 拖放
+            // 采集图片附件，故放开由 webview 原生处理（前端无 Tauri 拖放事件消费方）
+            .disable_drag_drop_handler()
             .initialization_script(&boot_script);
 
             #[cfg(target_os = "macos")]
@@ -265,7 +269,7 @@ pub fn run() {
             ai::ai_stop_chat,
             ai::ai_test_connection,
             ai::ai_set_api_key,
-            ai::ai_has_api_key,
+            ai::ai_get_api_key,
             ai::ai_save_chat,
             ai::ai_load_chat,
             ai::ai_clear_chat,

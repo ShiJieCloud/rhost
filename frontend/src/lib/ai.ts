@@ -21,12 +21,52 @@ export interface AiToolCall {
   function: { name: string; arguments: string }
 }
 
+/** OpenAI 兼容 content part（多模态：文本 / 图片 data URL），后端原样透传 */
+export type AiContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
+/** 图片附件（落盘与回显形态，字段 camelCase）。
+ *  dataUrl 为客户端压缩后的 data URL，既是回显来源也是发送时的 image_url.url */
+export interface AiImageAttachment {
+  id: string
+  /** 附件类型判别（与 AiTextAttachment 组成联合类型） */
+  kind: 'image'
+  /** 压缩后 data URL（image/png / image/jpeg / image/webp） */
+  dataUrl: string
+  /** 展示名：拖拽/选择取文件名；粘贴为「粘贴的图片」 */
+  name: string
+  /** 压缩后近似字节数（base64 长度换算） */
+  sizeBytes: number
+  width: number
+  height: number
+}
+
+/** 文本/代码附件：按 UTF-8 读入纯文本，发送时内联为 `<file name="…">…</file>` 块
+ *  并入 user 文本（不占用 content parts，兼容所有模型）；落盘即纯文本 */
+export interface AiTextAttachment {
+  id: string
+  /** 附件类型判别 */
+  kind: 'text'
+  /** 展示名（文件名，含扩展名） */
+  name: string
+  /** 原始文件字节数 */
+  sizeBytes: number
+  /** UTF-8 文本内容 */
+  text: string
+}
+
+/** 输入区待发送附件：图片 | 文本/代码文件 */
+export type AiAttachment = AiImageAttachment | AiTextAttachment
+
 /** 发给模型的消息（与 OpenAI 消息同构，后端透传）。
  *  tool 角色用于回传工具执行结果（content 为结果文本，tool_call_id 关联提案）；
- *  assistant 携带 tool_calls 时 content 为 null */
+ *  assistant 携带 tool_calls 时 content 为 null；
+ *  含图 user 消息 content 为 content parts 数组（`[{type:'text'},{type:'image_url'}]`），
+ *  纯文本消息仍为字符串（不升级为数组，兼容且省体积） */
 export interface AiWireMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
-  content: string | null
+  content: string | AiContentPart[] | null
   tool_calls?: AiToolCall[]
   tool_call_id?: string
 }
@@ -48,6 +88,8 @@ export interface AiToolProposal {
   execOutput?: string
   /** pending 等待裁决 / accepted 已处理 / rejected 已拒绝 / expired 用户忽略后失效 */
   state: 'pending' | 'accepted' | 'rejected' | 'expired'
+  /** SFTP 传输进度（sftp_upload_file / sftp_download_file 执行中由 Channel 事件实时更新） */
+  progress?: { transferred: number; total: number; speed: number; done: boolean }
 }
 
 /** 前端持久化的消息（比 wire 多 id/状态/思考过程） */
@@ -57,10 +99,23 @@ export interface AiChatMessage {
   content: string
   /** 模型思考过程（reasoning_content），独立存储以支持折叠可视化 */
   reasoning?: string
+  /** 执行过程的自由文本轨迹（如规划阶段的流式输出原文）：随会话落盘，
+   *  仅用于「执行过程」区展示，不参与任何上行上下文装配 */
+  trace?: string
+  /** 本轮任务总耗时（ms）：一次用户输入触发的整段回复（含工具循环/计划各步）的墙钟时长。
+   *  由前端在回复落定时写入组内最后一条 assistant 消息，随会话落盘 */
+  elapsedMs?: number
   /** 工具提案（M2.3）：assistant 消息携带的 propose_command 提案卡片状态 */
   toolProposals?: AiToolProposal[]
   /** 执行计划（M4 Plan-and-Act）：规划模式生成的计划卡片状态 */
   plan?: AiPlan
+  /** Plan 执行步标识：该消息所属计划步骤下标（执行步续跑轮继承同值），
+   *  用于过程区步骤分隔条；planner/总结轮消息无此字段，旧数据亦无 */
+  stepIndex?: number
+  /** 图片附件（多模态输入）：随消息落盘与回显；含图消息发送时装配为 content parts */
+  images?: AiImageAttachment[]
+  /** 文本/代码附件：随消息落盘与回显；发送时内联为 `<file>` 块并入 user 文本 */
+  files?: AiTextAttachment[]
   /** streaming：流式生成中；done：完成；error：出错；stopped：用户中止 */
   status: 'streaming' | 'done' | 'error' | 'stopped'
   createdAt: number
@@ -90,6 +145,10 @@ export interface AiPlan {
   currentIndex: number
   /** draft 待确认 / executing 执行中 / done 全部落定 / cancelled 已取消 */
   state: 'draft' | 'executing' | 'done' | 'cancelled'
+  /** done/cancelled 后用户是否已确认收尾（true 则悬浮面板消失，不进消息流） */
+  acknowledged?: boolean
+  /** done 后变更文件列表面板是否已确认（true 则面板消失） */
+  filesAcknowledged?: boolean
 }
 
 /** 后端计划生成结果（serde camelCase） */
@@ -97,9 +156,14 @@ export interface AiPlanGenResult {
   steps: { title: string; detail: string }[]
 }
 
-/** 生成执行计划：非流式单次调用，模型输出经后端宽松解析为 3~8 步数组 */
-export function aiPlanGenerate(scope: AiScope, question: string): Promise<AiPlanGenResult> {
-  return invoke('ai_plan_generate', { scope, question })
+/** 生成执行计划：非流式单次调用，模型输出经后端宽松解析为 3~8 步数组。
+ *  content 与对话链路同构：纯文本（文本/代码附件已内联为 `<file>` 块）传字符串，
+ *  含图片时传 content parts 数组 */
+export function aiPlanGenerate(
+  scope: AiScope,
+  content: string | AiContentPart[],
+): Promise<AiPlanGenResult> {
+  return invoke('ai_plan_generate', { scope, content })
 }
 
 /** 落盘的会话记录（后端原样存取） */
@@ -210,9 +274,9 @@ export function aiSetApiKey(key: string): Promise<void> {
   return invoke('ai_set_api_key', { key })
 }
 
-/** 钥匙串中是否已保存 API Key */
-export function aiHasApiKey(): Promise<boolean> {
-  return invoke<boolean>('ai_has_api_key')
+/** 读取钥匙串中的 API Key 明文（设置面板回显用；空串表示未保存） */
+export function aiGetApiKey(): Promise<string> {
+  return invoke<string>('ai_get_api_key')
 }
 
 /** 覆盖保存一条会话记录 */

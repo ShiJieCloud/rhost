@@ -181,8 +181,10 @@ pub fn assemble_export(
         }
         ExportScope::Full => {
             data.insert("connections".into(), Value::Array(connections));
-            // settings：磁盘节覆盖内置默认（缺字段补默认，未知字段保留）
-            let settings = merge_settings_default(&cfg.settings);
+            // settings：磁盘节覆盖内置默认（缺字段补默认，未知字段保留）；
+            // AI 模块设置不参与导出
+            let mut settings = merge_settings_default(&cfg.settings);
+            strip_ai_settings(&mut settings);
             data.insert("settings".into(), settings);
             data.insert("keys".into(), strip_keys_sensitive(&cfg.keys));
             data.insert("groups".into(), cfg.groups.clone());
@@ -245,6 +247,35 @@ fn merge_settings_default(disk: &Value) -> Value {
         }
         (_, Value::Object(_)) => disk.clone(),
         _ => persisted::default_settings_value(),
+    }
+}
+
+/// AI 模块的设置键：不参与配置导入导出（API Key 存钥匙串本就不落配置，
+/// Base URL/模型/技能规则开关等与设备环境绑定，跨机迁移无意义）。
+pub(crate) const AI_SETTINGS_KEYS: &[&str] = &[
+    "aiEnabled",
+    "aiProvider",
+    "aiBaseUrl",
+    "aiApiKey",
+    "aiModel",
+    "aiSkillsEnabled",
+    "aiSkillsDisabled",
+    "aiRulesEnabled",
+    "aiRulesDisabled",
+    "aiMemoryEnabled",
+    "aiMemoryLimit",
+    "aiMultilineExec",
+    "aiAutoReturnOutput",
+    "aiExecConfirmMode",
+    "aiRiskKeywords",
+];
+
+/// 从 settings 对象中原地剔除 AI 模块设置键（非对象则无操作）
+fn strip_ai_settings(settings: &mut Value) {
+    if let Some(obj) = settings.as_object_mut() {
+        for k in AI_SETTINGS_KEYS {
+            obj.remove(*k);
+        }
     }
 }
 
@@ -484,9 +515,11 @@ pub fn prepare_import(
             out_cfg.keys = merged_keys.value;
         }
 
-        // 5.4 设置（关键；键级合并 + 跨平台快捷键过滤）
+        // 5.4 设置（关键；键级合并 + 跨平台快捷键过滤）；AI 模块设置不参与导入
         if let Some(settings_v) = data.get("settings") {
-            let merged = merge_settings(&out_cfg.settings, settings_v)
+            let mut incoming = settings_v.clone();
+            strip_ai_settings(&mut incoming);
+            let merged = merge_settings(&out_cfg.settings, &incoming)
                 .map_err(|e| ImportError::parse("settings", e))?;
             summary.settings_changed = merged.renamed;
             out_cfg.settings = merged.value;
@@ -890,6 +923,54 @@ mod tests {
         assert_eq!(v["data"]["settings"]["uiTheme"], "light"); // 磁盘覆盖
         assert_eq!(v["data"]["settings"]["motd"], true); // 默认补齐
         assert_eq!(v["data"]["settings"]["futureField"], 7); // 未知保留
+    }
+
+    #[test]
+    fn export_strips_ai_settings() {
+        let mut cfg = AppConfigFile::default();
+        cfg.settings = serde_json::json!({
+            "uiTheme": "light",
+            "aiEnabled": true,
+            "aiBaseUrl": "https://api.example.com/v1",
+            "aiModel": "gpt-4o-mini",
+        });
+        let doc = assemble_export(
+            &[],
+            &cfg,
+            ExportScope::Full,
+            false,
+            false,
+            "1.0.0",
+            "ts",
+            "h",
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&doc.json).unwrap();
+        let s = &v["data"]["settings"];
+        assert_eq!(s["uiTheme"], "light"); // 非 AI 键保留
+        assert!(s.get("aiEnabled").is_none());
+        assert!(s.get("aiBaseUrl").is_none());
+        assert!(s.get("aiModel").is_none());
+    }
+
+    #[test]
+    fn import_ignores_ai_settings() {
+        let mut existing = AppConfigFile::default();
+        existing.settings = serde_json::json!({
+            "uiTheme": "dark",
+            "aiBaseUrl": "https://local.example/v1"
+        });
+        let file = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "data": {
+                "settings": {"uiTheme": "light", "aiBaseUrl": "https://other.example/v1"}
+            }
+        });
+        let p = prepare_import(&file.to_string(), &[], &existing, false, None).unwrap();
+        assert_eq!(p.app_config.settings["uiTheme"], "light"); // 非 AI 键正常导入
+        // AI 键被忽略：保留本地值，不计入 settings_changed
+        assert_eq!(p.app_config.settings["aiBaseUrl"], "https://local.example/v1");
+        assert_eq!(p.summary.settings_changed, 1);
     }
 
     #[test]

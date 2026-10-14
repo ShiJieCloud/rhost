@@ -197,13 +197,22 @@ impl SessionManager {
         remote_path: String,
         chunk_kb: Option<u32>,
         resume: Option<bool>,
+        max_bytes: Option<u64>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
             Some(s) => {
-                s.upload_file(task_id, local_path, remote_path, chunk_kb, resume, channel)
-                    .await
+                s.upload_file(
+                    task_id,
+                    local_path,
+                    remote_path,
+                    chunk_kb,
+                    resume,
+                    max_bytes,
+                    channel,
+                )
+                .await
             }
             None => Err(SshError::NotFound),
         }
@@ -218,13 +227,22 @@ impl SessionManager {
         local_path: String,
         chunk_kb: Option<u32>,
         resume: Option<bool>,
+        max_bytes: Option<u64>,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
         match session {
             Some(s) => {
-                s.download_file(task_id, remote_path, local_path, chunk_kb, resume, channel)
-                    .await
+                s.download_file(
+                    task_id,
+                    remote_path,
+                    local_path,
+                    chunk_kb,
+                    resume,
+                    max_bytes,
+                    channel,
+                )
+                .await
             }
             None => Err(SshError::NotFound),
         }

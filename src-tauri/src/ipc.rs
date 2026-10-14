@@ -392,6 +392,7 @@ pub async fn sftp_upload(
     remote_path: String,
     chunk_kb: Option<u32>,
     resume: Option<bool>,
+    max_bytes: Option<u64>,
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
@@ -405,6 +406,7 @@ pub async fn sftp_upload(
             remote_path,
             chunk_kb,
             resume,
+            max_bytes,
             channel,
         )
         .await
@@ -423,6 +425,7 @@ pub async fn sftp_download(
     local_path: String,
     chunk_kb: Option<u32>,
     resume: Option<bool>,
+    max_bytes: Option<u64>,
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
@@ -435,6 +438,7 @@ pub async fn sftp_download(
             local_path,
             chunk_kb,
             resume,
+            max_bytes,
             channel,
         )
         .await

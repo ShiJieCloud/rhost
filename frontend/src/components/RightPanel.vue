@@ -22,7 +22,9 @@ const scopeLabel = computed(() => {
 const railRef = ref<HTMLElement | null>(null)
 const resizing = ref(false)
 
-const MIN_W = 280
+const MIN_W = 360
+/** 终端面板最小保留宽度：约 80 列等宽字符（13px 字号 ≈ 630px 含内边距），取 640 保底 */
+const TERM_MIN_W = 640
 
 function onMouseDown(e: MouseEvent) {
   if (!railRef.value) return
@@ -31,9 +33,9 @@ function onMouseDown(e: MouseEvent) {
   const startWidth = rightPanelWidth.value
 
   const onMove = (ev: MouseEvent) => {
-    // 面板在右侧，向左拖宽，向右拖窄；上限为「窗口宽 - 主区最小宽(480) - 图标栏(44)」
+    // 面板在右侧，向左拖宽，向右拖窄；上限为「窗口宽 - 终端面板最小宽 - 图标栏(44)」
     const delta = startX - ev.clientX
-    const maxW = Math.max(MIN_W, window.innerWidth - 480 - 44)
+    const maxW = Math.max(MIN_W, window.innerWidth - TERM_MIN_W - 44)
     rightPanelWidth.value = Math.min(maxW, Math.max(MIN_W, startWidth + delta))
   }
   const onUp = () => {
@@ -67,7 +69,12 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => document.addEventListener('keydown', onKey))
+onMounted(() => {
+  document.addEventListener('keydown', onKey)
+  // 视口级 clamp：持久化宽度可能超出当前窗口允许的上限（需为终端面板保留 TERM_MIN_W），挂载时收敛
+  const maxW = Math.max(MIN_W, window.innerWidth - TERM_MIN_W - 44)
+  if (rightPanelWidth.value > maxW) rightPanelWidth.value = maxW
+})
 onUnmounted(() => document.removeEventListener('keydown', onKey))
 </script>
 

@@ -4,7 +4,7 @@
 >
 > created: 2026-10-12 18:05:08
 >
-> updated: 2026-10-12 18:21:10
+> updated: 2026-10-13 19:20:56
 >
 > author:
 
@@ -24,7 +24,7 @@
 | 步骤规模受控 | 单计划 3~8 步；步骤标题 ≤50 字符；步骤结果摘要 ≤150 字符 |
 | 注入有界 | 计划上下文注入 system 消息总预算 2KB UTF-8，超出丢弃最旧步骤摘要 |
 | 步骤隔离 | 每步独立 ReAct 循环，工具轮次复用 MAX_TOOL_ROUNDS=6，步间计数互不影响 |
-| 低开销 | 计划生成为 1 次非流式调用；生成/解析失败降级为普通 ReAct 对话，用户输入不丢失 |
+| 低开销 | 计划生成为 1 次流式收集调用（`chat_stream_collect`，无整体超时）；生成/解析失败降级为普通 ReAct 对话，用户输入不丢失 |
 
 必须遵守的既有项目约束：见 §2。
 
@@ -74,7 +74,7 @@
 入口检测（优先级：/plan 命令 > Toggle 开关 > 默认 ReAct）
    │
    ▼
-ai_plan_generate（后端非流式：Planner prompt + 用户问题 → JSON 步骤数组）
+ai_plan_generate（后端流式收集：Planner prompt + 用户问题 → 正文增量实时推送 + 拼装完整响应 → JSON 步骤数组）
    │ 失败 → toast + 自动按普通 ReAct 发送（用户输入不丢失）
    ▼
 计划卡片（plan.state=draft）：步骤文本可编辑 → [确认执行] [取消]
@@ -95,7 +95,7 @@ plan.state=executing ──► 步骤 i 循环（step: pending→running）
    （注入各步摘要，enableTools=false，纯文本一轮收尾）
 ```
 
-与既有模块的关系：Planner 是独立非流式调用（复用 `ai_summarize` 的请求链路）；Act 阶段完全复用现有 ReAct 循环（`runAiStream` / `onToolCalls` / `settleProposalRound` / 授权弹窗），不新增工具、不改授权语义，增量仅为计划上下文注入与步骤推进编排。
+与既有模块的关系：Planner 是独立流式收集调用（`chat_stream_collect`：流式请求、只推 `ai-token`、无整体超时，规划过程在前端「执行过程」区实时可见）；Act 阶段完全复用现有 ReAct 循环（`runAiStream` / `onToolCalls` / `settleProposalRound` / 授权弹窗），不新增工具、不改授权语义，增量仅为计划上下文注入与步骤推进编排。
 
 ## 6. 详细设计
 
@@ -108,7 +108,9 @@ plan.state=executing ──► 步骤 i 循环（step: pending→running）
 
 - **优先级**：斜杠命令 > Toggle 开关 > 默认（ReAct）；斜杠命令在开关关闭时也生效；
 - 仅工作台 scope 可用：global scope 下开关置灰（hover 提示「全局对话无终端可执行计划」），`/plan ` 前缀按普通文本发送；
-- 发送后进入「规划中…」loading（输入区禁用 + 可取消按钮），期间调 `ai_plan_generate`；取消走 `aiStopChat` 同源中止（`AiState.cancels` 同 scope 键）。
+- 发送后进入「规划中…」loading（输入区禁用 + 可取消按钮），期间调 `ai_plan_generate`；取消走 `aiStopChat` 同源中止（`AiState.cancels` 同 scope 键）；
+- **附件**：规划模式支持附件（图片 / 文本/代码文件）。`content` 与对话链路同构——文本/代码附件内联为 `<file name="…">…</file>` 块并入文本，含图片时装配为 content parts 数组；取消规划时原文与附件一并填回输入框。装配口径见 `ai-multimodal-design.md` §6.4/§6.7。
+- **任务耗时与执行过程可视化**：回复区以「回复组」为单位展示——一次用户输入触发的整段回复（规划生成 / 工具循环中间轮 / 计划各步 / 收尾总结）合并渲染为一个回复。组头下方显示整组耗时「任务耗时 Xm Ys」（省略高位零段，如 `21m 27s`），点击该行展开/收起「执行过程」折叠区，耗时行下方经分隔线展示最终结果。运行中自动展开执行过程并逐秒刷新耗时，落定后自动改用持久化的 `elapsedMs` 并收起。
 
 ### 6.2 后端 IPC：`ai_plan_generate`（`src-tauri/src/ai.rs`）
 
@@ -124,20 +126,24 @@ pub struct PlanGenResult {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanStepOut {
-    title: String,   // 步骤简述（≤50 字符，超出截断）
-    detail: String,  // 步骤详情（做什么、验证什么）
+    title: String,   // 一句话 todo（≤50 字符，超出截断；展示给用户）
+    detail: String,  // 执行参考（做什么、如何验证；不展示给用户，仅供执行轮注入）
 }
 
 #[tauri::command]
 pub async fn ai_plan_generate(
     scope: String,
-    question: String,
+    // 字符串（纯文本，含已内联的文本/代码附件）或 content parts 数组（含图片）
+    content: serde_json::Value,
     state: State<'_, AiState>,
 ) -> Result<PlanGenResult, String>
 ```
 
-- **Planner prompt**（system）：要求模型将用户目标拆解为 3~8 个可执行步骤，每步给出 `title`（≤50 字符）与 `detail`；严格输出 JSON 数组，禁止任何额外文本。prompt 声明执行环境为「SSH 远程服务器，可用只读工具 read_file / list_directory / get_system_info 与经用户授权的写操作」，使步骤落到工具可及的范围；
-- **请求方式**：非流式单次 POST（复用 `ai_summarize` 的请求链路，messages = system(Planner) + user(question)），不携带工具定义；
+- **入参 `content`**：兼容字符串与 content parts 数组两种形态（空串 / 空数组 / null 视为「规划输入为空」并 Err），使规划与对话共用同一套附件装配口径；
+
+- **Planner prompt**（system）：要求模型将用户目标拆解为 3~8 个可执行步骤，每步给出 `title`（≤50 字符，须自描述、完整动作，作为 todo 展示给用户）与 `detail`（执行参考：做什么、如何验证；不展示给用户，仅供执行轮注入）；严格输出 JSON 数组，禁止任何额外文本；prompt 声明执行环境为「SSH 远程服务器，可用只读工具 read_file / list_directory / get_system_info 与经用户授权的写操作」，使步骤落到工具可及的范围；
+- **请求方式**：流式单次 POST（`chat_stream_collect`：`stream:true` 请求 + 累加正文增量 + 只推 `ai-token` 事件，不推 `ai-done` / `ai-tool-calls`；结束与提案由返回值表达，上游内联错误帧仍透传 `ai-error`），流结束返回完整正文供 `parse_plan_json` 解析，不携带工具定义。规划阶段的流式正文在前端实时呈现于「执行过程」区（标为「规划」），作为长耗时规划（实测 33~60s）的生成期反馈；生成完成后「执行过程」区**不留 Planner 原文**（多为 JSON 拼装过程，可读性差且可能露出 JSON 碎片），替换为生成的步骤编号列表（每行 `N. title`），随后自动收起并展示计划卡片；
+- **超时**：`chat_stream_collect` 无整体超时（仅 `req.send()` 建连阶段有超时），思考模式模型（qwen3-max 系列默认开启 thinking）在复杂目标下单次规划实测 33~60s（reasoning token 约 900~1800）也不会被误杀；原非流式链路固定 60s 硬超时会稳定命中并报「请求超时」，故规划改用流式收集。失败/取消后前端降级为普通 ReAct 发送（取消时回填原文与附件）；
 - **宽松解析** `parse_plan_json`：模型未严格遵守时，截取响应中首个 `[` 至末个 `]` 的子串再 `serde_json::from_str`；解析后校验——数组长度 ∈ [3, 8]（<3 无需规划，>8 注入膨胀且长程规划质量下降）、每步 `title` 非空（空则剔除该步，剔除后不足 3 步整体 Err）；
 - **取消**：令牌登记进 `AiState.cancels`（与流式同一 scope 键），中止/切 scope 时取消在飞规划请求；
 - **失败**：Err 透传前端，前端 toast「计划生成失败，已按普通模式发送」并自动走既有 ReAct 路径。
@@ -147,20 +153,22 @@ pub async fn ai_plan_generate(
 ```ts
 export interface AiPlanStep {
   id: string
-  title: string   // draft 态可编辑
-  detail: string  // draft 态可编辑
+  title: string   // 一句话 todo；draft 态可编辑（唯一可编辑字段）
+  detail: string  // 执行参考（模型生成，不展示给用户，仅供执行轮注入与 replan）
   state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
   /** 执行结果摘要（≤150 字符；failed 时存失败原因；skipped 记「用户跳过」） */
   result?: string
 }
 
 export interface AiPlan {
-  /** 用户原始问题（剥离 /plan 前缀后） */
+  /** 用户原始问题（剥离 /plan 前缀后）；纯附件（无文本）时为「（含附件）」 */
   goal: string
   steps: AiPlanStep[]
   /** 当前执行下标（executing 态有效） */
   currentIndex: number
   state: 'draft' | 'executing' | 'done' | 'cancelled'
+  /** done/cancelled 后用户是否已确认收尾（true 则悬浮面板消失，计划不进消息流） */
+  acknowledged?: boolean
 }
 
 // AiChatMessage 新增字段
@@ -228,7 +236,7 @@ failPlanStep(i, reason)
 ```text
 replan(failedIndex)
   输入：goal + 各步状态清单（done 的含 result 摘要）+ 失败步 detail 与失败原因
-  → ai_plan_generate（同一 IPC，question 为拼装后的重规划描述）
+  → ai_plan_generate（同一 IPC，content 为拼装后的重规划描述文本）
   → 新步骤数组替换 plan.steps[failedIndex..]
     （已完成步骤保留原样；失败步与后续全部作废）
   → plan.state=draft, currentIndex=failedIndex → 用户再次确认后执行
@@ -237,15 +245,18 @@ replan(failedIndex)
 - Replan 同样必须经用户确认，不做自动重规划（避免模型在失败循环里自行放大操作面）；
 - 重规划次数无硬上限（用户每次显式触发，天然限速）。
 
-### 6.7 计划卡片视觉
+### 6.7 计划面板视觉
 
-- 文档流卡片（与授权弹窗同一视觉语言）：挂在产生它的 assistant 消息位置，宽度同消息区；
-- 结构：卡片头部（徽标 + 目标行 `🎯 {goal}`）→ 步骤列表（序号 + 状态图标 + title + detail；draft 态为可编辑输入框）→ 操作按钮行；
+- **悬浮面板**（非文档流）：固定在输入框上方，授权弹窗出现时让位隐藏；计划**不进消息流**——done/cancelled 不再渲染为消息流历史卡片，而是保持悬浮展示至用户确认收尾（`acknowledged`）后消失；
+- 结构：面板头（徽标 + 标题行 `🎯 {planHeadTitle}` + 进度 + 折叠箭头）→ 步骤列表（序号 + 状态图标 + title 一句话；draft 态 title 为可编辑 `<input>`）→ 操作按钮行；
+- 标题行随折叠态切换：展开态或 draft 态显示 `goal`；折叠 + executing 态显示当前正在执行的步骤 title（随步骤推进更新），配右侧进度文本，折叠时即可一眼看到当前进度；
+- 步骤行仅展示 title（一句话 todo），不展示 detail 与 result（detail 为模型执行参考仅注入执行轮上下文与 replan；result 仅用于 localPlanSummary 总结与注入，不在步骤行展示）；步骤行的结果信息在执行过程区（流式输出）可见；
 - 状态图标：pending `○` 灰、running 蓝色脉冲圆点（复用「思考中…」脉冲动画）、done `✓` 绿、failed `✗` 红、skipped `⊘` 黄；状态随执行驱动实时更新；
-- 徽标：`计划中`（蓝，draft）/ `执行中`（蓝脉冲，executing）/ `已完成`（绿，done）/ `已取消`（灰，cancelled）；
-- 编辑交互：draft 态 title/detail 为 `<input>` / `<textarea>`，确认时以输入框当前值生成快照（与「commitRename 读 DOM 值保证一致性」同一教训）；
-- 按钮按态呈现：draft → `[确认执行] [取消]`；executing 且有 failed 步 → `[重试] [跳过] [终止] [重新规划]`；executing 正常推进 → 无按钮（中止走消息区既有中止按钮）；done/cancelled → 无按钮纯展示；
-- 步骤行可展开：done/failed/skipped 步骤点击展开 result 全文（摘要超过一行的场景）；
+- 徽标：`计划中`（蓝，draft）/ `执行中`（蓝脉冲，executing）/ `已完成`（绿，done）/ `已取消`（灰，cancelled）；draft/done/cancelled 不脉冲；
+- 进度文本：draft → `{n} 步 · 待确认`；executing → `第 X/N 步`；done → `{n}/{n} · 已完成`；cancelled → `已取消`；
+- 编辑交互：draft 态仅 title 为可编辑 `<input>`（detail 不可见、不可编辑，保留模型原值供执行轮注入），确认时以输入框当前值生成快照（与「commitRename 读 DOM 值保证一致性」同一教训）；
+- 按钮按态呈现：draft → `[确认执行] [取消]`；executing 且有 failed 步 → `[重试] [跳过] [终止] [重新规划]`；executing 正常推进 → 无按钮（中止走消息区既有中止按钮）；done/cancelled → `[确认完成]`（标记 `acknowledged=true`，面板消失，计划不留消息流）；
+- `acknowledged`：`AiPlan.acknowledged?: boolean`，done/cancelled 后用户点确认完成置 true；`activePlanMsg` 据此排除已确认计划（已确认的面板不再出现、不进消息流）；随会话持久化。
 - 执行期间的工具提案卡片、推理可视化、授权弹窗、消息操作按钮全部照常；重新生成整组截断到对应 user 消息时，计划一并作废（`plan.state=cancelled`）。
 
 ### 6.8 魔数取值
@@ -253,11 +264,11 @@ replan(failedIndex)
 | 魔数 | 取值 | 理由 |
 |---|---|---|
 | 步骤数 | 3~8 | <3 步普通 ReAct 即可，规划是负担；>8 步注入膨胀且模型长程规划质量显著下降 |
-| 步骤标题 | ≤50 字符 | 卡片单行展示；Planner prompt 约束 + 后端截断双闸 |
+| 步骤标题 | ≤50 字符 | todo 单行展示（title 为唯一展示字段）；Planner prompt 约束 + 后端截断双闸 |
 | 步骤结果摘要 | ≤150 字符 | 8 步 × 150 = 1.2KB，加目标与标题后总量 <2KB 预算 |
 | 计划注入预算 | 2KB UTF-8 | 够表达进展与约束，不挤占对话上下文与技能/规则 16KB 预算 |
 | 每步工具轮次 | 6（复用 MAX_TOOL_ROUNDS） | 步骤是独立子任务，计数独立；不新增常量 |
-| 规划生成超时 | 复用非流式请求链路默认 | `ai_summarize` 同链路已验证，不引入新超时参数 |
+| 规划生成超时 | `chat_stream_collect` 无整体超时（仅建连阶段 10s） | 思考模式单次规划可耗时数十秒，固定超时易误杀；流式既无整体超时又能让规划过程实时可见 |
 
 ## 7. 安全与降级
 
