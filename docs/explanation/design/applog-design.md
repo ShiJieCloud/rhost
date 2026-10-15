@@ -4,6 +4,8 @@
 >
 > 日期：2026-10-05
 >
+> 更新：2026-10-14 17:36:39
+>
 > scope: Rhost 应用自身运行日志的采集、过滤、内存缓冲、底部面板输出、磁盘持久化与轮转清理
 >
 > 关联代码：`src-tauri/src/lib.rs`、`src-tauri/src/ipc.rs`、`frontend/src/stores/settings.ts`（log* 字段）、`frontend/src/components/SettingsModal.vue`（日志 tab）、`frontend/src/components/wb/DockPanel.vue`（日志面板，当前为 mock）
@@ -90,9 +92,9 @@
 **`event_id` 命名规范**（每条日志必填，与 `msg` 解耦）：
 
 - 格式：`domain.action[.subaction]`，全小写蛇形，如 `ssh.connect.start`、`sftp.transfer.complete`；
-- `domain` 与 `target` 同源（`app`/`ssh`/`sftp`/`metrics`/`ipc`/`web`）；
+- `domain` 与 `target` 同源（`app`/`ssh`/`sftp`/`metrics`/`ipc`/`web`/`ai`）；
 - **为什么需要**：`msg` 是中文人类可读文案，不可作为机器筛选键（文案调整/未来 i18n 会破坏日志聚合规则、测试断言与告警）；`event_id` 是恒定的事件类型标识，`jq 'select(.event_id=="ssh.auth.failed")'` 精确匹配；
-- **集中定义**：后端 `applog/events.rs` 以常量形式注册全部 event_id（编译期防手误）；前端 `stores/applog.ts` 同步同一份常量表（`web.*` 域），文档本节表格即事实清单，三者必须同步；
+- **集中定义**：后端 `applog/events.rs` 以常量形式注册全部 event_id（编译期防手误）；前端 `stores/applog.ts` 同步同一份常量表（`web.*` 域，加上 §4.6 的 `ai.plan.*` 域），文档本节表格即事实清单，三者必须同步；
 - **面板默认不显示** event_id（保持纯文本简洁），stores 层保留字段供筛选/搜索扩展，后续可加"显示事件 ID"调试开关。
 
 ### 4.1 应用生命周期（target: `app`）
@@ -215,7 +217,63 @@
 | 前端 IPC 错误 | `web.ipc.error` | ERROR | 前端 invoke 失败统一上报：cmd、err |
 | 前端未捕获异常 | `web.unhandled_error` | ERROR | window.onerror / unhandledrejection：err、stack 摘要（截断 500 字符） |
 
-### 4.5 明确不记录（黑名单）
+### 4.5 端口转发隧道（target: `tunnel`）
+
+| 事件 | event_id | 级别 | 消息与 kv |
+|---|---|---|---|
+| 隧道启动 | `tunnel.start` | INFO | host、port、session_id |
+| 隧道启动失败 | `tunnel.start_failed` | ERROR | host、err |
+| 隧道停止 | `tunnel.stop` | INFO | host |
+| 端口冲突 | `tunnel.port_conflict` | WARN | local_port、err |
+| SOCKS 握手失败 | `tunnel.socks_handshake_failed` | ERROR | local_port、client |
+| SOCKS 握手超时 | `tunnel.socks_handshake_timeout` | WARN | local_port、client |
+| 远端拒绝 | `tunnel.remote_denied` | WARN | host、client |
+| 远端就绪 | `tunnel.remote_ready` | INFO | host、client |
+| 状态推送失败 | `tunnel.status_push_failed` | WARN | stage、err |
+| 监听器重试 | `tunnel.listener_retry` | INFO | local_port、attempt |
+| 监听器失败 | `tunnel.listener_failed` | ERROR | local_port、err |
+
+### 4.6 AI 助手（target: `ai`，带 scope 标签）
+
+| 事件 | event_id | 级别 | 消息与 kv |
+|---|---|---|---|
+| 流式对话开始 | `ai.stream.start` | INFO | model、message_count、enable_tools |
+| 流式对话完成（对端关闭） | `ai.stream.done` | INFO | finish_reason、tool_call_count |
+| 流式对话完成（收到 [DONE]） | `ai.stream.done` | INFO | finish_reason、tool_call_count |
+| 流式对话被中止（建连前） | `ai.stream.aborted` | INFO | stage=send |
+| 流式对话被中止（流式过程中） | `ai.stream.aborted` | INFO | stage=stream |
+| 流式对话失败（请求/解析错误） | `ai.stream.failed` | ERROR | error |
+| 用户主动中止对话 | `ai.stream.stop_request` | INFO | - |
+| 上游 HTTP 非 2xx | `ai.http_error` | ERROR | status、snippet（截断 500 字符） |
+| 上游返回错误帧（HTTP 200 但 SSE 体内报错） | `ai.upstream_error` | ERROR | message |
+| 模型请求了工具调用 | `ai.tool_calls.requested` | INFO | count、names |
+| AI 工具开始执行 | `ai.tool_exec.start` | INFO | tool_name |
+| AI 工具执行完成（退出码 0） | `ai.tool_exec.done` | INFO | tool_name、exit_code、timed_out、truncated |
+| AI 工具执行完成（非零退出码） | `ai.tool_exec.done` | WARN | tool_name、exit_code、timed_out、truncated |
+| AI 工具执行失败（参数解析/通道故障） | `ai.tool_exec.failed` | ERROR | tool_name、error |
+| AI 工具执行被取消（会话切换） | `ai.tool_exec.cancelled` | INFO | tool_name |
+| 计划提案建卡（模型判定复杂任务并调用 propose_plan） | `ai.plan.proposed` | INFO | step_count、tool_round、has_write_in_round |
+| 计划提案步骤校验失败（steps 解析失败 / 有效步数不足） | `ai.plan.invalid` | WARN | fail_reason、raw_step_count |
+| 用户确认执行计划 | `ai.plan.confirmed` | INFO | step_count、latency_ms |
+| 用户拒绝计划（「不用计划，直接执行」） | `ai.plan.refused` | INFO | step_count、latency_ms |
+| 强制规划路径触发（+ 菜单 / `/plan ` 前缀 / 重新规划） | `ai.plan.forced` | INFO | via、task_had_proposal |
+| 强制 / 重规划轮未产出合法计划 | `ai.plan.force_failed` | WARN | reason |
+| 计划与写操作工具同轮，计划作废（保留执行动作） | `ai.plan.conflict_dropped` | WARN | other_tools |
+| 禁令生效期仍收到计划提案（前端防御兜底命中） | `ai.plan.reproposal_blocked` | WARN | - |
+| 计划步骤执行失败 | `ai.plan.step_failed` | WARN | step_index、fail_reason |
+| 用户触发重新规划 | `ai.plan.replanned` | INFO | step_index |
+| 用户终止计划 | `ai.plan.aborted` | INFO | step_index |
+| 计划执行完成（总结轮结束） | `ai.plan.finished` | INFO | step_count、done_count、failed_count、duration_ms |
+| 计划执行阶段提前收敛 | `ai.plan.concluded` | INFO | outcome（resolved / blocked）、step_index、step_count、skipped_count、duration_ms |
+| memory.json 解析失败 | `ai.memory.parse_failed` | WARN | error |
+| 记忆文件写入失败 | `ai.memory.persist_failed` | ERROR | operation、error |
+| 会话记录持久化失败 | `ai.chat.persist_failed` | ERROR | scope、operation、error |
+| 测试连接成功 | `ai.test.ok` | INFO | status、latency_ms、model_count |
+| 测试连接失败 | `ai.test.failed` | ERROR | error |
+
+`ai.plan.*` 一组事件产生于前端裁决处（计划提案建卡、用户确认/拒绝、强制轮收尾、步骤失败、重规划、终止、完成），由前端 `stores/applog.ts` 的 `report()` 经 `report_app_log` 上报，target 固定 `web`（事件名保留 `ai.` 前缀以便聚合检索，§7.2 白名单已纳入 `ai.*`）。埋点字段仅含枚举、布尔与数值，不含任何用户消息、计划内容或命令原文；仅本地落盘，无网络上报（判定口径与字段见 ai-plan-trigger-design §6.9）。
+
+### 4.7 明确不记录（黑名单）
 
 - 密码、私钥内容/指纹外的任何密钥材料、passphrase
 - PTY 输入输出字节流（命令、回显）
@@ -354,7 +412,7 @@ Channel 推送与 invoke 上报均传结构化 JSON，**字段与 §5.1 文件 J
 | 命令 | 入参 | 返回 | 说明 |
 |---|---|---|---|
 | `subscribe_app_logs` | `channel: Channel<LogBatch>`、`sinceId: Option<u64>` | `()` | 先推 replay 批（`seq > sinceId` 的部分；`sinceId=None` 或 `sinceId < min_seq` 推全量并附带 `lost_because` 元信息），再持续推增量批（攒 100ms 或 20 条，单批硬上限 50 条防爆量）。**支持多订阅者广播**：Hub 维护订阅者列表，send 失败即移除该订阅 |
-| `report_app_log` | `level, eventId, msg, kv?` | `()` | 前端日志上报入口。服务端校验 level 白名单、eventId 必须是 `web.*` 域、msg 长度 ≤ 2KB，target 固定填 `web`；`seq`/`ts`/`sid` 由服务端生成，前端不得传入 |
+| `report_app_log` | `level, eventId, msg, kv?` | `()` | 前端日志上报入口。服务端校验 level 白名单、eventId 必须是 `web.*` / `sftp.*` / `ai.*` 域、msg 长度 ≤ 2KB，target 固定填 `web`；`seq`/`ts`/`sid` 由服务端生成，前端不得传入 |
 | `clear_app_log_buffer` | `()` | `()` | 清空内存缓冲（面板「清空日志」按钮）；**只清内存，不删磁盘文件** |
 | `reveal_log_dir` | `()` | `()` | 系统文件管理器打开日志目录（复用 tauri-plugin-opener） |
 

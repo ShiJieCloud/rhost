@@ -96,6 +96,68 @@ pub const WEB_UNHANDLED_ERROR: &str = "web.unhandled_error";
 /// 第三方 crate 日志统一事件：原始 target 放 kv.crate_target
 pub const EXTERNAL_RAW_LOG: &str = "external.raw_log";
 
+/* ---- AI 助手（target: ai） ---- */
+/// 流式对话开始（ai_chat_stream 入口，scope 级）
+pub const AI_STREAM_START: &str = "ai.stream.start";
+/// 流式对话正常完成（收到 [DONE] 或对端关闭流）
+pub const AI_STREAM_DONE: &str = "ai.stream.done";
+/// 流式对话中止（用户主动停止或新请求顶替旧请求）
+pub const AI_STREAM_ABORTED: &str = "ai.stream.aborted";
+/// 流式对话失败（请求/解析/上游错误）
+pub const AI_STREAM_FAILED: &str = "ai.stream.failed";
+/// 用户主动中止指定 scope 的对话
+pub const AI_STREAM_STOP_REQUEST: &str = "ai.stream.stop_request";
+/// 上游 HTTP 错误（非 2xx 响应）
+pub const AI_HTTP_ERROR: &str = "ai.http_error";
+/// 上游错误帧（HTTP 200 但 SSE 体内含 error）
+pub const AI_UPSTREAM_ERROR: &str = "ai.upstream_error";
+/// 模型请求了工具调用（流结束时 finish_stream 发出）
+pub const AI_TOOL_CALLS_REQUESTED: &str = "ai.tool_calls.requested";
+/// 只读/写工具开始执行（ai_exec_tool 入口）
+pub const AI_TOOL_EXEC_START: &str = "ai.tool_exec.start";
+/// 工具执行完成
+pub const AI_TOOL_EXEC_DONE: &str = "ai.tool_exec.done";
+/// 工具执行失败（参数解析/通道级故障等）
+pub const AI_TOOL_EXEC_FAILED: &str = "ai.tool_exec.failed";
+/// 工具执行被取消（会话切换 / ai_cancel_execs）
+pub const AI_TOOL_EXEC_CANCELLED: &str = "ai.tool_exec.cancelled";
+/// 计划提案建卡成功（模型判定复杂任务并调用 propose_plan）
+pub const AI_PLAN_PROPOSED: &str = "ai.plan.proposed";
+/// 计划提案参数校验失败（steps 解析失败 / 有效步数不足）
+pub const AI_PLAN_INVALID: &str = "ai.plan.invalid";
+/// 用户确认执行计划
+pub const AI_PLAN_CONFIRMED: &str = "ai.plan.confirmed";
+/// 用户拒绝计划（「不用计划，直接执行」）
+pub const AI_PLAN_REFUSED: &str = "ai.plan.refused";
+/// 强制规划路径触发（「+」菜单「规划模式」项 / `/plan ` 前缀 / 「重新规划」）
+pub const AI_PLAN_FORCED: &str = "ai.plan.forced";
+/// 强制 / 重规划轮未产出合法计划（tool_choice 未生效或校验失败）
+pub const AI_PLAN_FORCE_FAILED: &str = "ai.plan.force_failed";
+/// 计划与写操作工具同轮，计划作废（保留执行动作）
+pub const AI_PLAN_CONFLICT_DROPPED: &str = "ai.plan.conflict_dropped";
+/// 禁令生效期仍收到计划提案（前端防御性兜底命中）
+pub const AI_PLAN_REPROPOSAL_BLOCKED: &str = "ai.plan.reproposal_blocked";
+/// 计划步骤执行失败
+pub const AI_PLAN_STEP_FAILED: &str = "ai.plan.step_failed";
+/// 用户点击「重新规划」
+pub const AI_PLAN_REPLANNED: &str = "ai.plan.replanned";
+/// 用户点击「终止」计划
+pub const AI_PLAN_ABORTED: &str = "ai.plan.aborted";
+/// 计划执行完成（总结轮结束）
+pub const AI_PLAN_FINISHED: &str = "ai.plan.finished";
+/// 计划执行阶段提前收敛（resolved：目标已达成 / blocked：剩余步骤不可行）
+pub const AI_PLAN_CONCLUDED: &str = "ai.plan.concluded";
+/// 记忆文件解析失败（memory.json 损坏按空降级）
+pub const AI_MEMORY_PARSE_FAILED: &str = "ai.memory.parse_failed";
+/// 记忆文件写入失败
+pub const AI_MEMORY_PERSIST_FAILED: &str = "ai.memory.persist_failed";
+/// 会话记录持久化失败
+pub const AI_CHAT_PERSIST_FAILED: &str = "ai.chat.persist_failed";
+/// 测试连接成功
+pub const AI_TEST_OK: &str = "ai.test.ok";
+/// 测试连接失败
+pub const AI_TEST_FAILED: &str = "ai.test.failed";
+
 /* ---- 端口转发隧道（target: tunnel） ---- */
 pub const TUNNEL_START: &str = "tunnel.start";
 pub const TUNNEL_START_FAILED: &str = "tunnel.start_failed";
@@ -111,7 +173,8 @@ pub const TUNNEL_LISTENER_FAILED: &str = "tunnel.listener_failed";
 
 /// 前端上报允许的 event_id 域（report_app_log 校验白名单）：
 /// web.* 前端通用事件 + sftp.* 传输队列事件（队列管理逻辑在前端，§7.3）
-pub const REPORT_ALLOWED_PREFIXES: &[&str] = &["web.", "sftp."];
+/// + ai.plan.* 计划判定埋点（事件产生点在前端裁决处，见 ai-plan-trigger-design §6.9）
+pub const REPORT_ALLOWED_PREFIXES: &[&str] = &["web.", "sftp.", "ai."];
 
 /// 敏感设置键静态集合：settings.change 埋点统一查表脱敏，不记值只记 changed
 pub const SENSITIVE_SETTING_KEYS: &[&str] = &[
@@ -219,6 +282,36 @@ mod tests {
             TUNNEL_STATUS_PUSH_FAILED,
             TUNNEL_LISTENER_RETRY,
             TUNNEL_LISTENER_FAILED,
+            AI_STREAM_START,
+            AI_STREAM_DONE,
+            AI_STREAM_ABORTED,
+            AI_STREAM_FAILED,
+            AI_STREAM_STOP_REQUEST,
+            AI_HTTP_ERROR,
+            AI_UPSTREAM_ERROR,
+            AI_TOOL_CALLS_REQUESTED,
+            AI_TOOL_EXEC_START,
+            AI_TOOL_EXEC_DONE,
+            AI_TOOL_EXEC_FAILED,
+            AI_TOOL_EXEC_CANCELLED,
+            AI_PLAN_PROPOSED,
+            AI_PLAN_INVALID,
+            AI_PLAN_CONFIRMED,
+            AI_PLAN_REFUSED,
+            AI_PLAN_FORCED,
+            AI_PLAN_FORCE_FAILED,
+            AI_PLAN_CONFLICT_DROPPED,
+            AI_PLAN_REPROPOSAL_BLOCKED,
+            AI_PLAN_STEP_FAILED,
+            AI_PLAN_REPLANNED,
+            AI_PLAN_ABORTED,
+            AI_PLAN_FINISHED,
+            AI_PLAN_CONCLUDED,
+            AI_MEMORY_PARSE_FAILED,
+            AI_MEMORY_PERSIST_FAILED,
+            AI_CHAT_PERSIST_FAILED,
+            AI_TEST_OK,
+            AI_TEST_FAILED,
         ];
         for id in all {
             assert!(
@@ -230,7 +323,7 @@ mod tests {
             let domain = parts.next().unwrap();
             assert!(
                 [
-                    "app", "ssh", "sftp", "metrics", "ipc", "web", "external", "tunnel"
+                    "app", "ssh", "sftp", "metrics", "ipc", "web", "external", "tunnel", "ai"
                 ]
                 .contains(&domain),
                 "未知 domain: {id}"
@@ -256,7 +349,7 @@ mod tests {
                 let mut it = s.split('.');
                 let domain = it.next().unwrap_or("");
                 let rest: Vec<&str> = it.collect();
-                ["app", "ssh", "sftp", "metrics", "ipc", "web", "external"].contains(&domain)
+                ["app", "ssh", "sftp", "metrics", "ipc", "web", "external", "ai", "tunnel"].contains(&domain)
                     && !rest.is_empty()
                     && rest.iter().all(|p| {
                         !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c == '_')

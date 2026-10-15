@@ -59,6 +59,21 @@ export const SFTP_TRANSFER_PAUSE = 'sftp.transfer.pause'
 export const SFTP_TRANSFER_RESUME = 'sftp.transfer.resume'
 export const SFTP_MANAGE_REMOVE = 'sftp.manage.remove'
 
+/* ---- ai.plan.* 计划判定埋点事件（与后端 applog/events.rs 同步，仅本地落盘，无网络上报） ---- */
+export const AI_PLAN_PROPOSED = 'ai.plan.proposed'
+export const AI_PLAN_INVALID = 'ai.plan.invalid'
+export const AI_PLAN_CONFIRMED = 'ai.plan.confirmed'
+export const AI_PLAN_REFUSED = 'ai.plan.refused'
+export const AI_PLAN_FORCED = 'ai.plan.forced'
+export const AI_PLAN_FORCE_FAILED = 'ai.plan.force_failed'
+export const AI_PLAN_CONFLICT_DROPPED = 'ai.plan.conflict_dropped'
+export const AI_PLAN_REPROPOSAL_BLOCKED = 'ai.plan.reproposal_blocked'
+export const AI_PLAN_STEP_FAILED = 'ai.plan.step_failed'
+export const AI_PLAN_REPLANNED = 'ai.plan.replanned'
+export const AI_PLAN_ABORTED = 'ai.plan.aborted'
+export const AI_PLAN_FINISHED = 'ai.plan.finished'
+export const AI_PLAN_CONCLUDED = 'ai.plan.concluded'
+
 /* ---- app.config.* 配置导入导出事件（与后端 applog/events.rs 同步，仅登记/展示） ---- */
 export const APP_CONFIG_EXPORT = 'app.config.export'
 export const APP_CONFIG_EXPORT_FAILED = 'app.config.export_failed'

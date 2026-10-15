@@ -130,10 +130,15 @@ export interface AiPlanStep {
   title: string
   /** 步骤详情（draft 态可编辑） */
   detail: string
-  /** pending 待执行 / running 执行中 / done 已完成 / failed 失败 / skipped 用户跳过 */
+  /** pending 待执行 / running 执行中 / done 已完成 / failed 失败 / skipped 已跳过 */
   state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
-  /** 执行结果摘要（≤150 字符；failed 存失败原因；skipped 记「用户跳过」） */
+  /** 执行结果摘要（≤150 字符；failed 存失败原因；skipped 记跳过原因） */
   result?: string
+  /** 本步执行中模型调用 conclude_plan 标记提前收敛（由 completePlanStep 消费：
+   *  剩余 pending 步转 skipped 后直接进入总结轮） */
+  concluded?: boolean
+  /** 收敛类型：resolved 目标已达成 / blocked 目标前提不成立、剩余步骤不可行 */
+  concludeOutcome?: 'resolved' | 'blocked'
 }
 
 /** 执行计划（挂在生成它的 assistant 消息上，随会话落盘） */
@@ -149,21 +154,9 @@ export interface AiPlan {
   acknowledged?: boolean
   /** done 后变更文件列表面板是否已确认（true 则面板消失） */
   filesAcknowledged?: boolean
-}
-
-/** 后端计划生成结果（serde camelCase） */
-export interface AiPlanGenResult {
-  steps: { title: string; detail: string }[]
-}
-
-/** 生成执行计划：非流式单次调用，模型输出经后端宽松解析为 3~8 步数组。
- *  content 与对话链路同构：纯文本（文本/代码附件已内联为 `<file>` 块）传字符串，
- *  含图片时传 content parts 数组 */
-export function aiPlanGenerate(
-  scope: AiScope,
-  content: string | AiContentPart[],
-): Promise<AiPlanGenResult> {
-  return invoke('ai_plan_generate', { scope, content })
+  /** 提前收敛标记：某执行步调用 conclude_plan 触发（剩余 pending 步转 skipped）；
+   *  收敛计划转 done 后规划面板不自动消失，保留展示各步最终状态，等用户点「确认」收尾 */
+  converged?: boolean
 }
 
 /** 落盘的会话记录（后端原样存取） */
@@ -212,13 +205,28 @@ export interface AiToolCallsEvent {
 /* ---- IPC ---- */
 
 /** 发起流式对话；结果通过事件返回，invoke 本身的 rejection 仅表示建连前失败。
- *  enableTools 附加内置工具定义（propose_command），供 M2.3 工具循环使用 */
+ *  enableTools 附加内置工具定义（含 propose_command 等），供工具循环使用；
+ *  planForced 强制 / 重规划轮：后端只下发 propose_plan 并置 tool_choice 强制调用；
+ *  planStepActive 计划执行步：后端剔除 propose_plan 并追加 conclude_plan（提前收敛判定）；
+ *  disablePlanProposal 用户拒绝计划后的整回合：后端从全量工具剔除 propose_plan */
 export function aiChatStream(
   scope: AiScope,
   messages: AiWireMessage[],
-  opts?: { enableTools?: boolean },
+  opts?: {
+    enableTools?: boolean
+    planForced?: boolean
+    planStepActive?: boolean
+    disablePlanProposal?: boolean
+  },
 ): Promise<void> {
-  return invoke('ai_chat_stream', { scope, messages, enableTools: opts?.enableTools ?? false })
+  return invoke('ai_chat_stream', {
+    scope,
+    messages,
+    enableTools: opts?.enableTools ?? false,
+    planForced: opts?.planForced ?? false,
+    planStepActive: opts?.planStepActive ?? false,
+    disablePlanProposal: opts?.disablePlanProposal ?? false,
+  })
 }
 
 /** 中止指定 scope 的流式回复 */

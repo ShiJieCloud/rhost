@@ -23,6 +23,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::applog;
 use crate::applog::persisted::{self, APP_CONFIG_FILE_NAME};
 use crate::store;
 
@@ -215,9 +216,12 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [AiMessage],
     stream: bool,
-    /// 模型可调用的工具定义（enableTools 时为内置 propose_command，见 [`builtin_tools`]）
+    /// 模型可调用的工具定义（enableTools 时下发，见 [`select_tools`] / [`builtin_tools`]）
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
+    /// 强制工具调用（仅强制 / 重规划轮）：{"type":"function","function":{"name":"propose_plan"}}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 /// 发起一轮流式对话。token 经 `ai-token` 事件增量推送，结束推送 `ai-done`；
@@ -231,6 +235,9 @@ pub async fn ai_chat_stream(
     scope: String,
     messages: Vec<AiMessage>,
     enable_tools: Option<bool>,
+    plan_forced: Option<bool>,
+    plan_step_active: Option<bool>,
+    disable_plan_proposal: Option<bool>,
 ) -> Result<(), String> {
     validate_scope(&scope)?;
     if messages.is_empty() {
@@ -238,16 +245,79 @@ pub async fn ai_chat_stream(
     }
     let cfg = read_ai_settings(&app)?;
 
-    let tools = enable_tools.unwrap_or(false).then(builtin_tools);
+    let plan_forced = plan_forced.unwrap_or(false);
+    let plan_step_active = plan_step_active.unwrap_or(false);
+    let disable_plan_proposal = disable_plan_proposal.unwrap_or(false);
+    // 工具列表按场景裁剪：强制/重规划轮只下发 propose_plan；计划执行步换入 conclude_plan、
+    // 剔除 propose_plan；用户拒绝计划的回合剔除 propose_plan
+    let tools = enable_tools
+        .unwrap_or(false)
+        .then(|| select_tools(plan_forced, plan_step_active, disable_plan_proposal));
+    // 强制调用 propose_plan（服务端约束，保证必然产出计划）
+    let tool_choice = plan_forced.then(|| {
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": "propose_plan" }
+        })
+    });
     let token = state.register(&scope);
-    let outcome = run_stream(&app, &cfg, &scope, &messages, token.clone(), tools).await;
+
+    applog::emit(
+        log::Level::Info,
+        "ai",
+        applog::events::AI_STREAM_START,
+        Some(&scope),
+        "AI 流式对话开始",
+        Some(serde_json::json!({
+            "model": cfg.model,
+            "message_count": messages.len(),
+            "enable_tools": enable_tools.unwrap_or(false),
+            "plan_forced": plan_forced,
+            "plan_step_active": plan_step_active,
+            "disable_plan_proposal": disable_plan_proposal,
+        })),
+    );
+
+    let outcome = run_stream(
+        &app,
+        &cfg,
+        &scope,
+        &messages,
+        token.clone(),
+        tools,
+        tool_choice,
+    )
+    .await;
     state.unregister(&scope, &token);
+
+    // outcome 已经是 Ok(()) 或 Err(String)，run_stream 内部已按分支 emit 结果，
+    // 此处只兜底一个未覆盖的失败分支
+    if outcome.is_err() {
+        applog::emit(
+            log::Level::Error,
+            "ai",
+            applog::events::AI_STREAM_FAILED,
+            Some(&scope),
+            "AI 流式对话失败",
+            outcome.as_ref().err().map(|e| serde_json::json!({ "error": e })),
+        );
+    }
     outcome
 }
 
 /// 用户主动中止指定 scope 的流式回复（幂等：无进行中请求时无操作）
 #[tauri::command]
 pub fn ai_stop_chat(state: State<'_, AiState>, scope: String) {
+    if state.cancels.lock().unwrap().get(&scope).is_some() {
+        applog::emit(
+            log::Level::Info,
+            "ai",
+            applog::events::AI_STREAM_STOP_REQUEST,
+            Some(&scope),
+            "用户请求中止 AI 对话",
+            None,
+        );
+    }
     if let Some(t) = state.cancels.lock().unwrap().get(&scope) {
         t.cancel();
     }
@@ -377,8 +447,93 @@ fn builtin_tools() -> serde_json::Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_plan",
+                "description": "当任务复杂时需要先规划再执行：目标需要 3 个以上可独立验证的步骤、涉及多个文件或多个服务且有先后依赖、或需要先诊断后修改再验证时，调用本工具提出执行计划，由用户确认后再逐步执行。简单任务（单条命令、单次读文件、单次查询、纯咨询）不要调用本工具，直接作答。【硬约束】调用本工具时本轮必须独占，禁止同时输出任何其他工具调用；若你已确定要立即执行某个动作（如执行命令、修改文件），就不要调用本工具，直接输出该动作。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "minItems": 3,
+                            "maxItems": 8,
+                            "description": "按执行顺序排列的计划步骤",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string", "description": "一句话描述该步骤要做什么，不超过 50 字符，须自描述、完整动作，作为 todo 展示给用户" },
+                                    "detail": { "type": "string", "description": "执行参考：具体做什么、如何验证结果（不展示给用户，仅供执行时参考）" }
+                                },
+                                "required": ["title", "detail"]
+                            }
+                        }
+                    },
+                    "required": ["steps"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "conclude_plan",
+                "description": "当【继续执行剩余步骤已无必要】时调用本工具，调用后剩余步骤不再执行，直接进入结果归纳。仅在以下两种情形调用：① outcome=resolved——原始目标（信息获取、诊断、解释类）已被已完成步骤的结果完整回答；② outcome=blocked——动作型目标（修复、安装、部署、重启等）的前提已被证伪或不成立（例如要求修复 nginx 但发现机器上未安装 nginx），后续步骤已不可行，此时应收敛并给出阻塞点与建议，而不是继续执行无效步骤。禁止在以下情况调用：① 目标仍然可达且剩余步骤仍然有效，仅因当前步骤困难、报错或耗时而想收尾；② 剩余步骤是用户显式要求且仍可执行的动作。调用后请直接输出结论正文，不要在同一轮调用其他工具。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "outcome": {
+                            "type": "string",
+                            "enum": ["resolved", "blocked"],
+                            "description": "resolved：目标已达成或信息已足以回答；blocked：目标前提不成立、剩余步骤不可行"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "resolved 时说明已获得哪些关键信息；blocked 时说明阻塞原因与建议的下一步"
+                        }
+                    },
+                    "required": ["outcome", "reason"]
+                }
+            }
         }
     ])
+}
+
+/// 组装本轮下发的工具列表（规划路径收敛为 propose_plan 单一路径）：
+/// - `plan_forced`（强制 / 重规划轮）：只下发 `propose_plan`，配合 `tool_choice` 保证必然产出计划；
+/// - `plan_step_active`（计划执行步）：全量剔除 `propose_plan`（执行中不应再提新计划）、
+///   追加 `conclude_plan`（允许判定「剩余步骤已无必要」时提前收敛）；
+/// - `disable_plan_proposal`（用户拒绝计划后的整个回合）：全量剔除 `propose_plan`，
+///   使模型上下文中不存在该工具、物理上无法再提案；
+/// - 默认：全量内置工具（10 个，含 conclude_plan 定义但仅在执行步下发）。
+fn select_tools(
+    plan_forced: bool,
+    plan_step_active: bool,
+    disable_plan_proposal: bool,
+) -> serde_json::Value {
+    let all = builtin_tools();
+    let find = |name: &str| -> Option<serde_json::Value> {
+        all.as_array()
+            .and_then(|a| a.iter().find(|t| t["function"]["name"] == name).cloned())
+    };
+    if plan_forced {
+        return serde_json::Value::Array(find("propose_plan").into_iter().collect());
+    }
+    let mut arr = all.as_array().cloned().unwrap_or_default();
+    arr.retain(|t| {
+        let name = t["function"]["name"].as_str().unwrap_or("");
+        if name == "propose_plan" {
+            // 执行步与「拒绝计划后的回合」均不下发
+            return !(plan_step_active || disable_plan_proposal);
+        }
+        if name == "conclude_plan" {
+            // 仅计划执行步下发；常规 ReAct 轮无「剩余步骤」概念，下发会诱导无效调用
+            return plan_step_active;
+        }
+        true
+    });
+    serde_json::Value::Array(arr)
 }
 
 /// 只读工具执行结果（前端 camelCase）
@@ -559,36 +714,97 @@ pub async fn ai_exec_tool(
     state: State<'_, crate::ssh::manager::SessionManager>,
     ai_state: State<'_, AiState>,
 ) -> Result<ToolExecResult, String> {
-    let cmd = build_tool_command(&tool_name, &args)?;
+    let cmd = match build_tool_command(&tool_name, &args) {
+        Ok(c) => c,
+        Err(e) => {
+            applog::emit(
+                log::Level::Error,
+                "ai",
+                applog::events::AI_TOOL_EXEC_FAILED,
+                Some(&session_id),
+                "AI 工具参数解析/构造失败",
+                Some(serde_json::json!({
+                    "tool_name": tool_name,
+                    "error": e,
+                })),
+            );
+            return Err(e);
+        }
+    };
+
+    applog::emit(
+        log::Level::Info,
+        "ai",
+        applog::events::AI_TOOL_EXEC_START,
+        Some(&session_id),
+        "AI 工具开始执行",
+        Some(serde_json::json!({ "tool_name": tool_name })),
+    );
 
     // 登记取消令牌：会话切换时前端调 ai_cancel_execs 取消在飞 exec
     let token = ai_state.register_exec(&session_id);
     let exec_fut = state.exec_collect(&session_id, &cmd, std::time::Duration::from_secs(10));
     // exec_collect 与取消令牌竞速：令牌取消时 exec_fut 被 drop → 通道关闭
     let result = tokio::select! {
-        _ = token.cancelled() => ToolExecResult {
-            output: String::new(),
-            truncated: false,
-            exit_code: None,
-            timed_out: false,
-        },
-        r = exec_fut => match r {
-            Ok(exec) => {
-                let (truncated, capped) = cap_output(&exec.output);
-                ToolExecResult {
-                    output: capped,
-                    truncated,
-                    exit_code: exec.exit_code,
-                    timed_out: exec.timed_out,
-                }
-            }
-            // 通道级故障（会话不存在/channel_open_session 失败等）：无任何输出
-            Err(_) => ToolExecResult {
+        _ = token.cancelled() => {
+            applog::emit(
+                log::Level::Info,
+                "ai",
+                applog::events::AI_TOOL_EXEC_CANCELLED,
+                Some(&session_id),
+                "AI 工具执行被取消",
+                Some(serde_json::json!({ "tool_name": tool_name })),
+            );
+            ToolExecResult {
                 output: String::new(),
                 truncated: false,
                 exit_code: None,
                 timed_out: false,
-            },
+            }
+        }
+        r = exec_fut => match r {
+            Ok(exec) => {
+                let (truncated, capped) = cap_output(&exec.output);
+                let exit_code = exec.exit_code;
+                let timed_out = exec.timed_out;
+                let ok = exit_code == Some(0);
+                applog::emit(
+                    if ok { log::Level::Info } else { log::Level::Warn },
+                    "ai",
+                    applog::events::AI_TOOL_EXEC_DONE,
+                    Some(&session_id),
+                    if ok { "AI 工具执行完成" } else { "AI 工具执行完成（非零退出码）" },
+                    Some(serde_json::json!({
+                        "tool_name": tool_name,
+                        "exit_code": exit_code,
+                        "timed_out": timed_out,
+                        "truncated": truncated,
+                    })),
+                );
+                ToolExecResult {
+                    output: capped,
+                    truncated,
+                    exit_code,
+                    timed_out,
+                }
+            }
+            // 通道级故障（会话不存在/channel_open_session 失败等）：无任何输出
+            Err(_) => {
+                applog::emit(
+                    log::Level::Error,
+                    "ai",
+                    applog::events::AI_TOOL_EXEC_FAILED,
+                    Some(&session_id),
+                    "AI 工具执行通道级故障",
+                    Some(serde_json::json!({ "tool_name": tool_name })),
+                );
+                ToolExecResult {
+                    output: String::new(),
+                    truncated: false,
+                    exit_code: None,
+                    timed_out: false,
+                }
+            }
         }
     };
     ai_state.unregister_exec(&session_id, &token);
@@ -608,6 +824,7 @@ async fn run_stream(
     messages: &[AiMessage],
     token: CancellationToken,
     tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let client = http_client()?;
     let url = format!("{}/chat/completions", cfg.base_url);
@@ -618,6 +835,7 @@ async fn run_stream(
             messages,
             stream: true,
             tools,
+            tool_choice,
         });
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
@@ -627,10 +845,29 @@ async fn run_stream(
     let send_fut = req.send();
     let response = tokio::select! {
         _ = token.cancelled() => {
+            applog::emit(
+                log::Level::Info,
+                "ai",
+                applog::events::AI_STREAM_ABORTED,
+                Some(scope),
+                "AI 对话在建连前被中止",
+                Some(serde_json::json!({ "stage": "send" })),
+            );
             let _ = app.emit("ai-done", serde_json::json!({ "scope": scope, "reason": "stopped" }));
             return Ok(());
         }
-        r = send_fut => r.map_err(|e| format!("请求模型服务失败: {e}"))?,
+        r = send_fut => r.map_err(|e| {
+            let msg = format!("请求模型服务失败: {e}");
+            applog::emit(
+                log::Level::Error,
+                "ai",
+                applog::events::AI_STREAM_FAILED,
+                Some(scope),
+                &msg,
+                Some(serde_json::json!({ "error": e.to_string() })),
+            );
+            msg
+        })?,
     };
 
     let status = response.status();
@@ -638,7 +875,19 @@ async fn run_stream(
         // 错误体截断，避免上游 HTML 错误页刷屏
         let body = response.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(500).collect();
-        return Err(format!("模型服务返回 HTTP {status}: {snippet}"));
+        let msg = format!("模型服务返回 HTTP {status}: {snippet}");
+        applog::emit(
+            log::Level::Error,
+            "ai",
+            applog::events::AI_HTTP_ERROR,
+            Some(scope),
+            "上游 HTTP 非 2xx",
+            Some(serde_json::json!({
+                "status": status.as_u16(),
+                "snippet": snippet,
+            })),
+        );
+        return Err(msg);
     }
 
     let mut stream = response.bytes_stream();
@@ -658,6 +907,14 @@ async fn run_stream(
     loop {
         let chunk = tokio::select! {
             _ = token.cancelled() => {
+                applog::emit(
+                    log::Level::Info,
+                    "ai",
+                    applog::events::AI_STREAM_ABORTED,
+                    Some(scope),
+                    "AI 对话在流式过程中被中止",
+                    Some(serde_json::json!({ "stage": "stream" })),
+                );
                 emit_done!("stopped");
                 return Ok(());
             }
@@ -669,10 +926,29 @@ async fn run_stream(
                 // 对端关闭流（未显式给 [DONE] 也视为完成）
                 finish_stream(app, scope, &acc);
                 emit_done!("completed");
+                applog::emit(
+                    log::Level::Info,
+                    "ai",
+                    applog::events::AI_STREAM_DONE,
+                    Some(scope),
+                    "AI 流式对话完成（对端关闭）",
+                    Some(serde_json::json!({
+                        "finish_reason": acc.finish_reason.as_deref(),
+                        "tool_call_count": acc.tool_calls.len(),
+                    })),
+                );
                 return Ok(());
             }
             Some(Err(e)) => {
                 let msg = format!("读取模型响应失败: {e}");
+                applog::emit(
+                    log::Level::Error,
+                    "ai",
+                    applog::events::AI_STREAM_FAILED,
+                    Some(scope),
+                    &msg,
+                    Some(serde_json::json!({ "error": e.to_string() })),
+                );
                 let _ = app.emit(
                     "ai-error",
                     serde_json::json!({ "scope": scope, "message": msg }),
@@ -688,6 +964,17 @@ async fn run_stream(
                     if line_stops(&line) {
                         finish_stream(app, scope, &acc);
                         emit_done!("completed");
+                        applog::emit(
+                            log::Level::Info,
+                            "ai",
+                            applog::events::AI_STREAM_DONE,
+                            Some(scope),
+                            "AI 流式对话完成（收到 [DONE]）",
+                            Some(serde_json::json!({
+                                "finish_reason": acc.finish_reason.as_deref(),
+                                "tool_call_count": acc.tool_calls.len(),
+                            })),
+                        );
                         return Ok(());
                     }
                 }
@@ -747,6 +1034,17 @@ fn finish_stream(app: &AppHandle, scope: &str, acc: &StreamAcc) {
         })
         .collect();
     if !calls.is_empty() {
+        applog::emit(
+            log::Level::Info,
+            "ai",
+            applog::events::AI_TOOL_CALLS_REQUESTED,
+            Some(scope),
+            "模型请求了工具调用",
+            Some(serde_json::json!({
+                "count": calls.len(),
+                "names": calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            })),
+        );
         let _ = app.emit(
             "ai-tool-calls",
             serde_json::json!({ "scope": scope, "calls": calls }),
@@ -787,6 +1085,14 @@ fn handle_sse_line(
             .and_then(|m| m.as_str())
             .or_else(|| e.as_str())
     }) {
+        applog::emit(
+            log::Level::Error,
+            "ai",
+            applog::events::AI_UPSTREAM_ERROR,
+            Some(scope),
+            "上游返回错误帧",
+            Some(serde_json::json!({ "message": msg })),
+        );
         let _ = app.emit(
             "ai-error",
             serde_json::json!({ "scope": scope, "message": msg }),
@@ -854,93 +1160,6 @@ fn acc_tool_call(acc: &mut StreamAcc, tc: &serde_json::Value) {
     }
 }
 
-/// 流式调用并收集完整正文（规划生成用）。
-///
-/// 与 [`run_stream`] 同源的 SSE 消费，但语义是「流式收集后整体解析」：
-/// - 只推 `ai-token` 增量（思考/正文），**不推** `ai-done` / `ai-tool-calls`——
-///   结束与提案一律通过返回值表达，避免与前端编排状态机相互干扰
-///   （上游内联错误帧仍透传 `ai-error`，属协议层硬失败，前端降级为普通 ReAct）；
-/// - 流结束（`[DONE]` 或对端关闭）返回累积正文，供 `parse_plan_json` 解析；
-/// - 不带工具定义（规划是一次纯文本结构化输出）。
-///
-/// 之所以用流式而非 [`chat_non_stream`]：思考模式模型单次规划可耗时数十秒，
-/// 非流式的固定超时容易误杀；流式既无整体超时，又能让规划过程在前端实时可见。
-async fn chat_stream_collect(
-    app: &AppHandle,
-    cfg: &AiCfg,
-    scope: &str,
-    sys_prompt: &str,
-    extra_sys: Option<&str>,
-    messages: Vec<AiMessage>,
-    token: CancellationToken,
-) -> Result<String, String> {
-    let mut wired: Vec<AiMessage> = Vec::with_capacity(messages.len() + 2);
-    wired.push(AiMessage {
-        role: "system".into(),
-        content: Some(serde_json::Value::String(sys_prompt.into())),
-        tool_calls: None,
-        tool_call_id: None,
-    });
-    // 规则等附加 system（注意力靠后：稳定提示词在前，约定在后）
-    if let Some(extra) = extra_sys {
-        wired.push(AiMessage {
-            role: "system".into(),
-            content: Some(serde_json::Value::String(extra.into())),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    wired.extend(messages);
-
-    let client = http_client()?;
-    let url = format!("{}/chat/completions", cfg.base_url);
-    let mut req = client.post(&url).json(&ChatRequest {
-        model: &cfg.model,
-        messages: &wired,
-        stream: true,
-        tools: None,
-    });
-    if let Some(key) = &cfg.api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = tokio::select! {
-        _ = token.cancelled() => return Err("规划已取消".to_string()),
-        r = req.send() => r.map_err(|e| format!("请求模型服务失败: {e}"))?,
-    };
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
-        return Err(format!("模型服务返回 HTTP {status}: {snippet}"));
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut acc = StreamAcc::default();
-    loop {
-        let chunk = tokio::select! {
-            _ = token.cancelled() => return Err("规划已取消".to_string()),
-            next = stream.next() => next,
-        };
-        match chunk {
-            None => break, // 对端关闭流（未显式给 [DONE] 也视为完成）
-            Some(Err(e)) => return Err(format!("读取响应流失败: {e}")),
-            Some(Ok(bytes)) => {
-                buf.extend_from_slice(&bytes);
-                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    handle_sse_line(app, scope, &line, &mut acc)?;
-                    if line_stops(&line) {
-                        return Ok(acc.content);
-                    }
-                }
-            }
-        }
-    }
-    Ok(acc.content)
-}
-
 /* =========================================================
  *  测试连接
  * ========================================================= */
@@ -977,39 +1196,70 @@ pub async fn ai_test_connection(
     }
 
     let started = Instant::now();
-    let resp = timeout(std::time::Duration::from_secs(10), req.send())
-        .await
-        .map_err(|_| "连接超时（10s）".to_string())?
-        .map_err(|e| format!("请求失败: {e}"))?;
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let status = resp.status();
+    let result: Result<AiTestResult, String> = (async {
+        let resp = timeout(std::time::Duration::from_secs(10), req.send())
+            .await
+            .map_err(|_| "连接超时（10s）".to_string())
+            .and_then(|r| r.map_err(|e| format!("请求失败: {e}")))?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let status = resp.status();
 
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
-        return Err(format!("HTTP {status}: {snippet}"));
-    }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(300).collect();
+            return Err(format!("HTTP {status}: {snippet}"));
+        }
 
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析模型列表失败: {e}"))?;
-    let models: Vec<String> = data
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
-                .collect()
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析模型列表失败: {e}"))?;
+        let models: Vec<String> = data
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let model_count = models.len();
+        Ok(AiTestResult {
+            latency_ms,
+            status: status.as_u16(),
+            model_count,
+            models: models.into_iter().take(20).collect(),
         })
-        .unwrap_or_default();
-    let model_count = models.len();
-    Ok(AiTestResult {
-        latency_ms,
-        status: status.as_u16(),
-        model_count,
-        models: models.into_iter().take(20).collect(),
     })
+    .await;
+
+    match &result {
+        Ok(r) => {
+            applog::emit(
+                log::Level::Info,
+                "ai",
+                applog::events::AI_TEST_OK,
+                None,
+                "AI 测试连接成功",
+                Some(serde_json::json!({
+                    "status": r.status,
+                    "latency_ms": r.latency_ms,
+                    "model_count": r.model_count,
+                })),
+            );
+        }
+        Err(e) => {
+            applog::emit(
+                log::Level::Error,
+                "ai",
+                applog::events::AI_TEST_FAILED,
+                None,
+                "AI 测试连接失败",
+                Some(serde_json::json!({ "error": e })),
+            );
+        }
+    }
+    result
 }
 
 /* =========================================================
@@ -1132,7 +1382,6 @@ struct NonStreamMessage {
 /// 取首个 choice 的 message.content；空内容报错。
 /// 超时取值：思考模式模型（如 qwen3-max 系列默认开启 thinking）在复杂输入下
 /// 单个请求可耗时 55~60s，用 60s 超时会稳定失败，故放宽到 180s。
-/// （规划生成已改用 [`chat_stream_collect`]，不再受固定超时约束）
 async fn chat_non_stream(
     cfg: &AiCfg,
     sys_prompt: &str,
@@ -1154,6 +1403,7 @@ async fn chat_non_stream(
         messages: &wired,
         stream: false,
         tools: None,
+        tool_choice: None,
     });
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
@@ -1193,191 +1443,6 @@ pub async fn ai_summarize(app: AppHandle, messages: Vec<AiMessage>) -> Result<St
     }
     let cfg = read_ai_settings(&app)?;
     chat_non_stream(&cfg, SUMMARIZE_PROMPT, messages).await
-}
-
-/* =========================================================
- *  Plan-and-Act 计划生成（M4：ai_plan_generate）
- * ========================================================= */
-
-/// 计划生成器指令：拆解用户目标为 3~8 步，严格输出 JSON 数组。
-/// 声明执行环境（SSH + 只读工具 + 授权写操作）使步骤落到工具可及范围。
-const PLANNER_PROMPT: &str = "你是运维任务规划器。请将用户的目标拆解为 3~8 个可执行步骤，输出严格的 JSON 数组，不要输出任何其他文本、解释或 markdown 代码围栏。\n执行环境：SSH 远程服务器；可用只读工具 read_file（读取文件内容）、list_directory（列出目录）、get_system_info（系统信息快照），以及经用户授权后的写操作（编辑文件、执行命令）。\n每个步骤是一个对象：{\"title\": \"一句话描述该步骤要做什么（不超过 50 字符，须自描述、完整动作，作为 todo 展示给用户）\", \"detail\": \"执行参考：具体做什么、如何验证结果（不展示给用户，仅供执行时参考）\"}。\n要求：步骤按执行顺序排列；先观察诊断、后修改验证；title 之间信息不重复，各自聚焦本步动作；每步可通过上述工具独立完成；不要包含无法通过命令行完成的步骤。";
-
-/// 计划步数范围：少于 3 步无需规划（普通 ReAct 即可），
-/// 多于 8 步注入膨胀且模型长程规划质量显著下降
-const PLAN_MIN_STEPS: usize = 3;
-const PLAN_MAX_STEPS: usize = 8;
-/// 步骤标题上限（字符）：卡片单行展示；Planner prompt 约束 + 此处截断双闸
-const PLAN_TITLE_MAX_CHARS: usize = 50;
-
-/// 计划生成结果（前端 camelCase）
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanGenResult {
-    /// 步骤列表（3~8 步，已校验）
-    steps: Vec<PlanStepOut>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanStepOut {
-    /// 步骤简述（≤50 字符）
-    title: String,
-    /// 步骤详情（做什么、如何验证）
-    detail: String,
-}
-
-/// 模型输出的步骤（宽松反序列化：缺字段按空串，后续校验剔除）
-#[derive(Deserialize)]
-struct PlanStepIn {
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    detail: String,
-}
-
-/// 宽松解析模型输出为步骤数组：模型未严格遵守「只输出 JSON」时，
-/// 截取首个 `[` 至末个 `]` 的子串再反序列化。
-/// 校验：步数 ∈ [3, 8]；title 空白的步剔除，剔除后不足 3 步整体报错；
-/// title 超 50 字符截断（按 char 计，不拆多字节字符）。
-fn parse_plan_json(raw: &str) -> Result<Vec<PlanStepOut>, String> {
-    let start = raw.find('[').ok_or("计划输出不含 JSON 数组")?;
-    let end = raw.rfind(']').ok_or("计划输出不含 JSON 数组")?;
-    if end <= start {
-        return Err("计划输出 JSON 数组不完整".to_string());
-    }
-    let items: Vec<PlanStepIn> = serde_json::from_str(&raw[start..=end])
-        .map_err(|e| format!("计划 JSON 解析失败: {e}"))?;
-    let steps: Vec<PlanStepOut> = items
-        .into_iter()
-        .filter(|s| !s.title.trim().is_empty())
-        .map(|s| PlanStepOut {
-            title: s.title.trim().chars().take(PLAN_TITLE_MAX_CHARS).collect(),
-            detail: s.detail.trim().to_string(),
-        })
-        .collect();
-    if steps.len() < PLAN_MIN_STEPS {
-        return Err(format!(
-            "计划步骤不足 {} 步（实际 {} 步），请改用普通模式提问",
-            PLAN_MIN_STEPS,
-            steps.len()
-        ));
-    }
-    if steps.len() > PLAN_MAX_STEPS {
-        return Err(format!(
-            "计划步骤超过 {} 步（实际 {} 步），请缩小目标范围后重试",
-            PLAN_MAX_STEPS,
-            steps.len()
-        ));
-    }
-    Ok(steps)
-}
-
-/// 规划输入是否为空：`content` 兼容字符串（纯文本）与 content parts 数组（含图片）两种形态
-fn plan_content_is_empty(content: &serde_json::Value) -> bool {
-    match content {
-        serde_json::Value::String(s) => s.trim().is_empty(),
-        serde_json::Value::Array(a) => a.is_empty(),
-        serde_json::Value::Null => true,
-        _ => false,
-    }
-}
-
-/// 生成执行计划（Plan-and-Act）：流式调用并按 scope 实时推送增量（前端把规划过程
-/// 展示在「执行过程」区），流结束后对累积正文做宽松 JSON 解析。
-/// `content` 为 user 消息内容：字符串（纯文本，文本/代码附件已内联为 `<file>` 块）
-/// 或 content parts 数组（含图片时的多模态形态），与对话链路同构。
-/// 取消令牌登记进 cancels（与对话流同一 scope 键）：中止/新请求顶替时取消在飞规划。
-#[tauri::command]
-pub async fn ai_plan_generate(
-    app: AppHandle,
-    scope: String,
-    content: serde_json::Value,
-    state: State<'_, AiState>,
-) -> Result<PlanGenResult, String> {
-    if plan_content_is_empty(&content) {
-        return Err("规划输入为空".to_string());
-    }
-    let cfg = read_ai_settings(&app)?;
-    let token = state.register(&scope);
-    let messages = vec![AiMessage {
-        role: "user".into(),
-        content: Some(content),
-        tool_calls: None,
-        tool_call_id: None,
-    }];
-    let rules_sys = plan_rules_system(&app);
-    let result = chat_stream_collect(
-        &app,
-        &cfg,
-        &scope,
-        PLANNER_PROMPT,
-        rules_sys.as_deref(),
-        messages,
-        token.clone(),
-    )
-    .await
-    .and_then(|raw| parse_plan_json(&raw));
-    state.unregister(&scope, &token);
-    result.map(|steps| PlanGenResult { steps })
-}
-
-/// 规划轮注入的用户自定义规则 system 文本（无启用规则时返回 None）。
-///
-/// 与对话轮同口径：设置唯一真相源在 app_config.json 的 settings 节，
-/// 直接读 `aiRulesEnabled`（默认 true）/ `aiRulesDisabled`（文件名黑名单），
-/// 扫描 ai/rules/ 目录、单文件 8KB 截断，总预算 16KB UTF-8 超出丢弃靠后。
-/// 尾部固定追加结构化输出防护语，避免规则干扰规划 JSON 解析。
-fn plan_rules_system(app: &AppHandle) -> Option<String> {
-    const BUDGET: usize = 16 * 1024;
-    let path = app_config_file(app).ok()?;
-    let s = &persisted::load_full(&path).settings;
-    if !s.get("aiRulesEnabled").and_then(|v| v.as_bool()).unwrap_or(true) {
-        return None;
-    }
-    let disabled: Vec<String> = s
-        .get("aiRulesDisabled")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let dir = prompt_asset_dir(app, "rules").ok()?;
-    let all = scan_prompt_dir(&dir);
-    let files: Vec<&PromptAsset> = all
-        .iter()
-        .filter(|a| !disabled.contains(&a.file_name))
-        .collect();
-    if files.is_empty() {
-        return None;
-    }
-
-    let mut used = 0usize;
-    let mut dropped = 0usize;
-    let mut parts: Vec<String> = Vec::new();
-    for a in files {
-        let cut = if a.truncated { "，内容已截断" } else { "" };
-        let block = format!("## {}（rules/{}{}）\n\n{}", a.name, a.file_name, cut, a.content);
-        let bytes = block.len();
-        if used + bytes > BUDGET {
-            dropped += 1;
-            continue;
-        }
-        used += bytes;
-        parts.push(block);
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let mut content = format!("# 用户自定义规则（遵循以下约定响应）\n\n{}", parts.join("\n\n"));
-    if dropped > 0 {
-        content.push_str(&format!("\n\n（其余 {dropped} 个文件因总量超限未注入）"));
-    }
-    content.push_str("\n\n注意：以上规则不改变输出格式要求，仍须只输出 JSON 步骤数组。");
-    Some(content)
 }
 
 /* =========================================================
@@ -1569,7 +1634,14 @@ fn load_memories(path: &Path) -> Vec<MemoryItem> {
         return Vec::new();
     };
     serde_json::from_str(&raw).unwrap_or_else(|e| {
-        log::warn!("memory.json 解析失败，按空记忆处理: {e}");
+        applog::emit(
+            log::Level::Warn,
+            "ai",
+            applog::events::AI_MEMORY_PARSE_FAILED,
+            None,
+            "memory.json 解析失败，按空记忆处理",
+            Some(serde_json::json!({ "error": e.to_string() })),
+        );
         Vec::new()
     })
 }
@@ -1727,7 +1799,7 @@ mod tests {
     fn builtin_tools_shape() {
         let v = builtin_tools();
         let arr = v.as_array().expect("tools 应为数组");
-        assert_eq!(arr.len(), 8);
+        assert_eq!(arr.len(), 10);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -1742,14 +1814,29 @@ mod tests {
                 "write_file",
                 "sftp_upload_file",
                 "sftp_download_file",
-                "propose_command"
+                "propose_command",
+                "propose_plan",
+                "conclude_plan"
             ]
         );
         // sftp 工具需两个路径参数
         assert_eq!(arr[5]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
         assert_eq!(arr[6]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
-        // propose_command 为最后一个，需含 command 参数
+        // propose_command 需含 command 参数
         assert_eq!(arr[7]["function"]["parameters"]["required"][0], "command");
+        // propose_plan 需含 steps 参数（3~8 步，与前端校验同口径）
+        assert_eq!(arr[8]["function"]["parameters"]["required"][0], "steps");
+        let steps_schema = &arr[8]["function"]["parameters"]["properties"]["steps"];
+        assert_eq!(steps_schema["minItems"], 3);
+        assert_eq!(steps_schema["maxItems"], 8);
+        // conclude_plan 需 outcome + reason 双必填，outcome 为二值枚举
+        let conclude_params = &arr[9]["function"]["parameters"];
+        assert_eq!(conclude_params["required"][0], "outcome");
+        assert_eq!(conclude_params["required"][1], "reason");
+        assert_eq!(
+            conclude_params["properties"]["outcome"]["enum"],
+            serde_json::json!(["resolved", "blocked"])
+        );
         // read_file / list_directory 需 path 参数
         assert_eq!(arr[0]["function"]["parameters"]["required"][0], "path");
         assert_eq!(arr[1]["function"]["parameters"]["required"][0], "path");
@@ -1757,6 +1844,43 @@ mod tests {
         assert_eq!(arr[3]["function"]["parameters"]["required"].as_array().unwrap().len(), 3);
         // write_file 需 path/content
         assert_eq!(arr[4]["function"]["parameters"]["required"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn select_tools_covers_plan_scenarios() {
+        let names = |v: serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // 常规轮（ReAct）：全量减去仅在执行步下发的 conclude_plan
+        let react = names(select_tools(false, false, false));
+        assert_eq!(react.len(), 9);
+        assert!(!react.contains(&"conclude_plan".to_string()));
+        assert!(react.contains(&"propose_plan".to_string()));
+        // 强制 / 重规划轮：只下发 propose_plan（配合 tool_choice 保证产出计划）
+        assert_eq!(
+            names(select_tools(true, false, false)),
+            vec!["propose_plan"]
+        );
+        // 计划执行步：剔除 propose_plan、换入 conclude_plan
+        let step = names(select_tools(false, true, false));
+        assert_eq!(step.len(), 9);
+        assert!(!step.contains(&"propose_plan".to_string()));
+        assert!(step.contains(&"conclude_plan".to_string()));
+        // 用户拒绝计划后的回合：物理剔除 propose_plan（防循环提案），不引入 conclude_plan；
+        // 常规轮全量 9 再去掉 propose_plan，故为 8
+        let banned = names(select_tools(false, false, true));
+        assert_eq!(banned.len(), 8);
+        assert!(!banned.contains(&"propose_plan".to_string()));
+        assert!(!banned.contains(&"conclude_plan".to_string()));
+        // 强制轮优先：其余开关同时命中仍只下发 propose_plan
+        assert_eq!(
+            names(select_tools(true, true, true)),
+            vec!["propose_plan"]
+        );
     }
 
     #[test]
@@ -1818,79 +1942,6 @@ mod tests {
         assert!(truncated);
         assert!(capped.len() <= 8192);
         assert!(capped.chars().all(|c| c == '你')); // 不拆字
-    }
-
-    #[test]
-    fn parse_plan_json_strict() {
-        let raw = r#"[
-            {"title":"查看 nginx 配置","detail":"读取 /etc/nginx/nginx.conf"},
-            {"title":"检查后端服务","detail":"curl 后端端口确认响应"},
-            {"title":"修复并重启","detail":"修改配置后 systemctl restart nginx"}
-        ]"#;
-        let steps = parse_plan_json(raw).expect("严格 JSON 应解析成功");
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].title, "查看 nginx 配置");
-        assert_eq!(steps[2].detail, "修改配置后 systemctl restart nginx");
-    }
-
-    #[test]
-    fn parse_plan_json_lenient_strips_prose() {
-        // 模型未严格遵守时：截取首个 [ 至末个 ]
-        let raw = "好的，这是计划：\n```json\n[{\"title\":\"步骤一\",\"detail\":\"d1\"},{\"title\":\"步骤二\",\"detail\":\"d2\"},{\"title\":\"步骤三\",\"detail\":\"d3\"}]\n```\n请确认。";
-        let steps = parse_plan_json(raw).expect("宽松解析应成功");
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].title, "步骤一");
-        // 无 JSON 数组
-        assert!(parse_plan_json("无法规划").is_err());
-        // 数组不完整
-        assert!(parse_plan_json("[] x").is_err() || parse_plan_json("] [").is_err());
-    }
-
-    #[test]
-    fn parse_plan_json_step_count_bounds() {
-        // 2 步：不足下限
-        let two = r#"[{"title":"a","detail":"d"},{"title":"b","detail":"d"}]"#;
-        assert!(parse_plan_json(two).is_err());
-        // 9 步：超过上限
-        let nine: String = format!(
-            "[{}]",
-            (0..9)
-                .map(|i| format!(r#"{{"title":"s{i}","detail":"d"}}"#))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert!(parse_plan_json(&nine).is_err());
-        // 空 title 步剔除后仍 ≥3：正常
-        let mixed = r#"[{"title":"","detail":"d"},{"title":"a","detail":"d"},{"title":"b","detail":"d"},{"title":"c","detail":"d"}]"#;
-        let steps = parse_plan_json(mixed).expect("剔除空 title 后 3 步应通过");
-        assert_eq!(steps.len(), 3);
-        // 空 title 剔除后 <3：报错
-        let sparse = r#"[{"title":" ","detail":"d"},{"title":"","detail":"d"},{"title":"a","detail":"d"}]"#;
-        assert!(parse_plan_json(sparse).is_err());
-    }
-
-    #[test]
-    fn parse_plan_json_title_truncates_at_50_chars() {
-        let long_title = "查".repeat(60);
-        let raw = format!(
-            r#"[{{"title":"{}","detail":"d"}},{{"title":"b","detail":"d"}},{{"title":"c","detail":"d"}}]"#,
-            long_title
-        );
-        let steps = parse_plan_json(&raw).expect("应解析成功");
-        assert_eq!(steps[0].title.chars().count(), PLAN_TITLE_MAX_CHARS);
-    }
-
-    #[test]
-    fn plan_content_empty_detection() {
-        // 纯文本：空白视为空，非空文本放行
-        assert!(plan_content_is_empty(&serde_json::Value::String("   ".into())));
-        assert!(!plan_content_is_empty(&serde_json::Value::String("排查磁盘".into())));
-        // 多模态 content parts 数组：空数组视为空，非空放行
-        assert!(plan_content_is_empty(&serde_json::json!([])));
-        assert!(!plan_content_is_empty(&serde_json::json!([
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
-        ])));
-        assert!(plan_content_is_empty(&serde_json::Value::Null));
     }
 
     #[test]

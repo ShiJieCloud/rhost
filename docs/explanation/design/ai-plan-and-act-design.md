@@ -4,7 +4,7 @@
 >
 > created: 2026-10-12 18:05:08
 >
-> updated: 2026-10-13 19:20:56
+> updated: 2026-10-14 18:16:11
 >
 > author:
 
@@ -15,6 +15,8 @@
 > 范围：本文覆盖工作台会话的「规划模式」完整链路——计划生成（Planner）、计划卡片预览/编辑/确认、每步独立 ReAct 循环执行（Act）、步骤状态机与卡片可视化、失败处理与手动重规划（Replan）、全部落定后的总结（finishPlan）。
 > 边界：不覆盖任务复杂度自动检测、步骤间依赖图与并行执行、自动重规划、global 纯推理计划（无工具场景）。
 > 关联代码：`src-tauri/src/ai.rs`、`frontend/src/lib/ai.ts`、`frontend/src/components/AiChatPanel.vue`
+> 增量设计：[ai-plan-early-convergence-design.md](./ai-plan-early-convergence-design.md) 在本文 §6.4 执行驱动之上新增「提前收敛」——计划执行步追加 `conclude_plan` 工具，判定原始目标已可回答时剩余步骤置 `skipped` 后直接进入总结轮；本文 §6.4/§6.5/§6.6/§6.7 的既有决策不变，状态机与卡片渲染零改动。
+> 修订说明：本文的触发入口与规划生成路径（§4 非目标、§5 入口段、§6.1）已被 [ADR-001](./decisions/ADR-001-model-driven-plan-trigger.md) 取代——规划改为模型自主提案 + `propose_plan` 单一路径，详见 [ai-plan-trigger-design.md](./ai-plan-trigger-design.md)；其余部分（计划状态机、逐步执行驱动、计划卡片、上下文注入、失败与重规划处理）仍然有效。
 
 **核心定位**：计划 = 给 ReAct 的**目标清单与约束**，不是不可修改的死脚本——draft 态步骤文本可编辑，确认后作为约束注入（禁止擅自新增计划外动作）；同时计划也是执行的**编排骨架**——每步独立 ReAct 循环推进，步骤状态全程可视化。
 
@@ -63,12 +65,14 @@
 
 ### 非目标
 
-- 不做任务复杂度自动检测与自动进入规划模式（规划入口永远由用户显式触发）；
+- 不做任务复杂度自动检测与自动进入规划模式（**已被 [ADR-001](./decisions/ADR-001-model-driven-plan-trigger.md) 推翻**：触发改为模型自主提案，强制入口收敛为「+」菜单「规划模式」项）；
 - 不做自动重规划（失败后的重规划必须经用户显式触发并再次确认）；
 - 不做步骤间依赖图与并行执行（MVP 仅线性顺序执行）；
 - 不支持 global scope（无终端无工具，计划无执行载体）。
 
 ## 5. 总体架构
+
+> 入口与 Planner 生成路径已被 [ADR-001](./decisions/ADR-001-model-driven-plan-trigger.md) 修订（见 §6.1 顶部说明）；下图保留原始设计记录。
 
 ```text
 入口检测（优先级：/plan 命令 > Toggle 开关 > 默认 ReAct）
@@ -99,7 +103,9 @@ plan.state=executing ──► 步骤 i 循环（step: pending→running）
 
 ## 6. 详细设计
 
-### 6.1 入口（二合一）
+### 6.1 入口（二合一，已被 ADR-001 取代）
+
+> 本节入口设计已由 [ai-plan-trigger-design.md](./ai-plan-trigger-design.md) §6.1 取代：Toggle 开关移除，强制入口收敛为输入区「+」菜单「规划模式」项（等价 `/plan ` 前缀），生成改走对话轮内 `propose_plan` 工具。以下保留原始设计记录。
 
 | 入口 | 形态 | 状态粒度 |
 |---|---|---|
@@ -247,16 +253,16 @@ replan(failedIndex)
 
 ### 6.7 计划面板视觉
 
-- **悬浮面板**（非文档流）：固定在输入框上方，授权弹窗出现时让位隐藏；计划**不进消息流**——done/cancelled 不再渲染为消息流历史卡片，而是保持悬浮展示至用户确认收尾（`acknowledged`）后消失；
+- **悬浮面板**（非文档流）：固定在输入框上方，授权弹窗出现时让位隐藏；计划**不进消息流**——done/cancelled 不再渲染为消息流历史卡片，而是保持悬浮展示；其中 **done（提前收敛）与 cancelled（执行中终止）** 保持展示至用户确认收尾（`acknowledged`）后消失，**普通 done** 自动消失（由变更文件列表面板接替），**draft 态点「不用计划，直接执行」取消** 直接消失（意图明确，置 `acknowledged=true`，不再二次确认）；
 - 结构：面板头（徽标 + 标题行 `🎯 {planHeadTitle}` + 进度 + 折叠箭头）→ 步骤列表（序号 + 状态图标 + title 一句话；draft 态 title 为可编辑 `<input>`）→ 操作按钮行；
 - 标题行随折叠态切换：展开态或 draft 态显示 `goal`；折叠 + executing 态显示当前正在执行的步骤 title（随步骤推进更新），配右侧进度文本，折叠时即可一眼看到当前进度；
-- 步骤行仅展示 title（一句话 todo），不展示 detail 与 result（detail 为模型执行参考仅注入执行轮上下文与 replan；result 仅用于 localPlanSummary 总结与注入，不在步骤行展示）；步骤行的结果信息在执行过程区（流式输出）可见；
+- 步骤行仅展示 title（一句话 todo），不展示 detail 与 result（detail 为模型执行参考仅注入执行轮上下文与 replan；result 仅用于执行轮注入与 replan，不在步骤行展示）；步骤行的结果信息在执行过程区（流式输出）可见；计划各步状态与 result 只在规划面板呈现，不在消息回复区拼装步骤列表；
 - 状态图标：pending `○` 灰、running 蓝色脉冲圆点（复用「思考中…」脉冲动画）、done `✓` 绿、failed `✗` 红、skipped `⊘` 黄；状态随执行驱动实时更新；
-- 徽标：`计划中`（蓝，draft）/ `执行中`（蓝脉冲，executing）/ `已完成`（绿，done）/ `已取消`（灰，cancelled）；draft/done/cancelled 不脉冲；
-- 进度文本：draft → `{n} 步 · 待确认`；executing → `第 X/N 步`；done → `{n}/{n} · 已完成`；cancelled → `已取消`；
+- 徽标：`计划中`（蓝，draft）/ `执行中`（蓝脉冲，executing）/ `已完成`（绿，done）/ `已收敛`（绿，done 且提前收敛）/ `已取消`（灰，cancelled）；draft/done/cancelled 不脉冲；
+- 进度文本：draft → `{n} 步 · 待确认`；executing → `第 X/N 步`；done → `{n}/{n} · 已完成`（提前收敛为 `done/N · 已完成（K 步跳过）`）；cancelled → `已取消`；
 - 编辑交互：draft 态仅 title 为可编辑 `<input>`（detail 不可见、不可编辑，保留模型原值供执行轮注入），确认时以输入框当前值生成快照（与「commitRename 读 DOM 值保证一致性」同一教训）；
-- 按钮按态呈现：draft → `[确认执行] [取消]`；executing 且有 failed 步 → `[重试] [跳过] [终止] [重新规划]`；executing 正常推进 → 无按钮（中止走消息区既有中止按钮）；done/cancelled → `[确认完成]`（标记 `acknowledged=true`，面板消失，计划不留消息流）；
-- `acknowledged`：`AiPlan.acknowledged?: boolean`，done/cancelled 后用户点确认完成置 true；`activePlanMsg` 据此排除已确认计划（已确认的面板不再出现、不进消息流）；随会话持久化。
+- 按钮按态呈现：draft → `[确认执行] [不用计划，直接执行]`（拒绝即取消并直接消失，不再弹确认）；executing 且有 failed 步 → `[重试] [跳过] [终止] [重新规划]`；executing 正常推进 → 无按钮（中止走消息区既有中止按钮）；done（提前收敛）/cancelled（执行中终止）→ `[确认]`（标记 `acknowledged=true`，面板消失，计划不留消息流；普通 done 无按钮，面板自动消失）；
+- `acknowledged`：`AiPlan.acknowledged?: boolean`，done（提前收敛）/cancelled（执行中终止）后用户点确认置 true；draft 态拒绝（refusePlan）直接置 true；`activePlanMsg` 据此排除已确认计划（已确认的面板不再出现、不进消息流）；随会话持久化。
 - 执行期间的工具提案卡片、推理可视化、授权弹窗、消息操作按钮全部照常；重新生成整组截断到对应 user 消息时，计划一并作废（`plan.state=cancelled`）。
 
 ### 6.8 魔数取值
