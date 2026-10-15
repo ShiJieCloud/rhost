@@ -584,24 +584,7 @@ onMounted(async () => {
     },
     onError: e => {
       if (e.scope !== scope.value) return
-      const last = messages.value[messages.value.length - 1]
-      if (last && last.role === 'assistant') {
-        last.status = 'error'
-        if (!last.content) last.content = `请求失败：${e.message}`
-      }
-      streaming.value = false
-      stampElapsed()
-      // 计划步执行中请求失败 → 该步转 failed，等用户决策
-      const run = planRunRef.value
-      if (run) {
-        planRunRef.value = null
-        const planMsg = messages.value.find(m => m.id === run.msgId)
-        if (planMsg?.plan) failPlanStep(planMsg, run.stepIndex, `请求失败：${e.message}`)
-      }
-      planSummaryRef.value = null
-      persist()
-      // 错误落定产生部分结果（非计划场景）→ 晋升滚动（守卫内）
-      if (groupResultText(groupStartOf(messages.value.length - 1))) scrollToResult()
+      failStream(e.message)
     },
     onToolCalls: e => {
       // 工具提案（M2.3）：写入当前流式 assistant 消息并先落盘防崩溃丢失；
@@ -754,6 +737,30 @@ function finishStreaming(status: 'done' | 'stopped') {
   void maybeSummarize()
   // 记忆提取仅在正常完成后触发（中止/错误轮次内容不完整，不提取）
   if (status === 'done') void maybeExtractMemories()
+}
+
+/** 请求失败落定：事件 ai-error 与 invoke reject（403 / 配额 / IPC 错误等）两条路径共用。
+ *  必须复位 streaming——否则输入区停在「停止生成」按钮，且后端无在飞流可中止，按钮点了无反应 */
+function failStream(message: string) {
+  const last = messages.value[messages.value.length - 1]
+  if (last && last.role === 'assistant') {
+    last.status = 'error'
+    // 已有部分输出时保留，仅空内容才写入错误文案
+    if (!last.content) last.content = `请求失败：${message}`
+  }
+  streaming.value = false
+  stampElapsed()
+  // 计划步执行中请求失败 → 该步转 failed，等用户决策（设计 §7 降级：不自动重试）
+  const run = planRunRef.value
+  if (run) {
+    planRunRef.value = null
+    const planMsg = messages.value.find(m => m.id === run.msgId)
+    if (planMsg?.plan) failPlanStep(planMsg, run.stepIndex, `请求失败：${message}`)
+  }
+  planSummaryRef.value = null
+  persist()
+  // 失败落定产生了部分结果（非计划场景）→ 晋升滚动（守卫内）
+  if (groupResultText(groupStartOf(messages.value.length - 1))) scrollToResult()
 }
 
 /* ---------- 滚动摘要（M1.5） ---------- */
@@ -2009,12 +2016,7 @@ async function runAiStream(seq: number, planForced = false) {
     disablePlanProposal: planBannedInRound.value,
   }).catch(e => {
     if (seq !== loadSeq) return
-    const last = messages.value[messages.value.length - 1]
-    if (last && last.role === 'assistant') {
-      last.status = 'error'
-      last.content = `请求失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`
-    }
-    persist()
+    failStream(typeof e === 'string' ? e : (e as Error)?.message ?? String(e))
   })
 }
 
@@ -4186,8 +4188,8 @@ const configHint = computed(() => {
 .auth-wrap {
   flex-shrink: 0;
   /* 与输入框同宽居中，作为文档流区块推挤消息区而非覆盖 */
-  width: 100%;
-  max-width: 760px;
+  width: calc(100% - 20px);
+  max-width: 740px;
   box-sizing: border-box;
   margin: 0 auto 6px;
   background: var(--panel);
