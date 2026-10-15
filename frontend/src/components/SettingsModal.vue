@@ -603,10 +603,15 @@ function boolVal(key: keyof AppSettings): boolean {
   return draft[key] as boolean
 }
 /* ---- list kind：换行分隔 string ↔ 行数组视图（环境变量式逐条编辑）。
- *  存储格式与判定逻辑零改动，仅 UI 形态；空行保留以维持输入索引稳定（判定时跳过） ---- */
+ *  存储格式与判定逻辑零改动，仅 UI 形态；空行保留以维持输入索引稳定（判定时跳过）。
+ *  空串与「单个空行」在存储层不可区分（[''] .join('\n') === ''），故空值下用组件内展开标记
+ *  表达「已点过添加、应显示一行空输入框」；一旦写入非空内容即由存储态自然表达 ---- */
+const listExpanded = ref(new Set<keyof AppSettings>())
+
 function listVal(key: keyof AppSettings): string[] {
   const v = strVal(key)
-  return v === '' ? [] : v.split('\n')
+  if (v !== '') return v.split('\n')
+  return listExpanded.value.has(key) ? [''] : []
 }
 function setListLine(key: keyof AppSettings, i: number, v: string) {
   const lines = listVal(key)
@@ -617,11 +622,13 @@ function addListLine(key: keyof AppSettings) {
   const lines = listVal(key)
   lines.push('')
   setVal(key, lines.join('\n'))
+  listExpanded.value.add(key)
 }
 function removeListLine(key: keyof AppSettings, i: number) {
   const lines = listVal(key)
   lines.splice(i, 1)
   setVal(key, lines.join('\n'))
+  if (lines.length === 0) listExpanded.value.delete(key)
 }
 /** 行控件是否置灰：静态 disabled 优先；否则 disabledKey（单个或数组）中任一开关为 false；
  *  excludeKey 用于行内开关排除自身依赖（switchKey 本身不参与自身置灰判断） */
