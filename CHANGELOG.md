@@ -1,68 +1,70 @@
 # Changelog
 
-本项目所有显著变更记录于此文件。
+All notable changes to this project are documented in this file.
 
-格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
+
+[中文](./CHANGELOG.zh-CN.md) · **English**
 
 ## [2.0.0] - 2026-10-15
 
-本版本的核心是 **AI 助手能力全面落地**：Rhost 从纯 SSH 终端管理器进化为内置 AI 助手的远程主机工作台，支持对话式终端操作、Plan-and-Act 任务规划与多模态输入。
+This release is centered on **a full AI assistant**: Rhost evolves from a pure SSH terminal manager into a remote host workbench with a built-in AI assistant, supporting conversational terminal operations, Plan-and-Act task planning and multimodal input.
 
-### 新增
+### Added
 
-#### AI 助手
+#### AI assistant
 
-- AI 助手完整落地：流式对话、Markdown 与代码块渲染，代码块支持行号显示与终端插入/执行按钮
-- 消息操作：助手消息支持复制与重新生成，用户消息支持编辑重发、复制与删除
-- 推理可视化：思考过程独立折叠展示，含「思考中…」脉冲动画，支持手动展开/收起
-- 多模态输入：支持选择、粘贴、拖拽三种方式添加图片与文本文件附件
-- 会话大纲导航：长对话快速跳转定位
-- 上下文注入：AI 技能、规则与跨会话记忆注入系统提示词，支持按文件开关、注入预算控制与设置面板管理
-- 终端工具集：只读工具（读取文件、列目录、系统信息）免授权自动执行；文件编辑与命令提案经用户授权执行，编辑前自动备份并拒绝系统关键路径；内置高风险命令检测
-- 命令输出回传开关（默认关闭，保持零回传隐私边界），开启后 AI 可感知执行结果实现自主多步执行
-- Plan-and-Act 任务规划：复杂任务由模型自主生成计划草稿，用户确认后分步执行，步骤状态实时可视化；失败步骤支持重试、跳过、终止与重新规划；目标提前达成或前提不成立时支持提前收敛
-- 文件上传/下载工具：AI 可直接进行 SFTP 传输，64MB 体积上限预检，超限明确报错并引导至 SFTP 面板
+- Complete AI assistant: streaming chat, Markdown and code rendering, code blocks with line numbers plus insert-to-terminal / execute buttons
+- Message actions: copy and regenerate for assistant messages; edit-and-resend, copy and delete for user messages
+- Reasoning visualization: the thinking process is collapsed independently with a "Thinking…" pulse animation and can be expanded / collapsed manually
+- Multimodal input: add image and text file attachments by picker, paste or drag-and-drop
+- Chat outline navigation: jump quickly within long conversations
+- Context injection: AI skills, rules and cross-session memory injected into the system prompt, with per-file toggles, injection budget control and settings-panel management
+- Terminal toolset: read-only tools (read file, list directory, system info) run automatically without approval; file edits and command proposals require user approval, with automatic backup before edits and rejection of critical system paths; built-in high-risk command detection
+- Command output feedback toggle (off by default to keep the zero-feedback privacy boundary); when enabled, the AI can perceive execution results and act autonomously over multiple steps
+- Plan-and-Act task planning: the model drafts a plan for complex tasks, executes it step by step after user confirmation with live per-step status; failed steps can be retried, skipped, aborted or re-planned; a plan converges early once the goal is met or the remaining steps become infeasible
+- File upload / download tools: the AI can perform SFTP transfers directly, with a 64MB size pre-check and a clear error guiding users to the SFTP pane when exceeded
 
-#### 工作台与界面
+#### Workbench and UI
 
-- 右侧面板：历史会话、主机监控、AI 助手三合一布局，支持图标栏折叠/展开，首页与工作台全局同步
-- 历史会话记录与快速连接：自动记录最近成功连接，点击直接发起完整连接
-- 跨平台标题栏适配：原生红绿灯与自绘按钮可切换
+- Right panel: a combined layout for recent sessions, server monitoring and the AI assistant, with a collapsible icon rail kept in sync between the home page and the workbench
+- Recent sessions and quick connect: successful connections are recorded automatically and can be reconnected with one click
+- Cross-platform title bar adaptation: native traffic lights and custom-drawn buttons are switchable
 
-### 变更
+### Changed
 
-- 配置导入导出时剥离 AI 模块设置（含密钥）
-- 发布构建禁用 WebView 原生右键菜单与默认快捷键，避免与自定义上下文菜单叠加；开发构建保留调试快捷键
-- 终端命令执行超时不再丢弃输出，保留已收到的部分 stdout/stderr
-- API 密钥输入框支持显示/隐藏切换
-- 文档站与 README 大规模建设：使用指南、设计文档与架构决策记录（ADR）
+- AI module settings (including API keys) are stripped from configuration import / export
+- Release builds disable the WebView native context menu and default shortcuts to avoid overlapping the custom menu; debug builds keep the debugging shortcuts
+- Terminal command execution no longer discards output on timeout — partial stdout / stderr already received is preserved
+- The API key input supports show / hide toggling
+- Large-scale documentation site and README build-out: guides, design documents and architecture decision records (ADRs)
 
-### 修复
+### Fixed
 
-- 会话断开时清理 AI 终端执行残留的 /tmp/.ri-* 临时脚本
-- 标签栏仅在可滚动时启用拖拽与 grab 光标
+- Residual `/tmp/.ri-*` scripts from AI terminal execution are cleaned up when a session disconnects
+- The tab bar enables drag scrolling and the grab cursor only when tabs actually overflow
 
 ## [1.0.0] - 2026-10-08
 
-首个公开版本：基于 Tauri + Vue3 的跨平台 SSH 远程主机管理器。
+First public release: a cross-platform SSH remote host manager built with Tauri + Vue 3.
 
-### 新增
+### Added
 
-- SSH 终端核心功能：多标签会话管理、终端字体与光标设置实时生效
-- SSH 端口转发：本地/远程/动态三种模式
-- SSH 断线自动重连与启动动画
-- SSH 主机密钥校验（TOFU）与指纹确认弹窗
-- 标签栏右键菜单与隧道配置
-- 主机分组管理、密钥管理与首页视图切换
-- 配置导入导出（PBKDF2-SHA256 + AES-256-GCM 强制加密）
-- SFTP 传输队列：折叠态进度摘要与跨重启状态保存
-- 自定义 MOTD ASCII LOGO
-- 完整的应用日志系统
-- 设置弹窗与全套应用图标
+- Core SSH terminal: multi-tab session management with terminal font and cursor settings applied live
+- SSH port forwarding: local, remote and dynamic modes
+- SSH automatic reconnect on disconnect plus a startup animation
+- SSH host key verification (TOFU) with a fingerprint confirmation dialog
+- Tab bar context menu and tunnel configuration
+- Host groups, key management and home view switching
+- Configuration import / export (mandatory PBKDF2-SHA256 + AES-256-GCM encryption)
+- SFTP transfer queue: collapsed progress summary and state persisted across restarts
+- Custom MOTD ASCII logo
+- A complete application logging system
+- Settings dialog and the full set of application icons
 
-### 修复
+### Fixed
 
-- 修复远端提示符缺失用户名的问题
+- Fixed a remote prompt missing the username
 
 [2.0.0]: https://github.com/ShiJieCloud/rhost/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/ShiJieCloud/rhost/releases/tag/v1.0.0

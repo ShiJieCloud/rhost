@@ -6,7 +6,7 @@
 >
 > created: 2026-10-08 09:28:16
 >
-> updated: 2026-10-09 09:23:07
+> updated: 2026-10-15 16:50:00
 >
 > author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
@@ -19,7 +19,7 @@
 | 目标 | 量化口径 |
 |---|---|
 | 三平台产物 | 每次构建产出：macOS `.app`/`.dmg`、Windows `.msi`/`.exe`(NSIS)、Linux `.deb`/`.rpm`/`.AppImage` |
-| 发布操作 | 打 tag `v*` 即自动生成 Release 草稿，产物已挂载、changelog 已自动生成，人工核对后发布 |
+| 发布操作 | 打 tag `v*` 即自动创建 Release 草稿，产物已挂载、body 已拼接版本段，人工核对后发布 |
 | 构建可复现 | `Cargo.lock` 与 `frontend/package-lock.json` 均已入库，CI 用 `npm ci` / cargo 锁定解析 |
 | 缓存生效 | Rust 编译缓存（Swatinem/rust-cache）+ npm 缓存（setup-node），二次构建显著提速 |
 | 最小权限 | workflow 仅申请 `contents: write`（创建 Release 所需），无额外 secrets 依赖 |
@@ -53,7 +53,7 @@
 ### 目标
 
 1. 新建 `.github/workflows/release.yml`：三平台 matrix 构建，产物上传；
-2. `push tag v*` 触发：自动创建 **Release 草稿**（draft），挂载全部平台产物，自动生成 changelog，维护者核对后直接发布；
+2. `push tag v*` 触发：自动创建 **Release 草稿**（draft），挂载全部平台产物，body 自动拼接版本段，维护者核对后直接发布；
 3. `workflow_dispatch` 手动触发：仅构建并上传 workflow artifact，用于发版前验证，不产生 Release。
 
 ### 非目标
@@ -92,8 +92,8 @@ dispatch ────┘                 │
 
 ```yaml
 # 三平台打包与发布：tag v* → Release 草稿；手动触发 → 仅产物（无 Release）
-# 产物未签名（ad-hoc）：macOS 从浏览器下载的 dmg 装好后若提示「"rhost" 已损坏，无法打开」，运行 xattr -dr com.apple.quarantine 移除隔离属性后再打开（右键打开对此错误无效）；Windows/Linux 有 SmartScreen/未知来源提示
-# Release body 由 release-body-prefix.md（安装须知）+ conventional-changelog 最新段拼接，关闭 generate_release_notes（ci-release-design §10 阶段2）
+# 产物未签名（ad-hoc）：macOS 首次打开需右键 → 打开，Windows/Linux 有 SmartScreen/未知来源提示
+# Release body 由 release-body-prefix.md（安装须知）+ CHANGELOG.zh-CN.md 当前版本段拼接（ci-release-design §10）
 name: Build & Release
 
 on:
@@ -177,20 +177,17 @@ jobs:
           if-no-files-found: warn
 
   # 仅 tag 触发执行：等三平台 build 全绿后下载全部 artifact，
-  # 用 conventional-changelog 最新段 + 安装须知前缀拼接 Release body，创建草稿
+  # 用 CHANGELOG.zh-CN.md 当前版本段 + 安装须知前缀拼接 Release body，创建草稿
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # 需完整历史供 conventional-changelog 解析 commit
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      # 为 npx conventional-changelog-cli 提供运行时；version 取自 frontend/package.json
+      # 为读取 frontend/package.json 版本号提供 Node 运行时
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -206,13 +203,21 @@ jobs:
           path: bundles
           pattern: bundles-*
 
-      # 拼接 Release body：安装须知前缀 + 分隔线 + CHANGELOG 最新段
-      # --pkg frontend/package.json 让版本号取 1.0.0；--tag-prefix v 按 v* tag 切段
+      # 拼接 Release body：安装须知前缀 + 分隔线 + CHANGELOG.zh-CN.md 对应版本段
+      # 版本号取自 frontend/package.json，与三处版本对齐约定一致
       - name: Build release body
         run: |
-          npx --yes conventional-changelog-cli@latest -p angular \
-            --pkg frontend/package.json --tag-prefix 'v' --release-count 1 \
-            -o changelog-latest.md
+          VERSION=$(node -p "require('./frontend/package.json').version")
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") {flag=1; next}
+            /^## \[/ && flag {exit}
+            flag {print}
+          ' CHANGELOG.zh-CN.md > changelog-latest.md
+          # 防呆：CHANGELOG.zh-CN.md 未回写当前版本段时直接失败，避免发出空 body
+          if [ ! -s changelog-latest.md ]; then
+            echo "::error::CHANGELOG.zh-CN.md 未包含 [${VERSION}] 段落，请先回写后再打 tag"
+            exit 1
+          fi
           cat .github/release-body-prefix.md > release-body.md
           printf '\n---\n\n' >> release-body.md
           cat changelog-latest.md >> release-body.md
@@ -220,7 +225,7 @@ jobs:
           cat release-body.md
 
       # 统一创建 Release 草稿，glob 挂载分发产物（.app 目录不挂载，用户应下 dmg）
-      # softprops v2 优先 body_path；不再使用 generate_release_notes 与 body
+      # softprops v2 优先 body_path
       - name: Create release draft
         uses: softprops/action-gh-release@v2
         with:
@@ -250,8 +255,7 @@ jobs:
 | build → release 两段式 | build 仅构建+上传 artifact；release `needs: build` 全绿后才创建草稿，避免单平台失败导致草稿只挂部分产物被误判为"全部就绪" |
 | build `tagName: ''` | 空串让 tauri-action 跳过内置发布步骤，发布权交给 release job 的 `softprops/action-gh-release@v2`，单一职责 |
 | `softprops/action-gh-release@v2` | 比 tauri-action 内置发布更可控；`files` 用 glob 只挂分发产物（dmg/msi/exe/deb/rpm/AppImage），排除 `.app` 目录；`body_path` 指向拼接好的 release-body.md |
-| `body_path` + conventional-changelog | Release body 由 `.github/release-body-prefix.md`（安装须知）+ conventional-changelog 最新段拼接，单一来源；关闭 `generate_release_notes` 避免与 CHANGELOG.md 重复（详见 §10） |
-| release job `fetch-depth: 0` | 需完整 git 历史供 conventional-changelog 解析 commit message |
+| `body_path` + CHANGELOG 版本段 | Release body 由 `.github/release-body-prefix.md`（安装须知）+ `CHANGELOG.zh-CN.md` 当前版本段（awk 提取）拼接，单一事实来源；段落缺失时流水线直接失败（防呆），避免发出空 body（详见 §10） |
 | action 版本（checkout@v5 / setup-node@v5 / upload@v6 / download@v7） | v5 为最小 node24 major；upload v6/download v7 配对，v5 改变了单 artifact 下载路径 |
 | `concurrency: release-${{ github.ref }}` | 同一 tag/dispatch 不并发；dispatch 排队不取消，避免产物半成品；与 docs.yml 的 concurrency 风格一致 |
 | build `timeout-minutes: 60` | 首次无缓存构建可能 30-60min，卡死时及时止损，避免长时间占用 runner |
@@ -295,7 +299,7 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 
 - Release 资产名保持 Tauri 默认输出，**禁止在 workflow 中重命名**；
 - Release 标题：`Rhost v1.0.0`（与 §6.1 release job 的 `name` 字段一致）；
-- Release body：由 `.github/release-body-prefix.md`（安装须知前缀）+ conventional-changelog 最新段拼接为 `release-body.md`，经 `body_path` 注入；维护者核对后直接发布，无需手写说明；
+- Release body：由 `.github/release-body-prefix.md`（安装须知前缀）+ `CHANGELOG.zh-CN.md` 当前版本段拼接为 `release-body.md`，经 `body_path` 注入；维护者核对后直接发布，无需手写说明；
 - 预发布（pre-release）用 `v1.0.0-rc.1` 形式，conf `version` 同步为 `1.0.0-rc.1`，产物文件名随之变化。
 
 **命名规范的非目标：**
@@ -316,7 +320,7 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 
 - 语法与触发验证：workflow YAML 本地可用 `actionlint`（若有）或推送后看 Actions 解析结果；
 - 手动触发一轮：`workflow_dispatch` → 三平台 build job 全绿 → 下载 `bundles-*` artifact，核对三平台产物齐全（dispatch 不触发 release job，无 Release 草稿）；
-- tag 验证：打 `v1.0.0` → build 全绿 → release job 创建草稿、挂载 6-7 个分发产物（不含 `.app`）、body 含安装须知 + CHANGELOG 最新段 → 维护者核对后直接发布；
+- tag 验证：打 `v1.0.0` → build 全绿 → release job 创建草稿、挂载 6-7 个分发产物（不含 `.app`）、body 含安装须知 + `CHANGELOG.zh-CN.md` 当前版本段 → 维护者核对后直接发布；
 - 冒烟：下载产物在本机安装启动（macOS arm64 可真机验证；Windows/Linux 产物至少确认文件完整可解包）。
 
 ## 9. 未决问题
@@ -326,110 +330,65 @@ Tauri 2 默认产物名由 `productName` + `version` + `arch` 派生，可定制
 - e2e 测试入 CI（ubuntu runner 起 docker/debian-sshd 容器跑 `cargo test --test ssh_e2e`）与 PR 快速检查 job（`cargo check` + `vue-tsc`）——待构建流水线稳定后追加；
 - tauri-updater 自动更新通道（`autoUpdate`/`updateChannel` 设置项已预留但后端未实现）——另立设计；
 
-## 10. CHANGELOG.md 引入方案
+## 10. CHANGELOG 引入与提取方案
 
-> status: 已落地。`CHANGELOG.md` 入库，`release.yml` release job 用 conventional-changelog 最新段 + `.github/release-body-prefix.md` 拼接 `body_path`，`generate_release_notes` 已关闭；§9 对应未决项已移除。
+> status: 已落地。中英双版入库（`CHANGELOG.md` 英文 / `CHANGELOG.zh-CN.md` 中文）；`release.yml` release job 用 awk 从中文版提取当前版本段，与 `.github/release-body-prefix.md`（安装须知）拼接为 `body_path`；段落缺失时流水线失败（防呆）。
 
 ### 10.1 目标与非目标
 
 目标：
 
 - 提供入库的、可 diff、可离线检索的版本变更记录，不依赖 GitHub 平台；
-- Release body 从 `CHANGELOG.md` 最新段提取，单一来源，关闭 `generate_release_notes`。
+- Release body 从 `CHANGELOG.zh-CN.md` 当前版本段提取，单一事实来源，仓库与 Release 页内容一致。
 
 非目标：
 
-- 不自动 commit `CHANGELOG.md` 回 main（避免 bot token 与分支保护冲突，由开发者发版前手工提交）；
-- 不引入 release-please / changesets（与 Tauri 双目录 + npm/cargo 混合构建不匹配，过重）。
+- 不自动 commit `CHANGELOG.md` / `CHANGELOG.zh-CN.md` 回 main（避免 bot token 与分支保护冲突，由开发者发版前手工提交）；
+- 不引入 release-please / changesets（与 Tauri 双目录 + npm/cargo 混合构建不匹配，过重）；
+- 不引入 conventional-changelog 等自动生成方案：版本段需面向用户做主题化总结（亮点分组、过滤内部实现细节、双语维护），机械罗列 commit 达不到该质量。
 
 ### 10.2 格式与位置
 
 - 格式：[Keep a Changelog 1.1.0](https://keepachangelog.com/zh-CN/1.1.0/) + SemVer 2.0.0；
-- 位置：仓库根 `CHANGELOG.md`（社区惯例，用户克隆即可见）；
-- 段落结构：`## [VERSION] - YYYY-MM-DD` 下分 `### Added` / `### Changed` / `### Deprecated` / `### Removed` / `### Fixed` / `### Security`。
+- 位置：仓库根 `CHANGELOG.zh-CN.md`（中文，**Release body 提取源**）与 `CHANGELOG.md`（英文，GitHub 默认展示），顶部互加语言切换链接（社区惯例，用户克隆即可见）；
+- 段落结构：`## [VERSION] - YYYY-MM-DD` 下分 `### Added` / `### Changed` / `### Deprecated` / `### Removed` / `### Fixed` / `### Security`（中文版对应「新增 / 变更 / 废弃 / 移除 / 修复 / 安全」；两版段落标题格式严格一致，保证同一提取逻辑对两版均可用）。
 
-### 10.3 前置依赖：conventional commits
+### 10.3 配套：conventional commits
 
-CHANGELOG 自动生成依赖 conventional commits 规范（`feat`/`fix`/`docs`/`refactor`/`chore`/`perf`/`test` 前缀）。项目当前未强制，落地前需：
+版本段由人工总结撰写，不依赖自动生成；但规范化的提交历史仍便于归纳与追溯：
 
-- 在根 `package.json` 加 `commitlint` + `husky` 钩子（commit-msg 检查）；
-- README 补充 commit 规范说明；
+- 根 `package.json` 已配置 `commitlint` + `husky` 钩子（commit-msg 检查）；
+- README 已补 commit 规范说明；
 - 历史 commit 不回溯改写，仅约束新 commit。
 
-### 10.4 工具与调用
+### 10.4 提取与维护
 
-- 工具：`conventional-changelog-cli`（npm 包）；
-- 写回 `CHANGELOG.md`（prepend 最新段）：`npx conventional-changelog -p angular -i CHANGELOG.md -s`；
-- 仅生成最新段到文件：`npx conventional-changelog -p angular --release-count 1 -o changelog-latest.md`；
-- 不加 `devDependency`，不污染任何 `package.json`（根 `package.json` 是 docs 站点专用，`frontend/` 是前端专用，均不承载项目级工具）。
+- 提取：`release.yml` 的 `Build release body` 步骤用 awk 取 `CHANGELOG.zh-CN.md` 中 `## [<version>]` 至下一个 `## [` 之间的内容，版本号取自 `frontend/package.json`（完整 yaml 见 §6.1）；
+- 防呆：段落缺失（忘回写）时 `::error::` 报错并 `exit 1`，避免发出空 body；
+- 维护：发版前人工总结提交历史，向中文版与英文版各 prepend 一个版本段，与三处版本号改动一并提交；
+- 不引入任何 changelog 生成工具，根 `package.json` 只承载 docs 站点脚本。
 
-### 10.5 落地阶段
+### 10.5 语言策略与 body 一致性
 
-**阶段 1：手工生成（最小引入）**
-
-- 开发者发版前本地跑 `npx conventional-changelog -p angular -i CHANGELOG.md -s`；
-- 提交 `CHANGELOG.md` → 打 tag → 推送；
-- `release.yml` 的 release job **不变**，仍用 `generate_release_notes: true`（CHANGELOG.md 仅入库，不进 Release body）；
-- 优势：零 CI 改动，先建立 commit 规范与历史档案。
-
-**阶段 2：CI 提取塞进 Release body**
-
-新增仓库文件 `.github/release-body-prefix.md`，内容为「安装须知」前缀（避免 shell 转义反引号）：
-
-```markdown
-## 安装须知（产物未签名）
-- **macOS**：从浏览器下载的 `.dmg` 装好后首次打开若提示「"rhost" 已损坏，无法打开」，运行 `xattr -dr com.apple.quarantine /Applications/rhost.app` 移除隔离属性后再打开（ad-hoc 签名 + quarantine 触发 Gatekeeper 标记"已损坏"，右键 → 打开对此错误无效）
-- **Windows**：SmartScreen 选「仍要运行」
-- **Linux**：AppImage 需 `chmod +x` 后运行；deb/rpm 用对应包管理器安装
-
-签名/公证为后续独立事项，详见设计文档 §7。
-```
-
-release job 的 `Create release draft` step 前加一步构建 body，并改用 `body_path`：
-
-```yaml
-      - name: Build release body
-        run: |
-          npx conventional-changelog -p angular --release-count 1 -o changelog-latest.md
-          cat .github/release-body-prefix.md > release-body.md
-          printf '\n---\n\n' >> release-body.md
-          cat changelog-latest.md >> release-body.md
-
-      - name: Create release draft
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Rhost ${{ github.ref_name }}
-          draft: true
-          prerelease: false
-          body_path: release-body.md
-          files: |
-            bundles/**/*.dmg
-            bundles/**/*.msi
-            bundles/**/*.exe
-            bundles/**/*.deb
-            bundles/**/*.rpm
-            bundles/**/*.AppImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
-
-- 关闭 `generate_release_notes`（删除该字段）；
-- `CHANGELOG.md` 仍由开发者发版前手工提交（CI 不自动 commit 回 main）。
+- 英文版 `CHANGELOG.md` 对齐英文 `README.md`，作为 GitHub 仓库默认展示与社区阅读入口；中文版 `CHANGELOG.zh-CN.md` 对齐中文 `README.zh-CN.md`；
+- Release body 取中文版：`release-body-prefix.md`（安装须知）为中文，与中文版本段同语种，避免页内中英混排；
+- body 拼接步骤完整 yaml 见 §6.1，不在此重复；
+- 文档站（VitePress）仅中文，不镜像 `CHANGELOG.zh-CN.md`（变更记录以仓库文件为单一事实来源）。
 
 ### 10.6 落地检查清单
 
 - [x] 根 `package.json` 加 `commitlint` + `husky`；
 - [x] README 补 commit 规范说明；
-- [x] 首次 `npx conventional-changelog -p angular -i CHANGELOG.md -s` 生成历史档案并提交；
+- [x] `CHANGELOG.md`（英文）入库，人工总结历史档案（2.0.0 / 1.0.0）；
+- [x] `CHANGELOG.zh-CN.md`（中文）入库，并作为 Release body 提取源；
 - [x] 新增 `.github/release-body-prefix.md`；
-- [x] `release.yml` release job 加 §10.5 阶段 2 步骤，改用 `body_path`；
-- [x] 删除 `generate_release_notes: true` 与原 `body` 字段；
-- [x] 验证：打测试 tag → 草稿 body 含「安装须知」+ CHANGELOG 最新段。
+- [x] `release.yml` release job 用 awk 提取中文版版本段，改用 `body_path`；删除 `generate_release_notes` 与原 `body` 字段；
+- [x] 验证：awk 提取在当前版本段（`## [2.0.0]`）上实测通过。
 
 ### 10.7 风险与回退
 
-- conventional-changelog 解析失败（commit 不规范）→ 生成空段，Release body 仅含「安装须知」前缀；回退：临时恢复 `generate_release_notes: true`；
-- 阶段 2 上线后若 changelog 质量差，可一键回滚 `release.yml` 到阶段 1 状态（git revert）；
+- 未回写当前版本段（忘改 `CHANGELOG.zh-CN.md`）→ 流水线 `::error::` 防呆失败，不产出草稿；回写后重新打 tag 即可；
+- 中英两版不同步 → 以中文版为准（Release body 提取源），英文版仅在下次发版前对齐；
 - `body_path` 与 `body` 不可同时生效（softprops v2 优先 `body_path`），切换时务必删旧 `body`。
 
 :::

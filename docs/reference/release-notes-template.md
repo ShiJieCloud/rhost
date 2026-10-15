@@ -15,7 +15,7 @@
 每次打 tag `v*` 触发流水线生成 Release 草稿后，维护者在 GitHub Releases 页面核对/编辑 body 时参考本模板。提供两套路径：
 
 - **§2 完整模板**：重要发版（如 `v2.0.0`、含破坏性变更）由维护者手写，亮点 / 下载表 / 校验 / 破坏性变更俱全；
-- **CHANGELOG.md 提取**：日常发版由流水线从 `CHANGELOG.md`（Keep a Changelog 格式）提取当前版本段拼接，`CHANGELOG.md` 为单一事实来源，仓库与 Release 页内容保持一致。
+- **CHANGELOG 提取**：日常发版由流水线从中文版 `CHANGELOG.zh-CN.md`（Keep a Changelog 格式）提取当前版本段拼接，`CHANGELOG.zh-CN.md` 为 Release body 的单一事实来源，仓库与 Release 页内容保持一致（英文记录在 `CHANGELOG.md`，不参与提取）。
 
 ## 2. 完整 Release body 模板（手写场景）
 
@@ -148,7 +148,7 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 ## 5. 发版流程
 
 1. 三处版本对齐：`src-tauri/tauri.conf.json` 的 `version`、`src-tauri/Cargo.toml` 的 `version`、`frontend/package.json` 的 `version`（`Cargo.lock` 中 rhost 版本随 `cargo check` 自动更新）；
-2. 手写回写 `CHANGELOG.md`：按 Keep a Changelog 格式新增 `## [<version>] - <日期>` 段落（流水线按此段落提取 body，缺失时打 tag 会失败）；
+2. 手写回写 `CHANGELOG.zh-CN.md`（中文，Keep a Changelog 格式新增 `## [<version>] - <日期>` 段落，流水线按此段落提取 body，缺失时打 tag 会失败）与 `CHANGELOG.md`（英文）；
 3. 提交改动并推送；
 4. 打 tag：`git tag v2.0.0 && git push origin v2.0.0`；
 5. 等 Actions 跑完（build + release 两 job，约 30-60 分钟，首次无缓存偏长）；

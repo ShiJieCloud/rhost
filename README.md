@@ -214,7 +214,8 @@ rhost/
 │   └── Cargo.toml
 ├── package.json                   # Docs site and commit tooling scripts
 ├── pnpm-workspace.yaml
-├── CHANGELOG.md                   # Manually maintained release notes (Keep a Changelog format)
+├── CHANGELOG.md                   # Manually maintained release notes, in English
+├── CHANGELOG.zh-CN.md             # Release notes in Chinese (source for the Release body)
 ├── LICENSE
 ├── README.md                      # English (default on GitHub)
 └── README.zh-CN.md                # Chinese
@@ -237,7 +238,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 - `feat` feature / `fix` bug fix / `docs` documentation / `refactor` refactoring / `perf` performance / `test` tests / `chore` maintenance / `style` formatting
 - Keep the description concise, in English or Chinese, e.g. `feat(tunnel): 支持实时流量统计`, `fix(ssh): 修复断线端口泄漏`
 
-The repository ships with `commitlint` + `husky` hooks that validate `commit-msg` on every `git commit` and reject non-conforming messages. At release time the maintainer summarizes the commit history into `CHANGELOG.md` (Keep a Changelog format), and the pipeline assembles the Release body from that section.
+The repository ships with `commitlint` + `husky` hooks that validate `commit-msg` on every `git commit` and reject non-conforming messages. At release time the maintainer summarizes the commit history into `CHANGELOG.md` (English) and `CHANGELOG.zh-CN.md` (Chinese), both in Keep a Changelog format; the pipeline assembles the Release body from the Chinese section.
 
 ## ⚠️ Notes
 

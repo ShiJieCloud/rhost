@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="https://shijiecloud.github.io/rhost/" target="_blank">📖 在线文档</a> · <a href="#-快速开始">快速开始</a> · <a href="CHANGELOG.md">更新日志</a>
+  <a href="https://shijiecloud.github.io/rhost/" target="_blank">📖 在线文档</a> · <a href="#-快速开始">快速开始</a> · <a href="CHANGELOG.zh-CN.md">更新日志</a>
 </p>
 
 ---
@@ -214,7 +214,8 @@ rhost/
 │   └── Cargo.toml
 ├── package.json                   # 文档站与 commit 工具脚本
 ├── pnpm-workspace.yaml
-├── CHANGELOG.md                   # 人工维护的发版记录（Keep a Changelog 格式）
+├── CHANGELOG.md                   # 人工维护的发版记录（英文）
+├── CHANGELOG.zh-CN.md             # 发版记录中文版（Release body 提取源）
 ├── LICENSE
 ├── README.md                      # 英文（GitHub 默认展示）
 └── README.zh-CN.md                # 中文（本文件）
@@ -237,7 +238,7 @@ rhost/
 - `feat` 新功能 / `fix` 修复 / `docs` 文档 / `refactor` 重构 / `perf` 性能 / `test` 测试 / `chore` 杂务 / `style` 格式
 - description 用简明中文或英文，示例：`feat(tunnel): 支持实时流量统计`、`fix(ssh): 修复断线端口泄漏`
 
-仓库已配置 `commitlint` + `husky` 钩子，`git commit` 时自动校验 `commit-msg`，不符合规范会被拒绝；发版时人工总结提交历史回写 `CHANGELOG.md`（Keep a Changelog 格式），流水线据此拼接 Release body。
+仓库已配置 `commitlint` + `husky` 钩子，`git commit` 时自动校验 `commit-msg`，不符合规范会被拒绝；发版时人工总结提交历史回写 `CHANGELOG.md`（英文）与 `CHANGELOG.zh-CN.md`（中文，均为 Keep a Changelog 格式），流水线从**中文版**提取版本段拼接 Release body。
 
 ## ⚠️ 注意事项
 
