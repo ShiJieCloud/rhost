@@ -5,7 +5,7 @@
 <h1 align="center">Rhost</h1>
 
 <p align="center">
-  跨平台高性能远程主机管理器（SSH 终端 + SFTP + 端口转发 + 服务器监控）
+  跨平台高性能远程主机管理器（SSH 终端 + SFTP + 端口转发 + 服务器监控 + AI 助手）
 </p>
 
 <p align="center">
@@ -25,8 +25,15 @@
 **Rhost** 是一款基于 Rust + Tauri 2 开发的开源桌面远程主机管理工具。
 采用**原生二进制 IPC 流**架构，终端高频字节流走自定义二进制帧 Channel，不经 JSON；低频控制消息走 invoke/JSON，从而规避大量终端输出时的 JSON 序列化开销与 ANSI 内容损坏，解决 Electron 类终端工具内存高、多连接并发卡顿问题。
 
+**v2.0.0 起内置 AI 助手**：以对话方式完成远端排障、命令执行与文件修改——只读工具免授权自动探索，写操作经授权弹窗裁决；复杂任务由模型自主生成计划（Plan-and-Act）分步执行，过程与结果全程可见、可中断。
+
 ## ✨ 核心特性
 
+- 🤖 **内置 AI 助手**：流式对话、推理过程可视化、Markdown 与代码块渲染，代码块可一键插入终端或直接执行；工作台会话与首页全局对话按视图隔离
+- 🧭 **Plan-and-Act 任务规划**：复杂任务由模型自主生成计划草稿，用户确认后分步执行、步骤状态实时可视化；失败步骤可重试 / 跳过 / 终止 / 重新规划，目标提前达成或前提不成立时支持提前收敛
+- 🛡️ **工具授权与风险控制**：只读工具免授权自动执行；命令提案、文件编辑与 SFTP 传输经授权弹窗裁决（仅本次 / 本会话豁免 + 三档权限），内置高风险命令检测，编辑前自动备份并拒绝系统关键路径
+- 🧠 **技能、规则与记忆注入**：用本地 `.md` 文件注入领域知识与行为约束，跨会话记忆自动提取；注入预算、逐文件开关与手动增删可控
+- 🖼️ **多模态输入**：支持选择、粘贴、拖拽三种方式添加图片与文本文件附件
 - 🖥️ **多标签 SSH 终端**：xterm.js 渲染、UTF-8 全链路透传；每会话独立 IPC Channel，数据流完全隔离
 - ♻️ **断线自动重连**：区分断线原因，网络意外中断触发指数退避自动重连（1s 起翻倍、封顶 30s），手动断开 / 远端正常退出不重连
 - 📁 **内置 SFTP 文件管理器**：双栏浏览、流式传输队列、断点续传、暂停 / 取消；Shell 与 SFTP 工作目录双向同步
@@ -46,13 +53,24 @@
   - 所有 SSH IO 纯 async，每个会话绑定独立 IPC Channel，Rust 层统一会话生命周期管理
   - 终端字节流走自定义二进制帧（`type:u8 + len:u32 + payload`），低频控制消息走 invoke / JSON
   - `ssh/` 模块除 manager 外不依赖 Tauri，可独立单测 / e2e；`ipc.rs` 永远是薄层（仅参数校验与转发）
+  - `ai.rs` 自主封装 OpenAI 兼容协议（JSON + SSE 流式 + 工具调用），不依赖第三方 Agent 框架
 - **前端**：Vue 3.5（`<script setup>`）+ TypeScript + Vite + Xterm.js
   - 原始二进制流经 IPC Channel 接收，直接送入 xterm 渲染 ANSI 终端序列
-  - 模块级单例状态管理（未使用 Pinia / Vue Router），组件化拆分：服务器树、终端面板、SFTP 面板、监控面板、全局设置
+  - 模块级单例状态管理（未使用 Pinia / Vue Router），组件化拆分：服务器树、终端面板、SFTP 面板、监控面板、AI 对话面板、全局设置
 
 > 架构亮点：**终端数据流不走 JSON 序列化**，大量输出无序列化开销、ANSI 内容不损坏。
 
 ## 📸 截图
+
+<p align="center">
+  <img src="docs/assets/ai-panel-overview.png" alt="AI 助手" /><br/>
+  <sub>内置 AI 助手：流式对话、代码块一键插入终端、推理过程可视化，支持技能 / 规则 / 记忆注入</sub>
+</p>
+
+<p align="center">
+  <img src="docs/assets/ai-plan-executing.png" alt="Plan-and-Act 任务规划" /><br/>
+  <sub>Plan-and-Act：计划草稿确认后分步执行，各步状态实时可视化，失败可重试 / 跳过 / 终止 / 重新规划</sub>
+</p>
 
 <p align="center">
   <img src="docs/assets/workbench-main.png" alt="工作台全景" /><br/>
@@ -154,10 +172,10 @@ rhost/
 │   │   ├── main.ts                #   入口（无路由 / 状态库）
 │   │   ├── App.vue                #   根组件：首页 / 工作台切换 + 全局弹窗常驻
 │   │   ├── views/                 #   顶层视图：HomeView、Workbench
-│   │   ├── components/            #   通用组件；wb/ 为工作台组件
-│   │   ├── stores/                #   模块级单例状态（session/hosts/settings/groups/keys/tunnels/applog）
+│   │   ├── components/            #   通用组件（AI 对话面板 AiChatPanel / AiMarkdown / RightPanel 等）；wb/ 为工作台组件
+│   │   ├── stores/                #   模块级单例状态（session/hosts/settings/groups/keys/tunnels/applog/aiQuote 等）
 │   │   ├── composables/           #   useToast / usePasswordPrompt / useHostKeyPrompt
-│   │   ├── lib/tauri.ts           #   isTauri 探测与 Tauri API 动态 import
+│   │   ├── lib/                   #   tauri（isTauri 探测）、ai（流式对话与工具调用）、aiRisk（高危检测）、markdown
 │   │   └── types.ts               #   跨模块共享类型
 │   ├── vite.config.ts             #   固定 5173 端口
 │   └── package.json
@@ -177,6 +195,7 @@ rhost/
 │   │   │   └── tunnel/             #     端口转发与 SOCKS5
 │   │   ├── metrics/               #   远端指标解析与周期采集
 │   │   ├── motd/                   #   MOTD 结构化指令生成
+│   │   ├── ai.rs                   #   AI 助手（OpenAI 兼容 SSE 流式对话、工具调用、技能/规则/记忆注入）
 │   │   ├── applog/                 #   应用日志系统（hub / logger / writer / persisted）
 │   │   ├── store.rs                #   connections.json + 系统钥匙串
 │   │   ├── localfs.rs              #   本地文件系统操作
@@ -220,6 +239,7 @@ rhost/
 - 本项目为开源学习项目，**不提供任何担保**，生产环境使用请自行评估风险。
 - 服务器密码不会明文保存在本地配置文件，全部交由操作系统密钥环安全存储。
 - 私钥文件路径仅做本地记录，不会上传或同步至任何第三方服务器。
+- AI 助手不会自动读取终端内容：仅你显式选中并发送的终端内容，以及技能 / 规则 / 记忆文件的内容会随对话发送给所配置的模型服务商；AI 模块设置（含 API 密钥）不参与配置导入导出。
 
 ## 📄 License
 
