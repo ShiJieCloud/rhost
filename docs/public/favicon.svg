@@ -1,0 +1,28 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 底座：与终端空态 icon-box 一致（纯黑渐变） -->
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </linearGradient>
+    <!-- 图标描边渐变（项目绿） -->
+    <linearGradient id="stroke" x1="0" y1="347" x2="0" y2="677" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#4ae08d"/>
+      <stop offset="100%" stop-color="#3ddc84"/>
+    </linearGradient>
+    <!-- 底座圆角裁剪 -->
+    <clipPath id="plateClip">
+      <rect x="100" y="100" width="824" height="824" rx="220"/>
+    </clipPath>
+  </defs>
+
+  <!-- macOS 风格圆角底座（824×824 有效图形，四周留白 100px） -->
+  <rect x="100" y="100" width="824" height="824" rx="220" fill="url(#plate)"/>
+
+  <!-- 终端窗口 Logo（AppLogo：窗口 + 提示符 + 光标，居中，占底座 60%） -->
+  <g fill="none" stroke="url(#stroke)" stroke-width="31" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="317" y="347" width="390" height="330" rx="62"/>
+    <path d="M409 461 L461 512 L409 564"/>
+    <path d="M533 564 H615"/>
+  </g>
+</svg>

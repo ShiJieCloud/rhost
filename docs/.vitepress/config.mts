@@ -2,15 +2,22 @@ import { defineConfig } from 'vitepress'
 
 // 内容根目录为 docs/（本配置位于 docs/.vitepress/），首页对应 docs/index.md → 路由 /
 // nav / sidebar 的 link 一律不带 .md 扩展名；新增文档后在此同步登记
-// base 本地默认根路径；部署到 GitHub Pages 项目页（<user>.github.io/<repo>/）时
-// 由 CI 通过 DOCS_BASE 注入 '/<repo>/'，无需为本地/CI 维护两份配置
+// 部署基路径：本地默认 /；CI 部署到 GitHub Pages 项目页（<user>.github.io/<repo>/）时
+// 由 DOCS_BASE 注入 '/<repo>/'，无需维护两份配置。head 中的静态资源 href 不会被
+// VitePress 自动补 base，需手动拼接（themeConfig.logo 由框架处理）
+const siteBase = process.env.DOCS_BASE ?? '/'
+
 export default defineConfig({
   lang: 'zh-CN',
   title: 'Rhost',
   description: '基于 Tauri 2 + Rust + Vue 3 的跨平台 SSH 远程主机管理器',
-  base: process.env.DOCS_BASE ?? '/',
+  base: siteBase,
   cleanUrls: true,
   lastUpdated: true,
+
+  // 浏览器标签栏图标：取自桌面端应用图标（frontend/public/favicon.svg 的副本，方形底
+  // 座在 16px 下比导航栏的细线 logo 更醒目），与 themeConfig.logo 是两套图形
+  head: [['link', { rel: 'icon', type: 'image/svg+xml', href: `${siteBase}favicon.svg` }]],
 
   // 文档中的源码引用（../frontend/、../src-tauri/ 下的 .vue/.rs/.ts 等）在
   // GitHub/编辑器中有效，但位于 VitePress 内容根之外，不纳入站内死链检查
@@ -36,6 +43,15 @@ export default defineConfig({
           { text: 'SSH 终端', link: '/guides/ssh-terminal' },
           { text: 'SFTP 文件传输', link: '/guides/sftp' },
           { text: '配置导入导出', link: '/guides/config-import-export' },
+          {
+            text: 'AI 助手',
+            items: [
+              { text: 'AI 助手使用指南', link: '/guides/ai-assistant' },
+              { text: 'AI 规划模式', link: '/guides/ai-plan-mode' },
+              { text: 'AI 终端执行与授权', link: '/guides/ai-terminal-exec' },
+              { text: 'AI 技能、规则与记忆配置', link: '/guides/ai-skills-rules-memory' },
+            ],
+          },
           { text: '开发指南', link: '/guides/development' },
           { text: '贡献指南', link: '/guides/contributing' },
           { text: 'CI/CD 流水线', link: '/guides/ci-cd' },
@@ -101,6 +117,15 @@ export default defineConfig({
           { text: 'SSH 终端', link: '/guides/ssh-terminal' },
           { text: 'SFTP 文件传输', link: '/guides/sftp' },
           { text: '配置导入导出', link: '/guides/config-import-export' },
+          {
+            text: 'AI 助手',
+            items: [
+              { text: 'AI 助手使用指南', link: '/guides/ai-assistant' },
+              { text: 'AI 规划模式', link: '/guides/ai-plan-mode' },
+              { text: 'AI 终端执行与授权', link: '/guides/ai-terminal-exec' },
+              { text: 'AI 技能、规则与记忆配置', link: '/guides/ai-skills-rules-memory' },
+            ],
+          },
           {
             text: '故障排查',
             items: [
