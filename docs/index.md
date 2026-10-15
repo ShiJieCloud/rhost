@@ -3,20 +3,32 @@ layout: home
 
 hero:
   name: Rhost
-  text: 跨平台 SSH 远程主机管理器
+  text: 跨平台远程主机管理器
   image:
     src: /logo.svg
     alt: Rhost
-  tagline: Tauri 2 · Rust · Vue 3 —— 多标签终端、SFTP 文件管理、端口转发、服务器监控，原生二进制流架构
+  tagline: Tauri 2 · Rust · Vue 3 —— 多标签终端、SFTP 文件管理、端口转发、服务器监控，以及内置 AI 助手：对话式排障、任务规划、技能与记忆注入
   actions:
     - theme: brand
       text: 快速开始
-      link: /development
+      link: /getting-started/
     - theme: alt
       text: 架构概览
-      link: /architecture
+      link: /explanation/architecture
 
 features:
+  - icon: 🤖
+    title: 内置 AI 助手
+    details: 流式对话、推理可视化与 Markdown / 代码渲染，代码块可一键插入终端或执行；图片与文本附件支持选择、粘贴、拖拽三种方式添加；工作台会话与首页全局对话按视图隔离。
+  - icon: 🧭
+    title: Plan-and-Act 任务规划
+    details: 复杂任务由模型自主起草计划，确认后分步执行并实时展示步骤状态；失败步骤可重试、跳过、终止或重新规划，目标达成或前提不成立时提前收敛。
+  - icon: 🛡️
+    title: 工具授权与风险控制
+    details: 只读工具免授权自动执行；命令提案、文件编辑与 SFTP 传输在授权弹窗裁决（本会话允许 + 三档权限）；内置高危命令检测，编辑前自动备份并拒绝系统关键路径。
+  - icon: 🧠
+    title: 技能、规则与记忆注入
+    details: 用本地 Markdown 文件注入领域知识与行为约束，跨会话记忆自动沉淀；注入预算、按文件开关与手动管理均可控。
   - icon: 🖥️
     title: 多标签 SSH 终端
     details: xterm.js 渲染、UTF-8 全链路透传；每会话独立 IPC Channel 数据流隔离，高频字节流走二进制帧，不经 JSON / Base64。
@@ -59,6 +71,34 @@ features:
 ![工作台全景](assets/workbench-main.png)
 
 工作台全景：多标签终端 + MOTD 欢迎面板 + SFTP 文件管理 + 实时服务器监控
+
+</div>
+
+<div class="screenshot-row">
+
+<div class="shot">
+
+![AI 助手](assets/ai-panel-overview.png)
+
+内置 AI 助手：流式对话、推理过程折叠、代码块一键插入终端
+
+</div>
+
+<div class="shot">
+
+![AI 任务规划](assets/ai-plan-executing.png)
+
+Plan-and-Act：确认计划后分步执行，步骤状态实时可见
+
+</div>
+
+<div class="shot">
+
+![工具授权](assets/ai-auth-dialog.png)
+
+写操作授权裁决：仅本次执行 / 本会话允许 / 拒绝
+
+</div>
 
 </div>
 
