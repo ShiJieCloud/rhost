@@ -17,9 +17,51 @@ export interface RiskHit {
   rule: string
 }
 
+/**
+ * 内置高危规则：`command` 类按「命令词」精确匹配（避免引号内字符串误报），
+ * `pattern` 类按整行正则匹配（表达参数组合、管道、重定向等语义）
+ */
+type RiskRule = { name: string; command: string } | { name: string; pattern: RegExp }
+
+/** 前缀词：真正的命令词在其之后 */
+const COMMAND_PREFIXES = new Set([
+  'sudo', 'doas', 'env', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'command', 'builtin', 'exec', 'stdbuf',
+])
+
+/** 剥离引号内文本（保留引号本身与结构字符），使字符串字面量不参与命令判定 */
+function stripQuoted(line: string): string {
+  let out = ''
+  let quote: string | null = null
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < line.length) { out += '  '; i++; continue }
+      if (ch === quote) { quote = null; out += ch; continue }
+      out += ' '
+      continue
+    }
+    if (ch === '"' || ch === "'") quote = ch
+    out += ch
+  }
+  return out
+}
+
+/** 逐命令段取命令词：按 ; & | 分段，跳过变量赋值、选项与前缀词 */
+function commandWords(line: string): string[] {
+  return stripQuoted(line)
+    .split(/[;&|]+/)
+    .map(seg =>
+      seg
+        .trim()
+        .split(/\s+/)
+        .find(t => !!t && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) && !t.startsWith('-') && !COMMAND_PREFIXES.has(t)),
+    )
+    .filter((t): t is string => !!t)
+}
+
 /** 内置高危规则集（随版本演进维护） */
-export const BUILTIN_RISK_RULES: { name: string; pattern: RegExp }[] = [
-  { name: '递归/强制删除', pattern: /\brm\s+(?:-[a-zA-Z]*[rf]|--recursive|--force)/ },
+export const BUILTIN_RISK_RULES: RiskRule[] = [
+  { name: '删除文件', command: 'rm' },
   { name: '磁盘格式化/写入', pattern: /\bmkfs\.|\bdd\b[^\n]*\bof=/ },
   { name: '系统关机/重启', pattern: /\b(?:shutdown|reboot|poweroff|halt|init\s+[06])\b/ },
   { name: '递归放权', pattern: /chmod\s+-R\s+777/ },
@@ -31,8 +73,13 @@ export const BUILTIN_RISK_RULES: { name: string; pattern: RegExp }[] = [
 /** 判定单条命令（多行命令时逐行匹配，任一行命中即整段高危） */
 export function matchHighRisk(code: string, customKeywords: string[]): RiskHit | null {
   for (const line of code.split('\n')) {
+    const words = commandWords(line)
     for (const r of BUILTIN_RISK_RULES) {
-      if (r.pattern.test(line)) return { rule: r.name }
+      if ('command' in r) {
+        if (words.includes(r.command)) return { rule: r.name }
+      } else if (r.pattern.test(line)) {
+        return { rule: r.name }
+      }
     }
     for (const raw of customKeywords) {
       const kw = raw.trim()
