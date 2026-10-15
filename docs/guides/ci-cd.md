@@ -4,7 +4,7 @@
 >
 > created: 2026-10-09 20:37:02
 >
-> updated: 2026-10-09 20:37:02
+> updated: 2026-10-15 10:23:36
 >
 > author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
@@ -103,8 +103,8 @@ release.yml
 **步骤**：
 
 1. **下载产物**：`actions/download-artifact@v7`，按 `bundles-*` pattern 下载所有平台产物
-2. **生成 changelog**：`conventional-changelog-cli` 从 Conventional Commits 提取最新段
-3. **拼接 Release body**：`.github/release-body-prefix.md`（安装须知） + `---` + changelog
+2. **提取 changelog**：从 `CHANGELOG.md` 按 `frontend/package.json` 版本号提取 `## [<version>]` 段落；段落缺失时直接失败（防呆），避免发出空 body
+3. **拼接 Release body**：`.github/release-body-prefix.md`（安装须知） + `---` + CHANGELOG 版本段
 4. **创建草稿**：`softprops/action-gh-release@v2`，挂载分发产物（`.dmg`/`.msi`/`.exe`/`.deb`/`.rpm`/`.AppImage`）
 
 **Release body 结构**：
@@ -115,7 +115,7 @@ release.yml
 
 ---
 
-（来自 conventional-changelog 的最新段，含 Added/Changed/Fixed 分类）
+（来自 CHANGELOG.md 的当前版本段，Keep a Changelog 格式）
 ```
 
 ### 3.5 并发控制
@@ -171,7 +171,7 @@ git push origin v1.0.0
 
 1. 等待 build + release job 全绿
 2. 进入 Releases 页面找到草稿 `Rhost v<version>`
-3. 核对 body（安装须知 + changelog）与附件
+3. 核对 body（安装须知 + CHANGELOG 版本段）与附件
 4. 重要发版按 [Release notes 模板](../reference/release-notes-template.md) 手写亮点
 5. 点 **Publish release** 发布
 

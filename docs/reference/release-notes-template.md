@@ -6,16 +6,16 @@
 >
 > created: 2026-10-08 10:58:02
 >
-> updated: 2026-10-08 16:10:24
+> updated: 2026-10-15 10:23:36
 >
 > author: [sjzhao](https://github.com/ShiJieCloud/rhost)
 
 ## 1. 何时用本模板
 
-每次打 tag `v*` 触发流水线生成 Release 草稿后，维护者在 GitHub Releases 页面核对/编辑 body 时参考本模板。提供两套模板：
+每次打 tag `v*` 触发流水线生成 Release 草稿后，维护者在 GitHub Releases 页面核对/编辑 body 时参考本模板。提供两套路径：
 
-- **§2 完整模板**：重要发版（如 `v1.0.0`、首个公开版、含破坏性变更）由维护者手写，亮点 / 下载表 / 校验 / 破坏性变更俱全；
-- **§4 过渡模板**：日常发版由流水线自动生成（`generate_release_notes: true`），维护者零手写，落地 [ci-release-design.md §10](../explanation/design/ci-release-design.md) 阶段 2 后切换为 CHANGELOG.md 提取。
+- **§2 完整模板**：重要发版（如 `v2.0.0`、含破坏性变更）由维护者手写，亮点 / 下载表 / 校验 / 破坏性变更俱全；
+- **CHANGELOG.md 提取**：日常发版由流水线从 `CHANGELOG.md`（Keep a Changelog 格式）提取当前版本段拼接，`CHANGELOG.md` 为单一事实来源，仓库与 Release 页内容保持一致。
 
 ## 2. 完整 Release body 模板（手写场景）
 
@@ -113,22 +113,22 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 
 ## 3. 段落来源说明
 
-| 段落 | 手写场景（§2） | 自动场景（§4 / §10 阶段 2） |
+| 段落 | 手写场景（§2） | CHANGELOG.md 提取场景 |
 |---|---|---|
-| 顶部元信息（发布日期、版本类型、对比范围、完整变更日志链接） | 维护者手填 | 流水线不生成，需手填或留空 |
-| 一句话总结 / 亮点 | 维护者手写 | 无 |
-| 新功能 / 修复 / 优化 | 维护者按 PR 标题归类 | `generate_release_notes` 自动列 PR，不分类 |
-| 破坏性变更 | 维护者手写 | 无（自动模式不识别破坏性） |
+| 顶部元信息（发布日期、版本类型、对比范围、完整变更日志链接） | 维护者手填 | 以 `CHANGELOG.md` 版本段首部描述为准 |
+| 一句话总结 / 亮点 | 维护者手写 | 以 `CHANGELOG.md` 版本段开头的主题描述为准 |
+| 新功能 / 修复 / 优化 | 维护者按 PR 标题归类 | 以 `CHANGELOG.md` 的「新增 / 变更 / 修复」段落为准 |
+| 破坏性变更 | 维护者手写 | `CHANGELOG.md` 未约定破坏性段落时无，需破坏性说明请回写后再打 tag |
 | 下载表（含 SHA256 列） | 维护者按 §6.4 命名规范填平台/格式 + 手填 SHA256 | 无（产物自动挂 Assets，body 不含表；SHA256 需流水线增强，见 §7） |
-| 制品校验命令 | 模板固定 | 模板固定（自动模式不含校验段） |
-| 贡献者 | 维护者手写 | `generate_release_notes` 的「New Contributors」段自动覆盖 |
-| 已知问题 | 维护者手写 | 无 |
-| 相关链接 | 维护者手填 | 无 |
+| 制品校验命令 | 模板固定 | 无 |
+| 贡献者 | 维护者手写 | 无 |
+| 已知问题 | 维护者手写 | 以 `CHANGELOG.md`「已知问题」段落为准（如有） |
+| 相关链接 | 维护者手填 | 以 `CHANGELOG.md` 版本段底部链接为准（如有） |
 | 产物未签名提示 | 下载段 blockquote 保留 | workflow `body` 写入前缀 |
 
-## 4. 过渡模板（流水线自动生成场景）
+## 4. 流水线自动提取说明
 
-当前 `release.yml` 用 `generate_release_notes: true` 自动生成，body 结构如下（见 [ci-release-design.md §6.1](../explanation/design/ci-release-design.md)）：
+`release.yml` 的 release job 从 `CHANGELOG.md` 提取当前版本段拼接 body（见 [ci-release-design.md §6.1](../explanation/design/ci-release-design.md)）：
 
 ```markdown
 ## 安装须知（产物未签名）
@@ -140,20 +140,21 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 
 ---
 
-<!-- 以下由 generate_release_notes: true 自动追加：What's Changed + New Contributors + Full Changelog 链接 -->
+<!-- 以下从 CHANGELOG.md 提取 `## [<version>]` 到下一个 `## [` 之间的内容 -->
 ```
 
-落地 [ci-release-design.md §10](../explanation/design/ci-release-design.md) 阶段 2 后，自动段从 CHANGELOG.md 最新段提取（带 Added/Changed/Fixed 分类），关闭 `generate_release_notes`。
+提取规则：版本号取自 `frontend/package.json`，匹配 `CHANGELOG.md` 中 `## [<version>]` 段落直至下一个 `## [` 标题；段落不存在时流水线直接失败（防呆），避免发出空 body。
 
 ## 5. 发版流程
 
-1. 三处版本对齐：`src-tauri/tauri.conf.json` 的 `version`、`src-tauri/Cargo.toml` 的 `version`、`frontend/package.json` 的 `version`；
-2. 提交改动并推送；
-3. 打 tag：`git tag v0.1.0 && git push origin v0.1.0`；
-4. 等 Actions 跑完（build + release 两 job，约 30-60 分钟，首次无缓存偏长）；
-5. 去 GitHub Releases 页面查看草稿：产物已挂载、body 已含「安装须知」+ 自动 changelog；
-6. 重要发版：按 §2 完整模板重写 body；日常发版：仅核对自动段；
-7. 点 **Publish release** 发布。
+1. 三处版本对齐：`src-tauri/tauri.conf.json` 的 `version`、`src-tauri/Cargo.toml` 的 `version`、`frontend/package.json` 的 `version`（`Cargo.lock` 中 rhost 版本随 `cargo check` 自动更新）；
+2. 手写回写 `CHANGELOG.md`：按 Keep a Changelog 格式新增 `## [<version>] - <日期>` 段落（流水线按此段落提取 body，缺失时打 tag 会失败）；
+3. 提交改动并推送；
+4. 打 tag：`git tag v2.0.0 && git push origin v2.0.0`；
+5. 等 Actions 跑完（build + release 两 job，约 30-60 分钟，首次无缓存偏长）；
+6. 去 GitHub Releases 页面查看草稿：产物已挂载、body 已含「安装须知」+ CHANGELOG 版本段；
+7. 重要发版：按 §2 完整模板重写 body；日常发版：仅核对提取段；
+8. 点 **Publish release** 发布。
 
 ## 6. 与流水线的关系
 
@@ -161,12 +162,11 @@ Get-FileHash {{FILE_NAME}} -Algorithm SHA256
 
 - build job 三平台并行构建，上传 workflow artifact；
 - release job 等 build 全绿后下载 artifact，用 `softprops/action-gh-release@v2` 创建草稿；
-- body 前缀「安装须知」由 workflow 写入，changelog 由 `generate_release_notes: true` 调 GitHub API 自动追加；
+- body 前缀「安装须知」由 workflow 写入，changelog 段从 `CHANGELOG.md` 按 `frontend/package.json` 版本号提取（缺失即失败）；
 - 产物文件名遵循 [ci-release-design.md §6.4](../explanation/design/ci-release-design.md) 命名规范（`rhost_{{VERSION}}_{{arch}}.{{ext}}`），Release 资产名保持 Tauri 默认，禁止重命名。
 
 ## 7. 未决问题
 
-- `CHANGELOG.md` 引入方案已规划，见 [ci-release-design.md §10](../explanation/design/ci-release-design.md)；落地前 Release body 仍用 `generate_release_notes: true` 自动生成，本模板 §4 作为过渡；
 - `checksums.txt` 生成与挂载：当前流水线未产出，需 release job 加 `sha256sum` 步骤生成并挂 Assets；落地后本模板 §2 的「制品校验」段方可使用；
 - Sigstore / cosign 制品签名：与 macOS/Windows 代码签名同属"未签名"现状，见 [ci-release-design.md §9](../explanation/design/ci-release-design.md) 签名/公证未决项；
 - macOS Intel (x86_64) 产物未提供，见 [ci-release-design.md §9](../explanation/design/ci-release-design.md)；

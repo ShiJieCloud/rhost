@@ -1,6 +1,6 @@
 # 三平台打包与发布：tag v* → Release 草稿；手动触发 → 仅产物（无 Release）
 # 产物未签名（ad-hoc）：macOS 首次打开需右键 → 打开，Windows/Linux 有 SmartScreen/未知来源提示
-# Release body 由 release-body-prefix.md（安装须知）+ conventional-changelog 最新段拼接，关闭 generate_release_notes（ci-release-design §10 阶段2）
+# Release body 由 release-body-prefix.md（安装须知）+ CHANGELOG.md 对应版本段拼接（单一事实来源，Keep a Changelog）
 name: Build & Release
 
 on:
@@ -84,20 +84,17 @@ jobs:
           if-no-files-found: warn
 
   # 仅 tag 触发执行：等三平台 build 全绿后下载全部 artifact，
-  # 用 conventional-changelog 最新段 + 安装须知前缀拼接 Release body，创建草稿
+  # 从 CHANGELOG.md 提取当前版本段 + 安装须知前缀拼接 Release body，创建草稿
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # 需完整历史供 conventional-changelog 解析 commit
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      # 为 npx conventional-changelog-cli 提供运行时；version 取自 frontend/package.json
+      # 为读取 frontend/package.json 版本号提供 Node 运行时
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -113,13 +110,21 @@ jobs:
           path: bundles
           pattern: bundles-*
 
-      # 拼接 Release body：安装须知前缀 + 分隔线 + CHANGELOG 最新段
-      # --pkg frontend/package.json 让版本号取 1.0.0；--tag-prefix v 按 v* tag 切段
+      # 拼接 Release body：安装须知前缀 + 分隔线 + CHANGELOG.md 对应版本段
+      # 版本号取自 frontend/package.json，与三处版本对齐约定一致
       - name: Build release body
         run: |
-          npx --yes conventional-changelog-cli@latest -p angular \
-            --pkg frontend/package.json --tag-prefix 'v' --release-count 1 \
-            -o changelog-latest.md
+          VERSION=$(node -p "require('./frontend/package.json').version")
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") {flag=1; next}
+            /^## \[/ && flag {exit}
+            flag {print}
+          ' CHANGELOG.md > changelog-latest.md
+          # 防呆：CHANGELOG.md 未回写当前版本段时直接失败，避免发出空 body
+          if [ ! -s changelog-latest.md ]; then
+            echo "::error::CHANGELOG.md 未包含 [${VERSION}] 段落，请先回写后再打 tag"
+            exit 1
+          fi
           cat .github/release-body-prefix.md > release-body.md
           printf '\n---\n\n' >> release-body.md
           cat changelog-latest.md >> release-body.md

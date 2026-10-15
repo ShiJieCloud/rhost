@@ -191,7 +191,7 @@ rhost/
 │   └── Cargo.toml
 ├── package.json                   # 文档站与 commit 工具脚本
 ├── pnpm-workspace.yaml
-├── CHANGELOG.md                   # 由 conventional-changelog 自动生成
+├── CHANGELOG.md                   # 人工维护的发版记录（Keep a Changelog 格式）
 ├── LICENSE
 └── README.md
 ```
@@ -213,7 +213,7 @@ rhost/
 - `feat` 新功能 / `fix` 修复 / `docs` 文档 / `refactor` 重构 / `perf` 性能 / `test` 测试 / `chore` 杂务 / `style` 格式
 - description 用简明中文或英文，示例：`feat(tunnel): 支持实时流量统计`、`fix(ssh): 修复断线端口泄漏`
 
-仓库已配置 `commitlint` + `husky` 钩子，`git commit` 时自动校验 `commit-msg`，不符合规范会被拒绝；`CHANGELOG.md` 由 `conventional-changelog` 据此自动生成。
+仓库已配置 `commitlint` + `husky` 钩子，`git commit` 时自动校验 `commit-msg`，不符合规范会被拒绝；发版时人工总结提交历史回写 `CHANGELOG.md`（Keep a Changelog 格式），流水线据此拼接 Release body。
 
 ## ⚠️ 注意事项
 
