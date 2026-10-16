@@ -115,6 +115,18 @@ pub struct ConnectPayload {
     /// 缺省 true 保持既有「接受并保存」落盘行为（设计 §6.5）
     #[serde(default = "default_true")]
     pub trust_host_key_persist: bool,
+    /// 传输层保活间隔（秒）：缺省 30s，0 = 禁用；按主机配置
+    #[serde(default)]
+    pub keepalive_secs: Option<u64>,
+}
+
+/// 保活间隔解析：未指定 → 缺省 30s（保持现行行为）；0 → 禁用；其余 → 指定秒数
+fn resolve_keepalive(secs: Option<u64>) -> Option<Duration> {
+    match secs {
+        None => Some(Duration::from_secs(30)),
+        Some(0) => None,
+        Some(n) => Some(Duration::from_secs(n)),
+    }
 }
 
 /// serde 默认值：布尔开关缺省为 true
@@ -218,6 +230,7 @@ pub async fn connect_ssh(
         color_prompt,
         env: payload.env,
         motd_logo: payload.motd_logo,
+        keepalive: resolve_keepalive(payload.keepalive_secs),
         host_key,
     };
     let (session_id, mut frame_rx) = manager.create(cfg).await.map_err(|e| {
@@ -651,6 +664,8 @@ pub async fn test_ssh_connection(
         color_prompt: false,
         env: Vec::new(),
         motd_logo: String::new(),
+        // 测试连接短生命周期（10s 超时即断），保活无意义
+        keepalive: None,
         host_key,
     };
 
@@ -1306,6 +1321,27 @@ pub async fn reset_settings_config(
         })),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::resolve_keepalive;
+    use std::time::Duration;
+
+    #[test]
+    fn default_is_30s() {
+        assert_eq!(resolve_keepalive(None), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn zero_disables() {
+        assert_eq!(resolve_keepalive(Some(0)), None);
+    }
+
+    #[test]
+    fn explicit_value_passes_through() {
+        assert_eq!(resolve_keepalive(Some(15)), Some(Duration::from_secs(15)));
+    }
 }
 
 #[cfg(test)]

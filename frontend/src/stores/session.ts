@@ -721,6 +721,8 @@ async function connectBackend(
         colorPrompt: savedSettings.colorPrompt,
         // 环境变量：随 init 脚本 export 注入远端 shell（绕过 sshd AcceptEnv 限制）
         env: savedSettings.env.map(e => [e.key, e.value]),
+        // 传输层保活间隔（秒）：0 = 禁用，未配置走缺省 30s
+        keepaliveSecs: s.host.keepalive ?? 30,
         // 主机密钥 TOFU 二阶段：重试时带用户确认的指纹（后端校验格式并比对本次握手）；
         // 仅本次连接 trustPersist=false，后端跳过 known_hosts 落盘
         trustHostKey,

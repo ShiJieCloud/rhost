@@ -54,12 +54,19 @@ function storedToHost(s: StoredHost): Host {
     group: s.group,
     keyPath: s.keyPath ?? undefined,
     tunnels: Array.isArray(extra.tunnels) ? (extra.tunnels as Host['tunnels']) : undefined,
+    keepalive:
+      typeof extra.keepalive === 'number' && extra.keepalive >= 0
+        ? extra.keepalive
+        : undefined,
     // password 不入 JSON，连接时从钥匙串按需读取
   }
 }
 
 /** 前端 Host → 后端 StoredHost（剔除运行时状态与密码） */
 function hostToStored(h: Host, connType: string): StoredHost {
+  const extra: Record<string, unknown> = {}
+  if (h.tunnels?.length) extra.tunnels = h.tunnels
+  if (h.keepalive !== undefined) extra.keepalive = h.keepalive
   return {
     id: h.id,
     connType,
@@ -72,7 +79,7 @@ function hostToStored(h: Host, connType: string): StoredHost {
     tag: h.tag,
     group: h.group,
     keyPath: h.keyPath ?? null,
-    extra: h.tunnels?.length ? { tunnels: h.tunnels } : {},
+    extra,
     updatedAt: Date.now(),
   }
 }

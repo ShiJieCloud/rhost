@@ -45,7 +45,8 @@ const FRAME_QUEUE: usize = 128;
 /// 前端输入通道容量（键盘输入量小）
 const WRITE_QUEUE: usize = 64;
 
-/// RTT 探测周期：30s，与传输层 keepalive 同频；RTT 变化慢，更高频无收益
+/// RTT 探测周期：30s。独立于传输层 keepalive（后者按主机配置），
+/// 仅用于状态栏延迟显示；RTT 变化慢，更高频无收益
 const RTT_INTERVAL: Duration = Duration::from_secs(30);
 /// 单次 ping 等待上限：不响应 global request 的 sshd（罕见）静默跳过本轮
 const RTT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -910,7 +911,7 @@ pub(crate) async fn connect_and_auth(
     );
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
-        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_interval: cfg.keepalive,
         nodelay: true,
         ..Default::default()
     });

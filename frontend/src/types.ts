@@ -82,6 +82,8 @@ export interface Host {
   keyPath?: string
   /** 公钥认证：私钥口令（无口令为 undefined，会话内暂存） */
   keyPassphrase?: string
+  /** 传输层保活间隔（秒）：undefined = 缺省 30s，0 = 禁用（持久化在 StoredHost.extra.keepalive） */
+  keepalive?: number
 }
 
 /**

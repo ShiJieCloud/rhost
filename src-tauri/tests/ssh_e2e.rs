@@ -32,6 +32,8 @@ fn test_cfg() -> SessionConfig {
         color_prompt: true,
         env: vec![],
         motd_logo: String::new(),
+        // 端到端用例不关心保活：禁用以免心跳干扰输出断言
+        keepalive: None,
         // 既有用例不关心主机密钥校验：显式跳过（doc(hidden)，仅测试可达）；
         // 信任路径行为由下方 ssh_hostkey_tofu_trust_and_persist 专项覆盖
         host_key: HostKeyPolicy::SkipForTests,

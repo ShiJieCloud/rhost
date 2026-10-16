@@ -6,6 +6,7 @@
 //! - [`manager`]：会话池（Arc<RwLock<HashMap>> + CancellationToken 生命周期管理）
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub mod frame;
 pub mod manager;
@@ -49,6 +50,9 @@ pub struct SessionConfig {
     pub env: Vec<(String, String)>,
     /// 用户自定义 MOTD ASCII LOGO（多行文本）；空串使用内置 LOGO
     pub motd_logo: String,
+    /// 传输层保活间隔（按主机配置）：`None` = 禁用（表单 0）；
+    /// 未配置时由 ipc 层解析为缺省 30s，本字段不携带缺省语义。
+    pub keepalive: Option<Duration>,
     /// 服务器主机密钥校验策略（hostkey-verification-design.md）。
     /// 非 `Option`：`None` 的缺省语义即「跳过校验」，属危险默认；
     /// 枚举强制显式选择、漏填即编译错误，生产路径恒为 `Verify`。
