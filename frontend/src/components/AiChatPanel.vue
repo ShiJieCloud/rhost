@@ -483,6 +483,13 @@ async function loadRecord(s: AiScope) {
     // 计划崩溃收敛：executing 计划的 running 步中断后收敛为 failed（记「应用中断」），
     // plan 保持 executing 等用户决策（重试/跳过/终止）——与 streaming→stopped 同语义
     for (const m of messages.value) {
+      // 遗留 pending 提案收敛：授权弹窗是运行时态，重载后无裁决入口，
+      // 置 expired 避免 hasPendingProposal 拦截发送导致软锁（卡片显示「已失效」）；
+      // 例外：draft 计划的 propose_plan 裁决入口是消息态驱动的确认栏（重载后仍可操作），保留 pending
+      const isDraftPlan = m.plan?.state === 'draft'
+      m.toolProposals?.forEach(p => {
+        if (p.state === 'pending' && !(isDraftPlan && p.name === 'propose_plan')) p.state = 'expired'
+      })
       if (m.plan?.state === 'executing') {
         m.plan.steps.forEach(st => {
           if (st.state === 'running') {
