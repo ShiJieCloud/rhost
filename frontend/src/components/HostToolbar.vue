@@ -11,6 +11,7 @@ import {
 } from '../stores/appConfig'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { isTauri } from '../lib/tauri'
+import { suppressBlurLock } from '../stores/appLock'
 import type { ViewStyle } from '../types'
 
 const VIEWS: { style: ViewStyle; title: string }[] = [
@@ -43,11 +44,18 @@ async function onImportHosts() {
     toast('请在桌面端使用「导入主机」', 'info', 2000)
     return
   }
-  const selected = await open({
-    multiple: false,
-    title: '选择要导入的配置文件',
-    filters: [{ name: 'JSON 配置文件', extensions: ['json'] }],
-  })
+  // 原生文件对话框会让主窗口收到假失焦事件，抑制失焦锁直到对话框关闭
+  const releaseBlur = suppressBlurLock()
+  let selected: string | string[] | null
+  try {
+    selected = await open({
+      multiple: false,
+      title: '选择要导入的配置文件',
+      filters: [{ name: 'JSON 配置文件', extensions: ['json'] }],
+    })
+  } finally {
+    releaseBlur()
+  }
   if (!selected || typeof selected !== 'string') return
   importing.value = true
   try {

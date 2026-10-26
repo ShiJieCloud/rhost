@@ -7,10 +7,15 @@ import AppLogo from './AppLogo.vue'
 import { toast } from '../composables/useToast'
 import {
   resolveTerminalFontFamily, savedSettings, saveSettings, showSettings,
+  pendingSettingsSection, persistSettings, APP_LOCK_IDLE_OPTIONS,
   type AppSettings,
 } from '../stores/settings'
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
+import { lockSlots, refreshLockSlots, suppressBlurLock } from '../stores/appLock'
+import { lockClearPassword } from '../lib/lock'
+import { unlockAllSessions } from '../stores/session'
+import LockPasswordEditor from './LockPasswordEditor.vue'
 import { aiClearMemories, aiGetApiKey, aiListMemories, aiListPromptAssets, aiRevealPromptDir, aiSaveMemories, aiSetApiKey, aiTestConnection, AI_MEMORY_CONTENT_MAX_CHARS, type AiMemoryItem, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
@@ -74,7 +79,7 @@ interface RowDef {
 interface GroupDef {
   label: string
   rows: RowDef[]
-  extra?: 'envEditor' | 'preview'
+  extra?: 'envEditor' | 'preview' | 'lockApp' | 'lockSession'
 }
 interface PanelDef {
   id: string
@@ -89,6 +94,7 @@ interface PanelDef {
 const ICONS: Record<string, string> = {
   appearance: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 000 18z" fill="currentColor" stroke="none"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M13 14h4"/></svg>',
+  security: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>',
   logs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>',
   keymap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>',
   advanced: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>',
@@ -128,6 +134,12 @@ async function refreshFontAvail() {
   }
 }
 void refreshFontAvail()
+
+/** 闲置自动锁屏档位（白名单见 stores/settings.ts；0=关闭） */
+const APP_LOCK_IDLE_OPTS = APP_LOCK_IDLE_OPTIONS.map(v => ({
+  v: String(v),
+  t: v === 0 ? '关闭（不自动锁定）' : `${v / 60} 分钟${v === 300 ? '（默认）' : ''}`,
+}))
 
 const PANELS: PanelDef[] = [
   {
@@ -207,6 +219,29 @@ const PANELS: PanelDef[] = [
         label: '环境变量', extra: 'envEditor',
         rows: [],
       },
+    ],
+  },
+  {
+    id: 'security', label: '安全', glyph: 'security',
+    title: '安全', sub: '应用锁与会话锁：两级独立密码，锁凭据仅保存在本机',
+    groups: [
+      {
+        label: '应用锁',
+        rows: [
+          { key: 'appLockEnabled', title: '启用应用锁', desc: '开启后冷启动即锁定，可用 ⌘/Ctrl+Shift+L 或状态栏锁图标手动锁屏；开启前需先在下方设置应用锁密码', kind: 'switch', keywords: '应用锁 锁屏 密码 启用 开关 冷启动 启动' },
+          { key: 'appLockIdleSec', title: '闲置自动锁定', desc: '无键盘、鼠标操作达到该时长后自动锁屏', kind: 'select', num: true, width: 180, disabledKey: 'appLockEnabled', keywords: '闲置 自动 锁屏 时间 分钟 超时 idle',
+            options: APP_LOCK_IDLE_OPTS },
+          { key: 'appLockLockOnBlur', title: '窗口失焦锁定', desc: '切换到其他应用、窗口失去焦点时立即锁屏', kind: 'switch', disabledKey: 'appLockEnabled', keywords: '失焦 切换窗口 锁屏 后台 blur 焦点' },
+        ],
+      },
+      { label: '应用锁密码', extra: 'lockApp', rows: [] },
+      {
+        label: '会话锁',
+        rows: [
+          { key: 'sessionLockUseAppPassword', title: '会话锁使用应用锁密码', desc: '勾选后单个会话的解锁验证使用应用锁密码；取消勾选则需设置独立的会话锁密码。会话锁运行时态生效，重启后全部解锁', kind: 'switch', keywords: '会话锁 密码 复用 应用锁 独立 标签' },
+        ],
+      },
+      { label: '会话锁密码', extra: 'lockSession', rows: [] },
     ],
   },
   {
@@ -512,12 +547,17 @@ watch(showSettings, v => {
   if (!v) return
   Object.assign(draft, JSON.parse(JSON.stringify(savedSettings)))
   query.value = ''
-  activePanelId.value = 'appearance'
+  // toast 引导等场景可指定打开后定位的分区（如 'security'），消费一次后清空
+  const target = pendingSettingsSection.value
+  pendingSettingsSection.value = null
+  activePanelId.value = target && PANELS.some(p => p.id === target) ? target : 'appearance'
   recordingKey.value = null
   alertUnit.value = 'MB'
   syncAlertRaw()
   // 刷新字体安装态：面板打开期间新装/卸载字体重开面板即反映
   void refreshFontAvail()
+  // 刷新锁密码槽位（可能在面板外清除过 lock.json）
+  void refreshLockSlots()
   nextTick(() => searchEl.value?.focus())
 })
 
@@ -659,6 +699,9 @@ function ctlHint(r: RowDef): string {
     const perMin = 60 / n
     const rate = perMin >= 10 ? String(Math.round(perMin)) : perMin.toFixed(1).replace(/\.0$/, '')
     return `每 ${n} 秒采集一次 · 约 ${rate} 次/分钟`
+  }
+  if (r.key === 'appLockIdleSec' && numVal(r.key) === 0) {
+    return '已关闭闲置自动锁定，仅能通过快捷键、锁图标或失焦选项锁屏'
   }
   return ''
 }
@@ -817,7 +860,51 @@ async function save() {
   }
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
+
+  /* ---- 两级锁开关联动（app-lock-design.md §6.3） ---- */
+  // 禁止「裸开」：启用应用锁前必须已有密码槽位
+  if (draft.appLockEnabled && !lockSlots.value.appPasswordSet) {
+    toast('请先在下方设置应用锁密码，再启用应用锁', 'warn', 3000)
+    activePanelId.value = 'security'
+    return
+  }
+  // 复用应用锁密码的前提同样是应用锁密码存在
+  if (draft.sessionLockUseAppPassword && !lockSlots.value.appPasswordSet) {
+    toast('应用锁密码未设置，无法复用；请先设置应用锁密码', 'warn', 3000)
+    activePanelId.value = 'security'
+    return
+  }
+  // 关闭应用锁总开关：验证当前密码并清除凭据（应用内不允许无验证关闭）
+  // 注意：先记录「复用通道是否被收回」，saveSettings 之后 savedSettings 即被覆盖。
+  const reuseWasOn = savedSettings.sessionLockUseAppPassword
+  let forceUnlock: 'credential-cleared' | 'channel-changed' | null = null
+  if (savedSettings.appLockEnabled && !draft.appLockEnabled && lockSlots.value.appPasswordSet) {
+    const pwd = await promptPassword(
+      '关闭应用锁需要验证当前密码，验证通过后将同时清除应用锁密码',
+      '关闭应用锁',
+      '输入应用锁密码',
+    )
+    if (pwd == null) return
+    try {
+      await lockClearPassword('app', pwd)
+    } catch (e) {
+      toast(`密码验证失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`, 'err', 3000)
+      return
+    }
+    await refreshLockSlots()
+    // 凭据已清除，会话锁复用选项同步收回（否则进入无凭据的半启用态）
+    if (draft.sessionLockUseAppPassword) draft.sessionLockUseAppPassword = false
+    forceUnlock = 'credential-cleared'
+    toast('应用锁已关闭，密码已清除', 'ok', 2200)
+  }
+  // 复用开关由开变关（且不是上面清 app 密码路径已覆盖的情况）：
+  // 已锁会话的验证通道从 app 槽位移走，通道切换必须解锁，防止旧 locked 滞留死锁
+  if (!forceUnlock && reuseWasOn && !draft.sessionLockUseAppPassword) {
+    forceUnlock = 'channel-changed'
+  }
+
   saveSettings(draft)
+  if (forceUnlock) unlockAllSessions(forceUnlock)
   syncLogConfig()
   if (storagePathChanged) {
     toast('日志存储路径已变更，重启应用后生效', 'warn', 3200)
@@ -830,6 +917,28 @@ async function save() {
 function discard() {
   syncDraftFromSaved()
   toast('已放弃未保存的更改', 'info', 1600)
+}
+
+/* ---- 密码编辑器「清除密码」成功后的联动（不经 save() 的直接清除路径） ----
+ * 槽位消失后仍保留开关 / 复用勾选 / 会话 locked 会造成死锁或半启用态，
+ * 这里就地收回并同步 draft（避免下次保存把旧值写回）。 */
+function onAppPasswordCleared() {
+  let changed = false
+  if (savedSettings.appLockEnabled) {
+    savedSettings.appLockEnabled = false
+    draft.appLockEnabled = false
+    changed = true
+  }
+  if (savedSettings.sessionLockUseAppPassword) {
+    savedSettings.sessionLockUseAppPassword = false
+    draft.sessionLockUseAppPassword = false
+    changed = true
+  }
+  if (changed) persistSettings()
+  unlockAllSessions('credential-cleared')
+}
+function onSessionPasswordCleared() {
+  unlockAllSessions('credential-cleared')
 }
 /* ---- 配置文件：导入 / 导出 / 重置（§7） ---- */
 
@@ -915,11 +1024,18 @@ async function onExportFile() {
   // 导出固定加密：必须设置密码（两次确认）
   const password = await askExportPassword()
   if (password === null) return
-  const path = await saveDialog({
-    title: '导出加密配置',
-    defaultPath: `rhost_config_${timeStamp()}.json`,
-    filters: jsonFilter(),
-  })
+  // 原生保存对话框会让主窗口收到假失焦事件，抑制失焦锁直到对话框关闭
+  const releaseBlur = suppressBlurLock()
+  let path: string | null
+  try {
+    path = await saveDialog({
+      title: '导出加密配置',
+      defaultPath: `rhost_config_${timeStamp()}.json`,
+      filters: jsonFilter(),
+    })
+  } finally {
+    releaseBlur()
+  }
   if (!path) return
   cfgBusy.value = true
   try {
@@ -934,11 +1050,18 @@ async function onExportFile() {
 
 async function onImportFile() {
   if (!ensureDesktop() || cfgBusy.value) return
-  const selected = await open({
-    title: '选择要导入的配置文件',
-    multiple: false,
-    filters: jsonFilter(),
-  })
+  // 原生文件对话框会让主窗口收到假失焦事件，抑制失焦锁直到对话框关闭
+  const releaseBlur = suppressBlurLock()
+  let selected: string | string[] | null
+  try {
+    selected = await open({
+      title: '选择要导入的配置文件',
+      multiple: false,
+      filters: jsonFilter(),
+    })
+  } finally {
+    releaseBlur()
+  }
   if (!selected || typeof selected !== 'string') return
   cfgBusy.value = true
   try {
@@ -1660,6 +1783,26 @@ function optionList(r: RowDef): Opt[] {
                 <div class="ln"><span class="y">⚠</span> 2 个依赖已过时</div>
                 <div class="ln c"># 连字测试: =&gt; != === -&gt; &lt;= ::</div>
               </div>
+
+              <!-- 应用锁密码管理 -->
+              <div v-if="g.extra === 'lockApp' && !p.searching" class="st-extra-lock">
+                <LockPasswordEditor kind="app" @cleared="onAppPasswordCleared" />
+              </div>
+
+              <!-- 会话锁密码管理：勾选复用应用锁密码时隐藏独立表单 -->
+              <div v-if="g.extra === 'lockSession' && !p.searching" class="st-extra-lock">
+                <LockPasswordEditor
+                  v-if="!draft.sessionLockUseAppPassword"
+                  kind="session"
+                  @cleared="onSessionPasswordCleared"
+                />
+                <div v-else class="lpe-follow-hint">已复用应用锁密码，单个会话解锁时输入应用锁密码即可。</div>
+              </div>
+            </div>
+
+            <!-- 安全分区底部固定提示：忘记密码的本机重置路径（应用内不提供绕过） -->
+            <div v-if="p.id === 'security' && !p.searching" class="st-lock-forgot">
+              锁密码仅保存在本机，忘记后需退出应用并删除 lock.json 重置；主机配置与钥匙串中的主机密码不受影响。
             </div>
           </section>
 

@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { activeSession, activeHost, activeSessionId, appView, rightPanelTab, rightPanelVisible, sendInput, sendInputAndCapture, sessions } from '../stores/session'
 import { savedSettings } from '../stores/settings'
+import { appLocked } from '../stores/appLock'
 import { aiQuote } from '../stores/aiQuote'
 import { toast } from '../composables/useToast'
 import { matchHighRisk } from '../lib/aiRisk'
@@ -67,6 +68,14 @@ const EXTRACT_TRIGGER_CHARS = 4000
 /** 对话归属：首页 'global'，终端为当前 SSH 会话 id */
 const scope = computed<AiScope>(() =>
   appView.value === 'home' ? 'global' : activeSession.value?.id ?? 'global',
+)
+
+/** 当前 scope 绑定的会话是否处于会话锁定态。
+ *  会话锁语义是单会话冻结，该会话发起的 AI 对话与之同为「该会话的操作」，
+ *  锁定后整体冻结（停流 + 发送拦截 + 输入禁用），与终端/粘贴/SFTP 拦截点对称。
+ *  首页 global 对话不绑定会话，不受会话锁影响（工具出口 aiExecTool 仍按 scope 拦）。 */
+const activeSessionLocked = computed(
+  () => appView.value !== 'home' && activeSession.value?.locked === true,
 )
 
 const messages = ref<AiChatMessage[]>([])
@@ -1194,6 +1203,12 @@ async function runSftpTransfer(p: AiToolProposal) {
     p.error = '无可用会话或会话已断开'
     return
   }
+  // 两级锁拦截（app-lock-design.md §6.5）：授权弹窗期间也可能被锁，执行前复检
+  if (appLocked.value || activeSession.value.locked) {
+    p.state = 'rejected'
+    p.error = appLocked.value ? '应用已锁定，请先解锁' : '会话已锁定，请先解锁'
+    return
+  }
   const paths = sftpPaths(p)
   if (!paths) {
     p.state = 'rejected'
@@ -1337,6 +1352,11 @@ function buildSessionContext(): AiWireMessage | null {
 function send(override?: string) {
   const input = (override ?? draft.value).trim()
   if ((!input && !attachments.value.length) || streaming.value) return
+  // 会话锁定：该 scope 的对话整体冻结，发送直接拦截（设计 §6.5 拦截矩阵）
+  if (activeSessionLocked.value) {
+    toast('会话已锁定，请先解锁', 'warn', 2400)
+    return
+  }
 
   // 编辑重发：截断发生在真正发送时（填回时不截断，用户可能取消编辑）
   if (editFromId.value) {
@@ -2482,6 +2502,16 @@ function stop() {
   if (!streaming.value) return
   void aiStopChat(scope.value)
 }
+
+// 应用锁锁定瞬间停止本面板在飞 AI 流（global 与会话 scope 均生效；设计 §6.4/§6.5）
+watch(appLocked, locked => {
+  if (locked) stop()
+})
+
+// 会话锁定瞬间停止本 scope 在飞 AI 流（设计 §6.5：会话锁冻结该会话的 AI 交互）
+watch(activeSessionLocked, locked => {
+  if (locked) stop()
+})
 
 function clearChat() {
   messages.value = []
@@ -3734,8 +3764,10 @@ const configHint = computed(() => {
         v-model="draft"
         class="composer-input"
         rows="1"
-        :disabled="!!configHint"
-        :placeholder="configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…')"
+        :disabled="!!configHint || activeSessionLocked"
+        :placeholder="activeSessionLocked
+          ? '会话已锁定，请先解锁'
+          : (configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…'))"
         @keydown="onKeydown"
         @focus="composerFocused = true"
         @blur="composerFocused = false"
@@ -3748,7 +3780,7 @@ const configHint = computed(() => {
             type="button"
             class="icon-btn"
             title="更多"
-            :disabled="!!configHint || streaming"
+            :disabled="!!configHint || streaming || activeSessionLocked"
             @click="addOpen = !addOpen"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -3863,7 +3895,13 @@ const configHint = computed(() => {
           </div>
         </div>
         <div class="bar-spacer"></div>
-        <button v-if="!streaming" class="send-btn" title="发送 (Enter)" @click="send()">
+        <button
+          v-if="!streaming"
+          class="send-btn"
+          :disabled="activeSessionLocked"
+          :title="activeSessionLocked ? '会话已锁定，请先解锁' : '发送 (Enter)'"
+          @click="send()"
+        >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="19" x2="12" y2="5" />
@@ -5172,6 +5210,15 @@ const configHint = computed(() => {
 }
 .send-btn:active {
   transform: scale(0.94);
+}
+/* 会话锁冻结：发送按钮不可用（与冻结输入区呼应） */
+.send-btn:disabled,
+.send-btn:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.send-btn:disabled:active {
+  transform: none;
 }
 .stop-btn {
   width: 28px;

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { appLocked } from '../../stores/appLock'
 
 /** 菜单项：divider=true 时渲染为分隔符行（不绑定 click，与动作项显式分支） */
 export interface MenuItem {
@@ -132,6 +133,13 @@ watch(visible, (v) => {
  * 监听器会泄漏并持续拦截终端按键（Enter 等 stopPropagation）。
  * onUnmounted 确保无论时序如何，监听器必被清理。 */
 onUnmounted(removeListeners)
+
+/* 应用锁屏瞬间关闭所有已打开的右键菜单：菜单 Teleport 到 body 且 z-index:9999，
+ * 会越过应用锁遮罩（z:1000）残留可点，其动作（粘贴/清屏/任务控制等）绕过冻结。
+ * 会话锁维度由各调用方（TerminalPane/DockPanel/WbTabs）自行关闭。 */
+watch(appLocked, (locked) => {
+  if (locked && visible.value) visible.value = false
+})
 </script>
 
 <template>

@@ -8,10 +8,12 @@ import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager'
 import '@xterm/xterm/css/xterm.css'
 import AppLogo from '../AppLogo.vue'
 import ContextMenu, { type MenuItem } from './ContextMenu.vue'
+import SessionLockOverlay from './SessionLockOverlay.vue'
 import { toast } from '../../composables/useToast'
 import { registerTerm, unregisterTerm } from '../../lib/termRegistry'
 import { addToAiChat } from '../../stores/aiQuote'
 import { hosts, showNewConn } from '../../stores/hosts'
+import { appLocked } from '../../stores/appLock'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
 import {
   activeReconnectAttempt, activeSession, activeSessionId, attachTerminal,
@@ -133,10 +135,19 @@ watch(pasteGuardOpen, open => {
   else window.removeEventListener('keydown', onPasteGuardKey, true)
 })
 
+/** 输入冻结判定：应用全局锁定 或 该会话被会话锁锁定。
+ *  键盘 onData 与粘贴 pasteWithGuard 两个写入点共用此断言。 */
+function isInputLocked(id: string): boolean {
+  if (appLocked.value) return true
+  return sessions.value.find(s => s.id === id)?.locked === true
+}
+
 /** 统一粘贴入口（快捷键事件 / 右键 paste 模式 / 菜单"粘贴"项共用）：
  *  开启保护且内容有风险时转确认弹窗，否则直接经 term.paste() 发送 */
 function pasteWithGuard(id: string, text: string) {
   if (!text) return
+  // 应用锁 / 会话锁冻结一切向终端的写入（遮罩已夺焦，此为断言兜底）
+  if (isInputLocked(id)) return
   if (savedSettings.pasteGuard && pasteNeedsGuard(text)) {
     pasteGuardText.value = text
     pasteGuardSession = id
@@ -157,6 +168,18 @@ function selectionText(term: Terminal): string {
 const termMenuOpen = ref(false)
 const termMenuPos = ref({ x: 0, y: 0 })
 const termMenuItems = ref<MenuItem[]>([])
+/** 当前菜单所属会话：该会话被会话锁锁定（或切走）时关闭已打开的菜单，
+ *  避免 z-index:9999 的菜单越过会话锁遮罩残留可点 */
+const termMenuSession = ref<string | null>(null)
+watch(
+  () => {
+    const id = termMenuSession.value
+    return id ? sessions.value.find(s => s.id === id)?.locked === true : false
+  },
+  locked => {
+    if (locked && termMenuOpen.value) termMenuOpen.value = false
+  },
+)
 
 const ICON_COPY = 'M9 9h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2V9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'
 const ICON_PASTE = 'M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'
@@ -186,8 +209,11 @@ function pasteFromClipboard(id: string) {
 
 /** 打开终端右键菜单（每次重建动作项，复制项随选区有无禁用） */
 function openTermMenu(id: string, x: number, y: number) {
+  // 应用锁 / 会话锁：不弹菜单（粘贴/清屏/全选/添加到 AI 均须冻结）
+  if (isInputLocked(id)) return
   const inst = termInsts.get(id)
   if (!inst) return
+  termMenuSession.value = id
   termMenuItems.value = [
     { label: '复制', icon: ICON_COPY, shortcut: '⌘C', disabled: !inst.term.hasSelection(), action: () => copySelection(id) },
     { label: '粘贴', icon: ICON_PASTE, shortcut: '⌘V', action: () => pasteFromClipboard(id) },
@@ -300,7 +326,10 @@ function mountTerminal(id: string) {
   const screenEl: HTMLElement = term.element!
 
   // 键盘原始字节 → 后端 PTY（先绑定再 fit，fit 触发的尺寸事件也能被捕获）
-  term.onData(data => sendInput(id, data))
+  // 应用锁 / 会话锁锁定时丢弃全部按键（遮罩已夺焦，此为断言兜底）
+  term.onData(data => {
+    if (!isInputLocked(id)) sendInput(id, data)
+  })
   // xterm 尺寸变化（fit 计算出新行列）→ window-change 同步远端 PTY
   // 订阅挂在 term 上，term.dispose() 时自动回收，无监听泄漏
   term.onResize(({ cols, rows }) => resizeTerminal(id, cols, rows))
@@ -849,7 +878,10 @@ function dotClass(status: HostStatus) {
         v-show="s.id === activeSessionId"
         :ref="el => setTermEl(s.id, el as Element | null)"
         class="term-instance"
-      ></div>
+      >
+        <!-- 会话锁遮罩：absolute 覆盖终端区，锁定态遮住历史输出并冻结输入 -->
+        <SessionLockOverlay :session-id="s.id" />
+      </div>
     </div>
 
     <!-- ============ 连接/断线/重连/终态：统一用顶部状态条，全程不遮挡快照 ============ -->

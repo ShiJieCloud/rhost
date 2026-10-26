@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { activeAlgo, activeMetrics, activeReconnectAttempt, activeSession, activeTermSize, connected } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
+import { appLocked } from '../../stores/appLock'
+import AppLockButton from '../AppLockButton.vue'
 
 // 五态：ok 已连接 / info 连接中 / warn 重连中 / err 已断开 / idle 未连接（新建会话，从未连接）
 const statusText = () => {
@@ -162,9 +164,11 @@ function onVisibility() {
   docVisible.value = document.visibilityState === 'visible'
 }
 
-/* 暂停开关开启时，仅「状态栏可见 且 文档可见」才采集 */
+/* 暂停开关开启时，仅「状态栏可见 且 文档可见 且 应用未锁定」才采集
+   （应用锁锁定即停内存轮询，解锁后由 watcher 自动恢复；设计 §6.6） */
 const pollingActive = computed(() =>
-  !savedSettings.memPauseHidden || (barVisible.value && docVisible.value),
+  !appLocked.value &&
+  (!savedSettings.memPauseHidden || (barVisible.value && docVisible.value)),
 )
 
 function startPolling() {
@@ -207,6 +211,8 @@ onUnmounted(() => {
 
 <template>
   <footer ref="barEl" class="statusbar">
+    <!-- 应用锁手动上锁入口：状态栏最左侧开头 -->
+    <AppLockButton class="status-lock-btn" />
     <span class="item" :class="statusText().cls">
       <span class="pulse"></span>
       {{ statusText().label }}
@@ -250,3 +256,10 @@ onUnmounted(() => {
     </span>
   </footer>
 </template>
+
+<style scoped>
+/* 状态栏基准字号仅 10px，锁图标需要可读尺寸 */
+.status-lock-btn {
+  font-size: 13px;
+}
+</style>

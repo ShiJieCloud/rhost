@@ -10,6 +10,8 @@
  */
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { appLocked } from '../stores/appLock'
+import { sessions } from '../stores/session'
 
 /** 对话归属：首页全局对话 / 终端会话对话（会话 id） */
 export type AiScope = string
@@ -248,11 +250,17 @@ export interface AiToolExecResult {
 
 /** 经 SSH exec channel 执行只读工具（后端构造 shell 命令，前端只传 tool_name + args）。
  *  工具：read_file / list_directory / get_system_info，自动执行无需授权。 */
-export function aiExecTool(
+export async function aiExecTool(
   sessionId: string,
   toolName: string,
   args: string,
 ): Promise<AiToolExecResult> {
+  // 两级锁拦截（app-lock-design.md §6.5 拦截矩阵）：直接拒绝，不发起 IPC；
+  // 错误文案经调用方 catch 作为工具结果回传模型
+  if (appLocked.value) throw new Error('应用已锁定，请先解锁')
+  if (sessions.value.some(s => s.id === sessionId && s.locked)) {
+    throw new Error('会话已锁定，请先解锁')
+  }
   return invoke<AiToolExecResult>('ai_exec_tool', { sessionId, toolName, args })
 }
 

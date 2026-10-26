@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import TitleBar from './components/TitleBar.vue'
 import WbTitleBar from './components/wb/WbTitleBar.vue'
 import HomeView from './views/HomeView.vue'
@@ -15,12 +16,14 @@ import PasswordModal from './components/PasswordModal.vue'
 import HostKeyModal from './components/HostKeyModal.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import AppToast from './components/AppToast.vue'
+import AppLockOverlay from './components/AppLockOverlay.vue'
 import { appView, restoreSessions, rightPanelMaximized, rightPanelVisible } from './stores/session'
 import { loadHosts } from './stores/hosts'
-import { savedSettings } from './stores/settings'
+import { savedSettings, showSettings } from './stores/settings'
 import { loadAppConfig } from './stores/appConfig'
 import { initGlobalErrorReporting, syncLogConfig } from './stores/applog'
-import { appWindow, detectPlatform } from './lib/tauri'
+import { appLocked, initAppLock, isBlurLockSuppressed, lockApp } from './stores/appLock'
+import { appWindow, detectPlatform, isTauri } from './lib/tauri'
 
 // 标题栏跨平台策略：根节点按平台挂 class，CSS 据此切换安全区方向
 // - platform-macos：左侧为原生红绿灯预留安全区（Overlay 模式）
@@ -47,6 +50,134 @@ onMounted(async () => {
 const workbenchMounted = ref(false)
 watch(appView, v => { if (v === 'workbench') workbenchMounted.value = true }, { immediate: true })
 
+/* ============================================================
+ * 应用锁：闲置 / 失焦检测 + 全局快捷键（app-lock-design.md §6.4）
+ * ============================================================ */
+
+/** 最近一次用户活动时刻（锁定期间冻结不更新，解锁瞬间重置） */
+let lastActivityAt = Date.now()
+let idleTimer: number | undefined
+let blurUnlisten: UnlistenFn | null = null
+/** watcher 装配代际：setup 是 async（onFocusChanged 返回 Promise），
+ *  设置快速连续变化时，过期一代在 await 返回后必须自我了断，
+ *  否则其 unlisten 会覆盖新一代的引用造成监听器泄漏与重复回调。 */
+let watcherGen = 0
+
+const ACTIVITY_EVENTS: Array<keyof DocumentEventMap> = ['pointerdown', 'keydown', 'wheel']
+
+function onUserActivity() {
+  // 锁屏密码框中的输入不刷新活动时刻（解锁成功才重置）
+  if (appLocked.value) return
+  lastActivityAt = Date.now()
+}
+
+function addActivityListeners() {
+  for (const ev of ACTIVITY_EVENTS) {
+    document.addEventListener(ev, onUserActivity, true)
+  }
+}
+function removeActivityListeners() {
+  for (const ev of ACTIVITY_EVENTS) {
+    document.removeEventListener(ev, onUserActivity, true)
+  }
+}
+
+function teardownLockWatchers() {
+  removeActivityListeners()
+  if (idleTimer !== undefined) {
+    window.clearInterval(idleTimer)
+    idleTimer = undefined
+  }
+  if (blurUnlisten) {
+    blurUnlisten()
+    blurUnlisten = null
+  }
+}
+
+/** 按当前开关 / 闲置秒数 / 失焦开关装配监听；设置变化时整体重建 */
+async function setupLockWatchers() {
+  const gen = ++watcherGen
+  teardownLockWatchers()
+  if (!isTauri || !savedSettings.appLockEnabled) return
+  lastActivityAt = Date.now()
+
+  addActivityListeners()
+
+  idleTimer = window.setInterval(() => {
+    if (appLocked.value) return
+    // 原生文件对话框打开期间收不到 document 活动事件，但用户正在应用内交互，
+    // 不计闲置（持续续命），由回焦时的重置兜底
+    if (isBlurLockSuppressed()) {
+      lastActivityAt = Date.now()
+      return
+    }
+    const idleSec = savedSettings.appLockIdleSec
+    if (idleSec > 0 && Date.now() - lastActivityAt >= idleSec * 1000) {
+      lockApp('idle')
+    }
+  }, 1000)
+
+  if (savedSettings.appLockLockOnBlur) {
+    const w = await appWindow()
+    const un = await w?.onFocusChanged(ev => {
+      if (ev.payload === false) {
+        // 原生文件对话框（导入/导出/选私钥）弹出期间的假失焦：不锁
+        if (isBlurLockSuppressed()) return
+        if (!appLocked.value) lockApp('blur')
+        return
+      }
+      // 对话框关闭回焦：用户活动其实发生在应用内模态里，重置计时且不补判
+      if (isBlurLockSuppressed()) {
+        lastActivityAt = Date.now()
+        return
+      }
+      // 重新聚焦补判：窗口后台期间 WebView 定时器会被节流
+      if (appLocked.value) return
+      const idleSec = savedSettings.appLockIdleSec
+      if (idleSec > 0 && Date.now() - lastActivityAt >= idleSec * 1000) {
+        lockApp('idle')
+      }
+    }) ?? null
+    // await 期间设置又变过：本代已过期，立即卸载自己注册的监听，不碰全局引用
+    if (gen !== watcherGen) {
+      un?.()
+      return
+    }
+    blurUnlisten = un
+  }
+}
+
+// 开关 / 档位 / 失焦选项任一变化即时重配（document 监听的增删由 setup/teardown 统一负责）
+watch(
+  () => [
+    savedSettings.appLockEnabled,
+    savedSettings.appLockIdleSec,
+    savedSettings.appLockLockOnBlur,
+  ],
+  () => {
+    void setupLockWatchers()
+  },
+)
+// 解锁成功：活动时刻重新计时，避免「刚解锁又被闲置锁」
+watch(appLocked, locked => {
+  if (!locked) lastActivityAt = Date.now()
+})
+
+// 手动锁屏快捷键：⌘+Shift+L（macOS）/ Ctrl+Shift+L（其他平台）
+function onLockHotkey(ev: KeyboardEvent) {
+  if (!(ev.shiftKey && (ev.metaKey || ev.ctrlKey))) return
+  if (ev.key !== 'L' && ev.key !== 'l') return
+  if (!savedSettings.appLockEnabled || appLocked.value || showSettings.value) return
+  ev.preventDefault()
+  lockApp('manual')
+}
+document.addEventListener('keydown', onLockHotkey, true)
+onBeforeUnmount(() => {
+  watcherGen += 1
+  teardownLockWatchers()
+  document.removeEventListener('keydown', onLockHotkey, true)
+})
+
 // Splash 最短展示时长（ms）：设置项 splashDurationMs（200~5000，消费侧夹取防手改配置文件越界），
 // 生产构建过快时补齐，避免启动画面一闪而过；呼吸动画不受影响。
 // 注意：必须在 await loadAppConfig() hydrate 之后再读取——savedSettings 在此之前是内置默认值，
@@ -71,6 +202,9 @@ onMounted(async () => {
   } catch (e) {
     console.error('loadAppConfig 失败，使用内置默认值:', e)
   }
+  // 应用锁初态判定（已启用且密码槽位存在 → splash 撤下即锁屏；设计 §6.7）
+  await initAppLock()
+  void setupLockWatchers()
   // hydrate 完成后启动最短展示计时（本地 IPC 仅数十 ms，对计时起点影响可忽略）
   const minDelay = new Promise(r => setTimeout(r, clampSplashMs(savedSettings.splashDurationMs)))
   const restBoot = (async () => {
@@ -111,5 +245,8 @@ onMounted(async () => {
     <HostKeyModal />
     <ConfirmModal />
     <AppToast />
+
+    <!-- 应用锁全屏遮罩：z-index:1000，必须最后挂载盖住一切 -->
+    <AppLockOverlay />
   </div>
 </template>

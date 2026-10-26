@@ -7,6 +7,7 @@ mod fonts;
 mod ipc;
 mod known_hosts;
 mod localfs;
+mod lock;
 mod metrics;
 mod motd;
 pub mod ssh;
@@ -215,6 +216,8 @@ pub fn run() {
         .manage(SessionManager::new())
         // AI 对话进行中请求的取消令牌表（按 scope 索引）
         .manage(ai::AiState::default())
+        // 应用锁/会话锁解锁失败限速表（内存态，重启清零）
+        .manage(lock::LockState::default())
         .invoke_handler(tauri::generate_handler![
             ipc::connect_ssh,
             ipc::write_terminal,
@@ -282,6 +285,10 @@ pub fn run() {
             ai::ai_extract_memories,
             ai::ai_exec_tool,
             ai::ai_cancel_execs,
+            lock::lock_status,
+            lock::lock_set_password,
+            lock::lock_unlock,
+            lock::lock_clear_password,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -8,6 +8,7 @@ import {
   startMetrics, stopMetrics,
 } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
+import { appLocked } from '../../stores/appLock'
 import { hosts } from '../../stores/hosts'
 
 /* ---------- 会话时长计时 ---------- */
@@ -265,6 +266,8 @@ const docVisible = ref(typeof document === 'undefined' ? true : document.visibil
 const metricsTarget = computed<{ id: string; iface: string | null; intervalMs: number } | null>(() => {
   const s = activeSession.value
   if (!s || s.state !== 'online' || !s.backendId) return null
+  // 两级锁门控：应用锁定全停；激活会话被锁时停该会话采集，切到未锁会话自动恢复（设计 §6.6）
+  if (appLocked.value || s.locked) return null
   if (!autoRefresh.value || !rightPanelVisible.value || !panelVisible.value || !docVisible.value) {
     return null
   }

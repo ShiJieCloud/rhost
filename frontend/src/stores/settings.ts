@@ -4,6 +4,15 @@ import { onConfigLoad, persistSectionNow } from './appConfig'
 /** 设置弹窗显隐（模块级单例，同 showNewConn 模式） */
 export const showSettings = ref(false)
 
+/** 请求设置弹窗打开后定位到的分区（如 'security'）；弹窗消费后自行清空 */
+export const pendingSettingsSection = ref<string | null>(null)
+
+/** 打开设置面板并定位到指定分区（如 toast 引导场景） */
+export function openSettingsSection(section: string) {
+  pendingSettingsSection.value = section
+  showSettings.value = true
+}
+
 export interface EnvVar {
   key: string
   value: string
@@ -70,6 +79,15 @@ export interface AppSettings {
   memAlertMb: number
   /** 历史会话保留数量上限（超出后丢弃最旧的记录） */
   recentConnectionsLimit: number
+  /* ---- 安全（应用锁 / 会话锁；密码哈希存后端独立 lock.json，不在配置文件中） ---- */
+  /** 应用锁总开关；置 true 前必须已设置应用锁密码 */
+  appLockEnabled: boolean
+  /** 无操作自动锁屏秒数，取值必须 ∈ APP_LOCK_IDLE_OPTIONS；0 = 关闭 */
+  appLockIdleSec: number
+  /** 窗口失焦即锁屏 */
+  appLockLockOnBlur: boolean
+  /** 会话锁复用应用锁密码验证（默认关闭，关闭时使用独立会话锁密码） */
+  sessionLockUseAppPassword: boolean
   /* ---- AI 助手 ---- */
   /** AI 功能总开关：关闭后右侧栏隐藏 AI 入口 */
   aiEnabled: boolean
@@ -221,6 +239,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   memAlertMb: 300,
   recentConnectionsLimit: 20,
 
+  appLockEnabled: false,
+  appLockIdleSec: 300,
+  appLockLockOnBlur: false,
+  sessionLockUseAppPassword: false,
+
   aiEnabled: true,
   aiProvider: 'custom',
   aiBaseUrl: '',
@@ -278,6 +301,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 /* ---- 持久化：后端 app_config.json settings 节（唯一真相源，localStorage 已下线） ---- */
 
+/** 闲置自动锁屏下拉档位（秒）；0 = 关闭。前后端消费侧均以此白名单为准 */
+export const APP_LOCK_IDLE_OPTIONS = [0, 60, 180, 300, 600, 1800] as const
+
+/** 非白名单值（手改配置 / 旧版本脏值）统一回退默认 300（5 分钟） */
+export function normalizeAppLockIdleSec(v: unknown): number {
+  return typeof v === 'number' && (APP_LOCK_IDLE_OPTIONS as readonly number[]).includes(v)
+    ? v
+    : 300
+}
+
 function cloneDefaults(): AppSettings {
   return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)) as AppSettings
 }
@@ -288,6 +321,11 @@ export const savedSettings = reactive<AppSettings>(cloneDefaults())
 /** settings 节（非 log* 键，后端 camelCase 原样）灌入内存态 */
 function applySettingsSection(section: Record<string, unknown>) {
   Object.assign(savedSettings, section)
+  // 锁参数强类型夹取：手改脏值回退默认，拒绝半启用状态
+  savedSettings.appLockEnabled = section.appLockEnabled === true
+  savedSettings.appLockIdleSec = normalizeAppLockIdleSec(section.appLockIdleSec)
+  savedSettings.appLockLockOnBlur = section.appLockLockOnBlur === true
+  savedSettings.sessionLockUseAppPassword = section.sessionLockUseAppPassword === true
 }
 
 /** logs 节字段（磁盘 snake_case，与后端 LogsSection 序列化一致）→ savedSettings 的 log* 字段；

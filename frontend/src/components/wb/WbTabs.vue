@@ -7,9 +7,12 @@ import {
   closeDisconnectedSessions, closeAllSessions,
   reconnectBackend, disconnectSession, setSessionAlias,
   duplicateSession, isDuplicating, openDock,
+  lockSession, lockAllSessions, focusSessionLock, sessionLockReady,
 } from '../../stores/session'
 import { showNewConn } from '../../stores/hosts'
+import { openSettingsSection } from '../../stores/settings'
 import { toast } from '../../composables/useToast'
+import LockIcon from '../LockIcon.vue'
 import type { Session } from '../../stores/session'
 
 /* ---- 右键菜单状态 ---- */
@@ -67,9 +70,22 @@ const tabMenuItems = computed<MenuItem[]>(() => {
     },
     { label: '关闭所有标签页', action: () => closeAllSessions() },
     { divider: true },
+    s.locked
+      ? {
+          label: '解锁会话',
+          action: () => {
+            activeSessionId.value = s.id
+            void nextTick(() => focusSessionLock(s.id))
+          },
+        }
+      : {
+          label: '锁定会话',
+          disabled: !sessionLockReady(),
+          action: () => lockSession(s.id),
+        },
     {
       label: '打开 SFTP 面板',
-      disabled: s.state !== 'online',
+      disabled: s.state !== 'online' || s.locked,
       action: () => { activeSessionId.value = s.id; openDock('sftp') },
     },
   ]
@@ -89,7 +105,27 @@ const barMenuItems = computed<MenuItem[]>(() => [
     disabled: sessions.value.length === 0,
     action: () => closeAllSessions(),
   },
+  {
+    label: '锁定全部会话',
+    disabled: !sessionLockReady() || !sessions.value.some(s => !s.locked),
+    action: () => lockAllSessions(),
+  },
 ])
+
+/* ---- 标签锁图标点击：未锁即上锁（无凭据引导去设置）；已锁切激活并聚焦遮罩密码框 ---- */
+function onTabLockClick(s: Session) {
+  if (s.locked) {
+    activeSessionId.value = s.id
+    void nextTick(() => focusSessionLock(s.id))
+    return
+  }
+  if (!sessionLockReady()) {
+    toast('请先在设置 → 安全中设置会话锁密码', 'warn')
+    openSettingsSection('security')
+    return
+  }
+  lockSession(s.id)
+}
 
 /* ---- 事件处理 ---- */
 function onTabContext(e: MouseEvent, s: Session) {
@@ -438,6 +474,14 @@ watch(activeSessionId, () => {
             @contextmenu="onTabContext($event, s)"
             @mousedown="onTabMouseDown($event, s)"
           >
+            <span
+              class="tab-lock"
+              :class="{ locked: s.locked }"
+              :title="s.locked ? '点击解锁此会话' : '锁定此会话'"
+              @click.stop="onTabLockClick(s)"
+              @mousedown.stop
+              @contextmenu.stop
+            ><LockIcon :locked="s.locked" /></span>
             <span class="dot" :class="dotCls(s.state)"></span>
             <input
               v-if="editingId === s.id"

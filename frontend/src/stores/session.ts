@@ -9,6 +9,10 @@ import { getSnapshot, onConfigLoad, patchUiState } from './appConfig'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmHostKey, parseHostKeyError } from '../composables/useHostKeyPrompt'
 import { toast } from '../composables/useToast'
+import { aiCancelExecs } from '../lib/ai'
+import { lockUnlock, type LockKind } from '../lib/lock'
+import { blurTerm, focusTerm } from '../lib/termRegistry'
+import { lockSlots } from './appLock'
 
 export type SessionState = 'idle' | 'connecting' | 'online' | 'reconnecting' | 'offline'
 export type AppView = 'home' | 'workbench'
@@ -30,6 +34,11 @@ export interface Session {
   resetSeq: number
   /** 标签自定义别名；空字符串表示无别名，UI 回落展示 host.id */
   alias: string
+  /**
+   * 会话锁（运行时态，不持久化、重启清零，关标签随 Session 移除解除）：
+   * true 时终端遮罩盖画面，键盘/粘贴/SFTP/AI 操作全部冻结，SSH 不断连。
+   */
+  locked: boolean
 }
 
 export const appView = ref<AppView>('home')
@@ -1140,6 +1149,7 @@ export function restoreSessions() {
     retryAt: null,
     resetSeq: 0,
     alias: e.alias,
+    locked: false,
   }))
   const activeId = restored[restored.length - 1]!.id
   sessions.value = restored
@@ -1161,10 +1171,93 @@ export function openSession(hostId: string) {
   const id = crypto.randomUUID()
   sessions.value.push({
     id, host, state: 'connecting', startedAt: Date.now(),
-    disconnectReason: '', retryAt: null, resetSeq: 0, alias: '',
+    disconnectReason: '', retryAt: null, resetSeq: 0, alias: '', locked: false,
   })
   activeSessionId.value = id
   persistSessions()
+}
+
+/* ---- 会话锁（运行时态；app-lock-design.md §6.5） ---- */
+
+/** 会话锁当前是否具备可用凭据：复用应用锁密码 或 已设置独立会话锁密码 */
+export function sessionLockReady(): boolean {
+  return savedSettings.sessionLockUseAppPassword
+    ? lockSlots.value.appPasswordSet
+    : lockSlots.value.sessionPasswordSet
+}
+
+/** 会话锁验证走的后端槽位（复选框「会话锁使用应用锁密码」） */
+export function sessionLockKind(): LockKind {
+  return savedSettings.sessionLockUseAppPassword ? 'app' : 'session'
+}
+
+/** 会话锁遮罩聚焦请求：已锁标签图标点击时自增，激活遮罩 watch 后聚焦密码框
+ *  （覆盖「已锁且已是激活标签再点图标」时 overlay 的 locked/isActive watch 不触发的场景） */
+export const sessionLockFocusReq = ref<{ id: string; n: number }>({ id: '', n: 0 })
+
+export function focusSessionLock(id: string) {
+  sessionLockFocusReq.value = { id, n: sessionLockFocusReq.value.n + 1 }
+}
+
+/** 上锁：不验证密码，一次点击完成；夺走终端焦点并取消该会话在飞 AI exec。
+ *  SSH 连接保持，远端输出继续进滚动缓冲，解锁后完整可见。 */
+export function lockSession(id: string) {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s || s.locked) return
+  s.locked = true
+  blurTerm(id)
+  void aiCancelExecs(id)
+}
+
+/** 批量上锁所有会话（标签栏空白区菜单）。
+ *  仅对非 idle 会话上锁（设计 §6.5：对所有「在线」会话批量置位）；
+ *  idle 是从未发起连接的占位标签，无活动会话可保护。offline/reconnecting
+ *  仍上锁——断线自动重连成功后锁态必须保持，防止重连后裸奔。 */
+export function lockAllSessions() {
+  for (const s of sessions.value) {
+    if (s.state === 'idle') continue
+    if (!s.locked) {
+      s.locked = true
+      void aiCancelExecs(s.id)
+    }
+  }
+  blurTerm(activeSessionId.value ?? '')
+}
+
+/**
+ * 批量解锁全部已锁会话（不验证密码，仅限「凭据即将消失」的内部联动调用）：
+ * - 会话锁独立密码被清除（设置 → 安全）；
+ * - 应用锁密码被清除 / 关闭总开关（复用通道的会话将失去验证槽位）；
+ * - 「会话锁使用应用锁密码」由开变关（验证通道从 app 槽位移走）。
+ *
+ * 必要性：后端 slot=None 时任何密码都无法通过验证，保留 locked 会永久死锁。
+ * 对激活会话把焦点还给终端。
+ */
+export function unlockAllSessions(reason?: 'credential-cleared' | 'channel-changed') {
+  let hadLocked = false
+  for (const s of sessions.value) {
+    if (s.locked) {
+      s.locked = false
+      hadLocked = true
+    }
+  }
+  if (hadLocked && activeSessionId.value) focusTerm(activeSessionId.value)
+  if (hadLocked) {
+    console.warn(`[session-lock] 凭据变更，已解锁全部会话（${reason ?? 'unknown'}）`)
+  }
+}
+
+/**
+ * 解锁会话：按复用开关选择密码槽位验证；失败时抛出后端中文文案错误，
+ * 成功清除锁定态并把焦点还给终端。
+ */
+export async function unlockSession(id: string, password: string): Promise<void> {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s) throw new Error('会话不存在')
+  if (!s.locked) return
+  await lockUnlock(sessionLockKind(), password)
+  s.locked = false
+  if (activeSessionId.value === id) focusTerm(id)
 }
 
 /** 主机被编辑（可能改名/替换对象）后，同步更新已打开会话的主机引用 */
@@ -1284,9 +1377,10 @@ export async function duplicateSession(sourceSessionId: string): Promise<string 
       disconnectReason: '',
       retryAt: null,
       resetSeq: 0,
-      // 继承源会话别名：源有别名则复制别名（与源同名，用户可自行重命名区分）；
+      // 继承源别名：源有别名则复制别名（与源同名，用户可自行重命名区分）；
       // 源无别名则 alias 为空，UI 回落展示 host.id（与源一致）。
       alias: source.alias,
+      locked: false,
     })
     activeSessionId.value = newId
     appView.value = 'workbench'
