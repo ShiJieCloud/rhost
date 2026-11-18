@@ -12,13 +12,16 @@ import { toast } from '../composables/useToast'
 
 const props = defineProps<{ content: string; terminalReady?: boolean }>()
 
-const emit = defineEmits<{ terminal: [{ code: string; run: boolean }] }>()
+const emit = defineEmits<{
+  terminal: [{ code: string; run: boolean }]
+  snippet: [{ code: string }]
+}>()
 
 const html = computed(() => renderMarkdown(props.content))
 
 async function onClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
-  const btn = target?.closest?.('.md-code-copy, .md-code-insert, .md-code-run')
+  const btn = target?.closest?.('.md-code-copy, .md-code-snippet, .md-code-insert, .md-code-run')
   if (!btn) return
   // 仅取代码列（排除行号 gutter 列）；fence 内容天然以 \n 结尾，
   // 必须去掉尾部换行，否则「插入终端」会带上回车导致立即执行
@@ -32,6 +35,10 @@ async function onClick(e: MouseEvent) {
       console.error('[clipboard] writeText failed', err)
       toast('复制失败', 'err', 1500)
     }
+    return
+  }
+  if (btn.classList.contains('md-code-snippet')) {
+    emit('snippet', { code })
     return
   }
   // 插入终端（不回车）/ 直接执行（确认后写入 + 回车）
@@ -151,6 +158,7 @@ async function onClick(e: MouseEvent) {
   gap: 2px;
 }
 .md :deep(.md-code-copy),
+.md :deep(.md-code-snippet),
 .md :deep(.md-code-insert),
 .md :deep(.md-code-run) {
   border: none;
@@ -163,6 +171,7 @@ async function onClick(e: MouseEvent) {
   transition: color 0.15s, background 0.15s;
 }
 .md :deep(.md-code-copy:hover),
+.md :deep(.md-code-snippet:hover),
 .md :deep(.md-code-insert:hover),
 .md :deep(.md-code-run:hover) {
   color: var(--green);

@@ -100,6 +100,7 @@ md.renderer.rules.fence = (tokens, idx) => {
     // 终端操作按钮由 AiMarkdown 按宿主 terminalReady 状态用 CSS 控制显隐
     '<div class="md-code-actions">' +
     '<button type="button" class="md-code-copy">复制</button>' +
+    '<button type="button" class="md-code-snippet">保存为片段</button>' +
     '<button type="button" class="md-code-insert">插入终端</button>' +
     '<button type="button" class="md-code-run">直接执行</button>' +
     '</div>' +

@@ -907,6 +907,7 @@ pub struct AppConfigSnapshot {
     groups: serde_json::Value,
     ui_state: serde_json::Value,
     quick_connect_history: serde_json::Value,
+    snippets: serde_json::Value,
     /// 导入文件大小上限（后端权威常量，前端预检取此值）
     max_import_file_bytes: u64,
     /// 日志存储路径留空时的平台默认目录（前端输入框 placeholder）
@@ -928,6 +929,7 @@ pub fn load_app_config(app: AppHandle) -> Result<AppConfigSnapshot, String> {
         groups: file.groups,
         ui_state: file.ui_state,
         quick_connect_history: file.quick_connect_history,
+        snippets: file.snippets,
         max_import_file_bytes: crate::config_io::MAX_IMPORT_FILE_BYTES,
         default_log_dir: crate::applog::hub::default_log_dir().display().to_string(),
     })

@@ -164,16 +164,17 @@ watch(appLocked, (locked) => {
 </template>
 
 <style scoped>
+/* 浮层遵循 OpenIDEA 规范：背景/边框/圆角/投影统一走主题变量，
+   不使用 backdrop-filter，与 Toast、终端浮动工具栏保持一致 */
 .ctx-menu{
   position:fixed;z-index:9999;
   padding:4px 0;
   max-height:calc(100vh - 8px);
   overflow-y:auto;
-  background:rgba(13,19,28,.97);
-  border:1px solid var(--border);
-  border-radius:7px;
+  background:var(--bg-popup);
+  border:1px solid var(--border-popup);
+  border-radius:var(--radius-popup);
   box-shadow:var(--shadow-popup);
-  backdrop-filter:blur(8px);
   user-select:none;
 }
 .ctx-item{
@@ -182,12 +183,15 @@ watch(appLocked, (locked) => {
   border-radius:5px;
   font-size:12px;color:var(--text);
   cursor:pointer;white-space:nowrap;
+  transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
 }
-.ctx-item.active{background:var(--hover)}
+.ctx-item.active{background:var(--hover);color:var(--fg-strong)}
 .ctx-item.disabled{color:var(--muted-2);cursor:default}
-.ctx-item.danger{color:var(--red)}
+.ctx-item.danger{color:var(--danger)}
 .ctx-icon{width:14px;height:14px;flex-shrink:0;color:var(--muted)}
-.ctx-item.danger .ctx-icon{color:var(--red)}
+.ctx-item.active .ctx-icon{color:var(--fg-strong)}
+.ctx-item.danger .ctx-icon{color:var(--danger)}
+.ctx-item.disabled .ctx-icon{color:var(--muted-2)}
 .ctx-label{flex:1;overflow:hidden;text-overflow:ellipsis}
 .ctx-shortcut{font-size:11px;color:var(--muted-2);margin-left:10px}
 .ctx-sep{height:1px;margin:4px 10px;background:var(--border)}

@@ -12,6 +12,7 @@ import SessionLockOverlay from './SessionLockOverlay.vue'
 import { toast } from '../../composables/useToast'
 import { registerTerm, unregisterTerm } from '../../lib/termRegistry'
 import { addToAiChat } from '../../stores/aiQuote'
+import { openSnippetEditor } from '../../stores/snippetDraft'
 import { hosts, showNewConn } from '../../stores/hosts'
 import { appLocked } from '../../stores/appLock'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
@@ -187,6 +188,7 @@ const ICON_PASTE = 'M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2
 /** AI 对话图标：聊天气泡 */
 const ICON_AI = 'M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'
 const ICON_CLEAR = 'M18 6L6 18M6 6l12 12'
+const ICON_SNIPPET = 'M4 17l6-6-6-6M12 19h8'
 const ICON_SELECT = 'M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3'
 
 function copySelection(id: string) {
@@ -226,6 +228,14 @@ function openTermMenu(id: string, x: number, y: number) {
         if (!text.trim()) return
         addToAiChat(text)
         toast('已添加到 AI 对话', 'ok', 1500)
+      },
+    },
+    {
+      label: '保存为片段', icon: ICON_SNIPPET, disabled: !inst.term.hasSelection(),
+      action: () => {
+        const text = inst.term.getSelection()
+        if (!text.trim()) return
+        openSnippetEditor({ command: text })
       },
     },
     { divider: true },

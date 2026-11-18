@@ -21,6 +21,7 @@ export type ConfigSection =
   | 'groups'
   | 'ui_state'
   | 'quick_connect_history'
+  | 'snippets'
 
 /** 后端 AppConfigSnapshot（serde camelCase；各节为原始 JSON，由各 store 自行解释） */
 export interface AppConfigSnapshot {
@@ -30,6 +31,7 @@ export interface AppConfigSnapshot {
   groups: unknown[]
   uiState: Record<string, unknown>
   quickConnectHistory: unknown[]
+  snippets: unknown[]
   /** 导入文件大小上限（后端权威，UI 预检取此值） */
   maxImportFileBytes: number
   /** 日志存储路径留空时的平台默认目录（设置面板输入框 placeholder） */
@@ -69,6 +71,7 @@ function browserFallbackSnapshot(): AppConfigSnapshot {
     groups: [],
     uiState: {},
     quickConnectHistory: [],
+    snippets: [],
     maxImportFileBytes: 5 * 1024 * 1024,
     defaultLogDir: '',
   }

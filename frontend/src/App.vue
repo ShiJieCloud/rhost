@@ -12,6 +12,8 @@ import NewConnectionModal from './components/NewConnectionModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import GroupModal from './components/GroupModal.vue'
 import KeysModal from './components/KeysModal.vue'
+import SnippetEditModal from './components/SnippetEditModal.vue'
+import SnippetVarsModal from './components/SnippetVarsModal.vue'
 import PasswordModal from './components/PasswordModal.vue'
 import HostKeyModal from './components/HostKeyModal.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
@@ -242,6 +244,8 @@ onMounted(async () => {
     <SettingsModal />
     <GroupModal />
     <KeysModal />
+    <SnippetEditModal />
+    <SnippetVarsModal />
     <PasswordModal />
     <HostKeyModal />
     <ConfirmModal />

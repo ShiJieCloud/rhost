@@ -57,6 +57,7 @@ pub const SECTIONS: &[&str] = &[
     "groups",
     "ui_state",
     "quick_connect_history",
+    "snippets",
 ];
 
 /* =========================================================
@@ -300,6 +301,21 @@ impl Default for SettingsSection {
     }
 }
 
+/// `snippets` 节元素：id/name/command 必填（缺失即拒绝），其余字段缺省；未知字段保留。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SnippetSection {
+    id: String,
+    name: String,
+    command: String,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    description: String,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 /// `keys` 节元素：id/name/type 必填（缺失即拒绝），其余字段缺省；未知字段保留。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,6 +425,9 @@ pub struct AppConfigFile {
     pub ui_state: Value,
     #[serde(default = "empty_array")]
     pub quick_connect_history: Value,
+    /// 命令片段
+    #[serde(default = "empty_array")]
+    pub snippets: Value,
     /// 本版本不认识的其他顶层节，读改写时原样带回
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -424,6 +443,7 @@ impl Default for AppConfigFile {
             groups: empty_array(),
             ui_state: empty_object(),
             quick_connect_history: empty_array(),
+            snippets: empty_array(),
             extra: Map::new(),
         }
     }
@@ -439,6 +459,7 @@ impl AppConfigFile {
             "groups" => self.groups.clone(),
             "ui_state" => self.ui_state.clone(),
             "quick_connect_history" => self.quick_connect_history.clone(),
+            "snippets" => self.snippets.clone(),
             _ => return None,
         })
     }
@@ -455,6 +476,7 @@ impl AppConfigFile {
             "groups" => self.groups = value,
             "ui_state" => self.ui_state = value,
             "quick_connect_history" => self.quick_connect_history = value,
+            "snippets" => self.snippets = value,
             _ => {}
         }
     }
@@ -518,6 +540,7 @@ fn validate_section(section: &str, value: Value) -> Result<Value, String> {
             serde_json::to_value(&typed).map_err(|e| format!("ui_state 节序列化失败: {e}"))?
         }
         "quick_connect_history" => validate_array::<QuickConnectItem>(section, value)?,
+        "snippets" => validate_array::<SnippetSection>(section, value)?,
         other => return Err(format!("未知配置节: {other}")),
     };
     Ok(normalized)

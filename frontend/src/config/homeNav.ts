@@ -4,6 +4,7 @@ import HostsView from '../views/home/HostsView.vue'
 import QuickConnectView from '../views/home/QuickConnectView.vue'
 import GroupsView from '../views/home/GroupsView.vue'
 import KeysView from '../views/home/KeysView.vue'
+import SnippetsView from '../views/home/SnippetsView.vue'
 import { keys } from '../stores/keys'
 
 /**
@@ -57,6 +58,13 @@ export const HOME_NAV: HomeNavItem[] = [
     component: KeysView,
     badge: () => (keys.value.length ? String(keys.value.length) : null),
     icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7.1 7.1 5 5 0 0 1 7.1-7.1zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></svg>',
+  },
+  {
+    id: 'snippets',
+    label: '命令片段',
+    enabled: true,
+    component: SnippetsView,
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
   },
 ]
 

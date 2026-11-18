@@ -53,6 +53,8 @@ export const connected = computed(() => activeSession.value?.state === 'online')
 
 /* ---- Dock / 面板 UI 状态 ---- */
 export const sidebarVisible = ref(true)
+/** 左侧面板当前页签（主机列表 / 命令片段互斥，与右侧面板互不影响） */
+export const leftPanelTab = ref<'hosts' | 'snippets'>('hosts')
 
 /** Dock 展开高度（px）；折叠态下该值保留，展开时无缝恢复 */
 export const dockHeight = ref(286)
@@ -96,6 +98,7 @@ onConfigLoad(snap => {
   const rpVisible = ui.rightPanelVisible !== undefined ? ui.rightPanelVisible : ui.inspectorVisible
   rightPanelVisible.value = bool(rpVisible, false)
   rightPanelTab.value = ui.rightPanelTab === 'ai' || ui.rightPanelTab === 'monitor' ? ui.rightPanelTab : 'monitor'
+  leftPanelTab.value = ui.leftPanelTab === 'snippets' || ui.leftPanelTab === 'hosts' ? ui.leftPanelTab : 'hosts'
   const savedRpWidth = num(ui.rightPanelWidth)
   rightPanelWidth.value = savedRpWidth !== null ? Math.min(800, Math.max(280, savedRpWidth)) : 320
   rightPanelMaximized.value = bool(ui.rightPanelMaximized, false)
@@ -117,12 +120,13 @@ onConfigLoad(snap => {
 /** 状态变化经 ui_state 合并写落盘（patchUiState 内部 300ms 防抖合并连续变更） */
 watch(
   [rightPanelVisible, rightPanelTab, rightPanelWidth, rightPanelMaximized, dockVisible, dockCollapsed, dockTab, dockHeight, sftpLocalRatio,
-   sftpQueueHeight, sftpQueueCollapsed],
+   sftpQueueHeight, sftpQueueCollapsed, leftPanelTab],
   () => {
     if (!isTauri || !layoutHydrated) return
     patchUiState({
       rightPanelVisible: rightPanelVisible.value,
       rightPanelTab: rightPanelTab.value,
+      leftPanelTab: leftPanelTab.value,
       rightPanelWidth: rightPanelWidth.value,
       rightPanelMaximized: rightPanelMaximized.value,
       dockVisible: dockVisible.value,

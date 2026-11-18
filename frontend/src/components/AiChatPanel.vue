@@ -4,6 +4,7 @@ import { activeSession, activeHost, activeSessionId, appView, rightPanelTab, rig
 import { savedSettings } from '../stores/settings'
 import { appLocked } from '../stores/appLock'
 import { aiQuote } from '../stores/aiQuote'
+import { openSnippetEditor } from '../stores/snippetDraft'
 import { toast } from '../composables/useToast'
 import { matchHighRisk } from '../lib/aiRisk'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
@@ -2383,6 +2384,11 @@ const terminalReady = computed(
     activeSession.value?.state === 'online',
 )
 
+/** AiMarkdown emit 的「保存为片段」意图：把代码块内容预填进片段编辑器，与终端右键入口同一通道 */
+function onSaveSnippet(payload: { code: string }) {
+  openSnippetEditor({ command: payload.code })
+}
+
 /** AiMarkdown emit 的终端操作意图：目标会话 = 点击时的当前活动会话（设计 §6.1 裁决） */
 function onTerminalIntent(payload: { code: string; run: boolean }) {
   const s = activeSession.value
@@ -3268,7 +3274,7 @@ const configHint = computed(() => {
                     <span class="trace-arrow" :class="{ open: isReasoningOpen(r.m) }">›</span>
                   </div>
                   <div v-show="isReasoningOpen(r.m)" class="trace-body">
-                    <AiMarkdown :content="r.m.reasoning ?? ''" />
+                    <AiMarkdown :content="r.m.reasoning ?? ''" @snippet="onSaveSnippet" />
                   </div>
                 </div>
                 <div v-if="r.m.trace" class="trace-block">
@@ -3278,7 +3284,7 @@ const configHint = computed(() => {
                 <!-- 轮次正文：结果确认后末轮正文晋升至结果区，此处不再渲染（防同文两处同显） -->
                 <div v-if="r.m.content.trim() && !r.promoted" class="trace-block">
                   <div class="trace-body">
-                    <AiMarkdown :content="r.m.content" />
+                    <AiMarkdown :content="r.m.content" @snippet="onSaveSnippet" />
                   </div>
                 </div>
                 <div v-if="r.m.toolProposals?.length" class="trace-block">
@@ -3421,6 +3427,7 @@ const configHint = computed(() => {
               :content="groupResultText(i)"
               :terminal-ready="terminalReady"
               @terminal="onTerminalIntent"
+              @snippet="onSaveSnippet"
             />
             <!-- 计划不进消息流：done/cancelled 由输入框上方悬浮面板展示至用户确认收尾 -->
             <!-- 消息底栏：streaming 期间整体隐藏；hover 淡入。整组仅此一处 -->
