@@ -36,16 +36,10 @@ function writeToActiveTerminal(command: string): boolean {
   if (!id) return false
   const s = sessions.value.find(x => x.id === id)
   if (!s || !s.backendId || s.state !== 'online') return false
-  const multiline = command.includes('\n')
-  // 执行多行片段时包成复合命令组：shell 把它当作一个语法单元整体解析，
-  // 中间不再逐条打印提示符。组在当前 shell 内执行，cd、变量赋值等状态照常生效。
-  const text = multiline
-    ? `{\n${command.replace(/\r\n?/g, '\n').replace(/\s+$/, '')}\n}`
-    : command
-  // 多行裸写时中间的 \n 会被行规程当作回车逐行提交，故用 bracketed paste 整体提交，
-  // 避免前一行未结束就把后续行送进它的输入、或续行符被提前拼接
-  const payload = multiline ? `\x1b[200~${text}\x1b[201~` : text
-  void sendInput(id, `${payload}\r`)
+  // 多行裸写时中间的 \n 会被当作回车逐行提交执行，故用 bracketed paste 整体提交：
+  // 支持 2004 模式的 shell 会把整块内容放入编辑缓冲区，随后 \r 一次性执行
+  const text = command.includes('\n') ? `\x1b[200~${command}\x1b[201~` : command
+  void sendInput(id, `${text}\r`)
   return true
 }
 
