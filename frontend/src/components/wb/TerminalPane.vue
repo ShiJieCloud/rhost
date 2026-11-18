@@ -565,14 +565,22 @@ watch(
   },
 )
 
-/* ---- 状态条占位：出现/消失后终端可视高度变化，nextTick 重新 fit。
-   断线期间 backendId 为空不发 window-change，但最新行列已存入 termSizes，
-   重连建连按新尺寸申请 PTY；banner 消失后 fit 回全高再补发 resize ---- */
-watch(bannerOn, async () => {
-  await nextTick()
-  const id = activeSessionId.value
-  if (id) safeFit(id)
-})
+/* ---- 离场内容快照：bannerOn 变 false 的同一帧 v-if 就关闭了元素，但 Transition
+   会让它继续留在 DOM 里播完滑出动画。此时 rc/flashOn 已为空，若直接读实时值
+   就会滑出一条空状态条，因此保留最后一次真实可见的内容供离场期间渲染 ---- */
+const lastBanner = ref<{ flash: boolean; rc: RcVm | null }>({ flash: false, rc: null })
+watch(
+  () => ({ flash: flashOn.value, rc: rc.value }),
+  cur => {
+    if (cur.flash || cur.rc) lastBanner.value = cur
+  },
+  { immediate: true },
+)
+/** 模板展示值：可见时取实时状态，滑出期间取快照 */
+const vFlash = computed(() => (bannerOn.value ? flashOn.value : lastBanner.value.flash))
+const vRc = computed(() => (bannerOn.value ? rc.value : lastBanner.value.rc))
+
+/* 状态条为纯浮层：不参与占位、不改变终端可视高度，因此无需在显隐时重新 fit */
 
 /** 状态条按钮：立即手动重连（退避等待中也可，会接管取消定时器） */
 function overlayReconnect() {
@@ -879,63 +887,66 @@ function dotClass(status: HostStatus) {
     </div>
 
     <!-- ============ 连接/断线/重连/终态：统一用顶部状态条，全程不遮挡快照 ============ -->
-    <div
-      v-if="bannerOn && hasSessions"
-      class="rc-banner"
-      :class="flashOn ? 'ok' : rc ? `p-${rc.phase}` : ''"
-      role="status"
-    >
-      <span class="rcb-dot" aria-hidden="true"></span>
+    <!-- 缓缓滑入/滑出：离场时 bannerOn 已为 false，内容改用 vRc/vFlash 快照，避免滑出空条 -->
+    <Transition name="rcb" appear>
+      <div
+        v-if="bannerOn && hasSessions"
+        class="rc-banner"
+        :class="vFlash ? 'ok' : vRc ? `p-${vRc.phase}` : ''"
+        role="status"
+      >
+        <span class="rcb-dot" aria-hidden="true"></span>
 
-      <template v-if="flashOn">
-        <span class="rcb-text">连接已恢复 · 会话已重新建立</span>
-      </template>
-      <template v-else-if="rc">
-        <span class="rcb-text">
-          <template v-if="rc.phase === 'waiting'">
-            连接已断开，正在尝试重新连接 · <b>{{ countdownSec }}</b> 秒后重试
-          </template>
-          <template v-else>{{ rc.title }}</template>
+        <template v-if="vFlash">
+          <span class="rcb-text">连接已恢复 · 会话已重新建立</span>
+        </template>
+        <template v-else-if="vRc">
+          <span class="rcb-text">
+            <template v-if="vRc.phase === 'waiting'">
+              连接已断开，正在尝试重新连接 · <b>{{ countdownSec }}</b> 秒后重试
+            </template>
+            <template v-else>{{ vRc.title }}</template>
+          </span>
+
+          <!-- offline：原因弱化跟在标题后，空间不足时省略 -->
+          <span v-if="vRc.phase === 'offline'" class="rcb-reason" :title="vRc.reason">{{ vRc.reason }}</span>
+
+          <span v-if="vRc.phase === 'waiting'" class="rcb-att">
+            第 <b>{{ vRc.attempt }}</b>{{ rcMaxAttempts > 0 ? ` / ${rcMaxAttempts}` : '' }} 次
+          </span>
+
+          <!-- 右侧操作区 -->
+          <span class="rcb-actions">
+            <template v-if="vRc.phase === 'waiting'">
+              <button class="rcb-btn primary" @click="overlayReconnect">立即重连</button>
+              <button class="rcb-btn ghost" @click="overlayCancel">取消重连</button>
+            </template>
+            <template v-else-if="vRc.phase === 'connecting'">
+              <button class="rcb-btn ghost" @click="overlayCancel">取消连接</button>
+            </template>
+            <template v-else-if="vRc.phase === 'offline'">
+              <button class="rcb-btn primary" @click="overlayReconnect">重新连接</button>
+            </template>
+            <template v-else>
+              <span class="rcb-spin"></span>
+              <span class="rcb-att">建立新会话中…</span>
+            </template>
+          </span>
+        </template>
+
+        <!-- 底边进度线：退避按真实窗口收缩；尝试/连接中不定滑动；离线不显示 -->
+        <span v-if="!vFlash && vRc?.bar !== 'none'" class="rcb-bar">
+          <i
+            v-if="vRc?.bar === 'shrink'"
+            :key="vRc.attempt"
+            class="shrink"
+            :style="{ animationDuration: `${rcDelayMs}ms` }"
+          ></i>
+          <i v-else class="slide"></i>
         </span>
-
-        <!-- offline：原因弱化跟在标题后，空间不足时省略 -->
-        <span v-if="rc.phase === 'offline'" class="rcb-reason" :title="rc.reason">{{ rc.reason }}</span>
-
-        <span v-if="rc.phase === 'waiting'" class="rcb-att">
-          第 <b>{{ rc.attempt }}</b>{{ rcMaxAttempts > 0 ? ` / ${rcMaxAttempts}` : '' }} 次
-        </span>
-
-        <!-- 右侧操作区 -->
-        <span class="rcb-actions">
-          <template v-if="rc.phase === 'waiting'">
-            <button class="rcb-btn primary" @click="overlayReconnect">立即重连</button>
-            <button class="rcb-btn ghost" @click="overlayCancel">取消重连</button>
-          </template>
-          <template v-else-if="rc.phase === 'connecting'">
-            <button class="rcb-btn ghost" @click="overlayCancel">取消连接</button>
-          </template>
-          <template v-else-if="rc.phase === 'offline'">
-            <button class="rcb-btn primary" @click="overlayReconnect">重新连接</button>
-          </template>
-          <template v-else>
-            <span class="rcb-spin"></span>
-            <span class="rcb-att">建立新会话中…</span>
-          </template>
-        </span>
-      </template>
-
-      <!-- 底边进度线：退避按真实窗口收缩；尝试/连接中不定滑动；离线不显示 -->
-      <span v-if="!flashOn && rc?.bar !== 'none'" class="rcb-bar">
-        <i
-          v-if="rc?.bar === 'shrink'"
-          :key="rc.attempt"
-          class="shrink"
-          :style="{ animationDuration: `${rcDelayMs}ms` }"
-        ></i>
-        <i v-else class="slide"></i>
-      </span>
-      <span v-else-if="flashOn" class="rcb-bar"><i class="full"></i></span>
-    </div>
+        <span v-else-if="vFlash" class="rcb-bar"><i class="full"></i></span>
+      </div>
+    </Transition>
 
     <!-- 广播命令条：一次发送命令到多个会话（空间不足时随 Dock 拖拽自动隐藏） -->
     <div v-if="hasSessions && bcastOpen && bcastSpaceEnough" class="bcast">
@@ -1108,9 +1119,17 @@ function dotClass(status: HostStatus) {
   background:var(--panel-2);
   border-bottom:1px solid var(--border);
   font-size:11px;color:var(--muted);
-  animation:rcb-slide .22s cubic-bezier(.16,1,.3,1);
 }
-@keyframes rcb-slide{from{transform:translateY(-100%)}to{transform:none}}
+/* 缓缓滑入 / 滑出：由 <Transition name="rcb"> 驱动，入场 0.5s、离场 0.4s。
+   入场 keyframes 必须独立命名：rcb-slide 已被底边进度条的横向滑动占用，
+   同名 @keyframes 后者覆盖前者，会让状态条以 margin-left 横移而不是从顶部滑入。
+   离场期间关闭指针事件，避免正在滑走的状态条挡住终端点击/框选 */
+.rcb-enter-active{animation:rcb-drop .5s cubic-bezier(.22,1,.36,1) both}
+.rcb-leave-active{animation:rcb-lift .4s cubic-bezier(.4,0,1,1) forwards;pointer-events:none}
+@keyframes rcb-drop{from{transform:translateY(-100%)}to{transform:none}}
+@keyframes rcb-lift{from{transform:none}to{transform:translateY(-100%)}}
+/* 滑入/滑出的裁切边界：否则 translateY(-100%) 期间状态条会压到上方标签栏 */
+.terminal-wrap{overflow:hidden}
 
 /* 状态点 */
 .rcb-dot{
@@ -1223,9 +1242,8 @@ function dotClass(status: HostStatus) {
 }
 .rcb-bar .full{width:100%;background:var(--green)}
 
-/* 状态条真实占位：xterm 容器与悬浮工具栏下移避让（特异性高于全局规则）；
-   banner 出现/消失后由 watch(bannerOn) 触发 safeFit 重算行列 */
-.rc-banner-on .term-instance{top:32px}
+/* 状态条是纯浮层：不占位、不改终端高度（xterm 行列与占位保持原样），
+   只把悬浮工具栏下移避让，避免与状态条重叠 */
 .rc-banner-on .term-tools{top:36px}
 
 /* 粘贴保护弹窗：复用全局 .mask/.modal/.btn，仅补本组件专属尺寸与预览样式。
