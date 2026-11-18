@@ -15,6 +15,7 @@ import { addToAiChat } from '../../stores/aiQuote'
 import { hosts, showNewConn } from '../../stores/hosts'
 import { appLocked } from '../../stores/appLock'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
+import { accentColor, resolvedTheme, terminalPalette } from '../../styles/theme'
 import {
   activeReconnectAttempt, activeSession, activeSessionId, attachTerminal,
   autoReconnectDelayMs, detachTerminal, disconnectSession, openSession, reconnectBackend,
@@ -252,30 +253,13 @@ function resolveLineHeight(percent: number): number {
   return Math.max(1, percent / 100)
 }
 
-/** xterm 主题：与项目配色（--status-ok 等设计令牌）对齐 */
-const XTERM_THEME = {
-  background: '#00000000', // 透明，透出 .terminal 的背景渐变
-  foreground: '#e6edf3',
-  cursor: '#3fb950',
-  cursorAccent: '#0d1117',
-  selectionBackground: 'rgba(88, 166, 255, .28)',
-  black: '#484f58',
-  red: '#ff7b72',
-  green: '#3fb950',
-  yellow: '#f0883e',
-  blue: '#58a6ff',
-  magenta: '#bc8cff',
-  cyan: '#39c5cf',
-  white: '#b1bac4',
-  brightBlack: '#6e7681',
-  brightRed: '#ffa198',
-  brightGreen: '#56d364',
-  brightYellow: '#e3b341',
-  brightBlue: '#79c0ff',
-  brightMagenta: '#d2a8ff',
-  brightCyan: '#56d4dd',
-  brightWhite: '#f0f6fc',
-}
+/** xterm 主题：跟随应用明暗主题（配色定义见 styles/theme.ts） */
+const termTheme = () => terminalPalette()
+
+/** 明暗主题或强调色切换时同步所有活动终端的配色 */
+watch([resolvedTheme, accentColor], () => {
+  for (const { term } of termInsts.values()) term.options.theme = terminalPalette()
+})
 
 /** v-for 容器 ref 收集 */
 function setTermEl(id: string, el: Element | null) {
@@ -306,7 +290,7 @@ function mountTerminal(id: string) {
     scrollback: Math.max(0, Math.trunc(savedSettings.scrollback) || 0),
     allowTransparency: true,
     macOptionIsMeta: false,
-    theme: XTERM_THEME,
+    theme: termTheme(),
   })
   const fit = new FitAddon()
   term.loadAddon(fit)
@@ -1134,8 +1118,8 @@ function dotClass(status: HostStatus) {
   animation:rcb-pulse-blue 1.6s ease-in-out infinite;
 }
 @keyframes rcb-pulse-blue{
-  0%,100%{box-shadow:0 0 0 2px rgba(122,162,247,.15)}
-  50%{box-shadow:0 0 0 5px rgba(122,162,247,0)}
+  0%,100%{box-shadow:0 0 0 2px rgba(var(--info-rgb),.15)}
+  50%{box-shadow:0 0 0 5px rgba(var(--info-rgb),0)}
 }
 /* 离线终态：红色常亮，不再脉冲（自动流程已停止） */
 .p-offline .rcb-dot{
@@ -1145,7 +1129,7 @@ function dotClass(status: HostStatus) {
 }
 .rc-banner.ok .rcb-dot{
   background:var(--green);
-  box-shadow:0 0 0 2px rgba(61,220,132,.15);
+  box-shadow:0 0 0 2px rgba(var(--accent-rgb),.15);
   animation:none;
 }
 
@@ -1176,19 +1160,20 @@ function dotClass(status: HostStatus) {
   transition:background .15s,border-color .15s,box-shadow .15s;
 }
 .rcb-btn.primary{
-  background:linear-gradient(180deg,rgba(61,220,132,.17),rgba(61,220,132,.07));
-  border:1px solid rgba(61,220,132,.32);
-  color:var(--green);
+  background:var(--accent);
+  border:1px solid rgba(var(--accent-rgb),.32);
+  /* 文字必须用强调色上的对比色：此前用 --green 与背景同色，且不随主题明暗/强调色变化 */
+  color:var(--on-accent);
 }
 .rcb-btn.primary:hover{
-  background:linear-gradient(180deg,rgba(61,220,132,.26),rgba(61,220,132,.11));
-  border-color:rgba(61,220,132,.52);
-  box-shadow:0 0 12px rgba(61,220,132,.12);
+  background:var(--accent-hover);
+  border-color:rgba(var(--accent-rgb),.52);
+  box-shadow:0 0 12px rgba(var(--accent-rgb),.12);
 }
 .rcb-btn.ghost{
-  background:transparent;border:1px solid var(--border);color:var(--muted);
+  background:transparent;border:1px solid var(--border);color:var(--fg-muted);
 }
-.rcb-btn.ghost:hover{background:var(--hover);color:var(--text)}
+.rcb-btn.ghost:hover{background:var(--hover);color:var(--fg-strong)}
 .rcb-spin{
   width:10px;height:10px;border-radius:50%;
   border:2px solid rgba(255,158,100,.25);
@@ -1196,7 +1181,7 @@ function dotClass(status: HostStatus) {
   animation:rcb-rot .7s linear infinite;
 }
 .p-connecting .rcb-spin{
-  border-color:rgba(122,162,247,.25);border-top-color:var(--blue);
+  border-color:rgba(var(--info-rgb),.25);border-top-color:var(--blue);
 }
 @keyframes rcb-rot{to{transform:rotate(360deg)}}
 
@@ -1209,7 +1194,7 @@ function dotClass(status: HostStatus) {
 /* 退避倒计时：满→空线性收缩，时长=真实退避窗口（内联 animationDuration） */
 .rcb-bar .shrink{
   width:100%;
-  background:linear-gradient(90deg,var(--orange),var(--yellow));
+  background:var(--warning);
   animation-name:rcb-shrink;animation-timing-function:linear;animation-fill-mode:forwards;
 }
 @keyframes rcb-shrink{from{width:100%}to{width:0%}}
@@ -1239,13 +1224,13 @@ function dotClass(status: HostStatus) {
 .tp-paste-modal{width:440px;max-width:calc(100vw - 48px);height:auto}
 .tp-paste-modal .modal-head{padding:12px 18px}
 .tp-paste-modal .modal-foot{padding:10px 18px}
-.tp-paste-icon{color:#f0883e}
+.tp-paste-icon{color:var(--orange)}
 .tp-paste-body{padding:10px 18px 12px}
-.tp-paste-label{font-size:12px;color:var(--text-dim,#8b949e);margin-bottom:6px}
+.tp-paste-label{font-size:12px;color:var(--text-dim,var(--fg-muted));margin-bottom:6px}
 .tp-paste-preview{
   margin:0;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;
   background:rgba(110,118,129,.12);border:1px solid rgba(110,118,129,.25);
   border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.55;
-  font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;color:#e6edf3;
+  font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;color:var(--fg-strong);
 }
 </style>

@@ -158,7 +158,7 @@ onUnmounted(() => {
   border-radius: 9px;
   border: none;
   background: var(--accent);
-  color: #04140b;
+  color: var(--on-accent);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -196,7 +196,7 @@ onUnmounted(() => {
 .lock-error {
   margin: 0;
   font-size: 12px;
-  color: #ff6b6b;
+  color: var(--danger);
   text-align: center;
 }
 </style>

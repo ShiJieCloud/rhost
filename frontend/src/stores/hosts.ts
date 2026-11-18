@@ -1,12 +1,11 @@
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { Host, StoredHost, ViewStyle } from '../types'
-import { MOCK_HOSTS, STYLE_LABELS } from '../data/mockHosts'
+import type { Host, StoredHost } from '../types'
+import { MOCK_HOSTS } from '../data/mockHosts'
 import { isTauri } from '../lib/tauri'
 
 /** 模块级单例状态；数据由后端 JSON 文件持久化，密码存系统钥匙串 */
 export const hosts = ref<Host[]>([])
-export const viewStyle = ref<ViewStyle>('list')
 export const filter = ref('')
 export const showNewConn = ref(false)
 
@@ -24,11 +23,6 @@ export const filtered = computed(() => {
   )
 })
 
-export const styleLabel = computed(() => STYLE_LABELS[viewStyle.value])
-
-export const filterInfo = computed(() =>
-  filter.value.trim() ? `筛选出 ${filtered.value.length} 台主机` : '无筛选',
-)
 
 /* =========================================================
  *  前后端数据转换

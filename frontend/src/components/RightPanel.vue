@@ -2,18 +2,15 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Inspector from './wb/Inspector.vue'
 import AiChatPanel from './AiChatPanel.vue'
-import { appView, activeSession, rightPanelMaximized, rightPanelTab, rightPanelVisible, rightPanelWidth } from '../stores/session'
+import { activeSession, rightPanelMaximized, rightPanelTab, rightPanelVisible, rightPanelWidth } from '../stores/session'
 import { savedSettings } from '../stores/settings'
 
-/** 头部标题：AI 固定；monitor 页签在首页显示「历史会话」，工作台显示「监控」 */
-const panelTitle = computed(() => {
-  if (rightPanelTab.value === 'ai') return 'AI 助手'
-  return appView.value === 'home' ? '历史会话' : '监控'
-})
+/** 头部标题：AI 固定，monitor 页面固定「监控」 */
+const panelTitle = computed(() => (rightPanelTab.value === 'ai' ? 'AI 助手' : '监控'))
 
-/** AI 对话 scope 标识：工作台显示当前主机名（别名优先回落 host.id），其余为全局 */
+/** AI 对话 scope 标识：有活动会话显示当前主机名（别名优先回落 host.id），否则为全局 */
 const scopeLabel = computed(() => {
-  if (appView.value === 'workbench' && activeSession.value) {
+  if (activeSession.value) {
     return activeSession.value.alias || activeSession.value.host.id
   }
   return '全局'
@@ -176,7 +173,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   width: 2px;
   height: 38px;
   border-radius: 2px;
-  background: #1f2b39;
+  background: var(--border-strong);
   transition: background 0.15s, height 0.15s;
 }
 .resize-handle:hover::after,
@@ -222,9 +219,9 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   white-space: nowrap;
   font-size: 10.5px;
   font-weight: 500;
-  color: var(--green);
-  background: rgba(61, 220, 132, 0.1);
-  border: 1px solid rgba(61, 220, 132, 0.25);
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.1);
+  border: 1px solid rgba(var(--accent-rgb), 0.25);
   border-radius: 999px;
   padding: 1px 8px;
 }
@@ -253,12 +250,12 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   margin-left: 4px;
 }
 .close-btn:hover {
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--hover);
+  color: var(--fg-strong);
 }
 .close-btn.on {
-  color: var(--green);
-  background: rgba(61, 220, 132, 0.1);
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.14);
 }
 
 /* 面板内容 */

@@ -145,10 +145,6 @@ async function copyPubKey(k: SshKey) {
 
   <div class="list-meta">
     共 <b>{{ keys.length }}</b> 个密钥
-    <template v-if="hasFilter">
-      <span class="sep">·</span>
-      <span>筛选出 <b>{{ visibleKeys.length }}</b> 个</span>
-    </template>
   </div>
 
   <div class="km-list">
@@ -237,7 +233,6 @@ async function copyPubKey(k: SshKey) {
       <p>{{ keys.length ? '没有找到匹配的密钥' : '还没有密钥' }}</p>
       <span v-if="keys.length" class="km-empty-sub">试试调整筛选条件</span>
       <button v-if="hasFilter" type="button" class="btn ghost" @click="clearFilter">清除筛选条件</button>
-      <button v-else type="button" class="btn primary" @click="openGenerate">生成新密钥</button>
     </div>
   </div>
 </template>

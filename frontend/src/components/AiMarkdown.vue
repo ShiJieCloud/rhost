@@ -129,7 +129,7 @@ async function onClick(e: MouseEvent) {
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
-  background: #0d1319;
+  background: var(--bg-input);
 }
 .md :deep(.md-code-head) {
   display: flex;
@@ -189,7 +189,7 @@ async function onClick(e: MouseEvent) {
   text-align: right;
   padding: 10px 8px 10px 12px;
   border-right: 1px solid var(--border);
-  color: #3d4a5c;
+  color: var(--fg-faint);
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.55;
@@ -218,43 +218,43 @@ async function onClick(e: MouseEvent) {
 .md :deep(.hljs-selector-tag),
 .md :deep(.hljs-literal),
 .md :deep(.hljs-section) {
-  color: #c678dd;
+  color: var(--purple);
 }
 .md :deep(.hljs-string),
 .md :deep(.hljs-regexp),
 .md :deep(.hljs-addition) {
-  color: #98c379;
+  color: var(--success);
 }
 .md :deep(.hljs-number),
 .md :deep(.hljs-symbol),
 .md :deep(.hljs-bullet),
 .md :deep(.hljs-deletion) {
-  color: #d19a66;
+  color: var(--orange);
 }
 .md :deep(.hljs-comment),
 .md :deep(.hljs-quote) {
-  color: #5f6b7d;
+  color: var(--fg-faint);
   font-style: italic;
 }
 .md :deep(.hljs-title),
 .md :deep(.hljs-function),
 .md :deep(.hljs-name) {
-  color: #61afef;
+  color: var(--info);
 }
 .md :deep(.hljs-type),
 .md :deep(.hljs-built_in),
 .md :deep(.hljs-class .hljs-title) {
-  color: #e5c07b;
+  color: var(--warning);
 }
 .md :deep(.hljs-attr),
 .md :deep(.hljs-attribute),
 .md :deep(.hljs-variable),
 .md :deep(.hljs-template-variable) {
-  color: #e06c75;
+  color: var(--danger);
 }
 .md :deep(.hljs-meta),
 .md :deep(.hljs-link) {
-  color: #56b6c2;
+  color: var(--cyan);
 }
 .md :deep(.hljs-emphasis) {
   font-style: italic;

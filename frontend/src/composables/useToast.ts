@@ -15,15 +15,18 @@ export function useToasts() {
   return toasts
 }
 
+/** 立即关闭某条通知（带退出动画）；到时长自动关闭也走这里。 */
+export function dismissToast(id: number) {
+  const item = toasts.value.find(t => t.id === id)
+  if (!item || item.leaving) return
+  item.leaving = true
+  setTimeout(() => {
+    toasts.value = toasts.value.filter(t => t.id !== id)
+  }, 200)
+}
+
 export function toast(msg: string, type: ToastType = 'ok', dur = 2000) {
   const id = ++seq
   toasts.value.push({ id, msg, type, leaving: false })
-  setTimeout(() => {
-    const item = toasts.value.find(t => t.id === id)
-    if (!item) return
-    item.leaving = true
-    setTimeout(() => {
-      toasts.value = toasts.value.filter(t => t.id !== id)
-    }, 200)
-  }, dur)
+  setTimeout(() => dismissToast(id), dur)
 }

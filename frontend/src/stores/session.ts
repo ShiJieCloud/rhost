@@ -76,51 +76,9 @@ export const dockVisible = ref(true)
 /** Dock 当前激活页签 */
 export const dockTab = ref<'sftp' | 'log' | 'tunnel'>('sftp')
 
-/* ---- 历史会话（首页右栏展示，用于快速重连） ---- */
-export interface RecentConnection {
-  hostId: string
-  /** 主机全名（Host.id；Host.label 是两字母徽标缩写，仅用于卡片图标） */
-  name: string
-  ip: string
-  port: number
-  user: string
-  connectedAt: number
-}
-export const recentConnections = ref<RecentConnection[]>([])
 /** SFTP 双栏左侧（本地）宽度占比；夹取 0.2~0.8 */
 export const sftpLocalRatio = ref(0.5)
 
-/* ---- 历史会话操作 ---- */
-
-/** 添加或更新一条历史会话记录，并截断到设置上限 */
-export function addRecentConnection(s: Session) {
-  const entry: RecentConnection = {
-    hostId: s.host.id,
-    name: s.host.id,
-    ip: s.host.ip,
-    port: s.host.port,
-    user: s.host.user,
-    connectedAt: Date.now(),
-  }
-  const idx = recentConnections.value.findIndex(r => r.hostId === s.host.id)
-  if (idx >= 0) recentConnections.value.splice(idx, 1)
-  recentConnections.value.unshift(entry)
-  const limit = savedSettings.recentConnectionsLimit
-  if (recentConnections.value.length > limit) {
-    recentConnections.value = recentConnections.value.slice(0, limit)
-  }
-  patchUiState({ recentConnections: recentConnections.value })
-}
-
-/** 从 ui_state hydrate 历史会话；兼容旧版 label 字段（曾误存两字母徽标缩写），统一迁移为 name */
-function hydrateRecentConnections(list: unknown) {
-  if (!Array.isArray(list)) return
-  recentConnections.value = list
-    .filter((r): r is RecentConnection & { label?: string } =>
-      r && typeof r.hostId === 'string' && typeof r.connectedAt === 'number',
-    )
-    .map(r => ({ ...r, name: r.name ?? r.label ?? r.ip }))
-}
 /** SFTP 传输队列展开高度（px）；折叠态下保留，展开无缝恢复 */
 export const sftpQueueHeight = ref(180)
 /** SFTP 传输队列折叠状态；初始折叠，用户调整后跨重启保留 */
@@ -141,7 +99,6 @@ onConfigLoad(snap => {
   const savedRpWidth = num(ui.rightPanelWidth)
   rightPanelWidth.value = savedRpWidth !== null ? Math.min(800, Math.max(280, savedRpWidth)) : 320
   rightPanelMaximized.value = bool(ui.rightPanelMaximized, false)
-  hydrateRecentConnections(ui.recentConnections)
   dockCollapsed.value = bool(ui.dockCollapsed, false)
   dockVisible.value = bool(ui.dockVisible, true)
   dockTab.value = ui.dockTab === 'log' || ui.dockTab === 'sftp' || ui.dockTab === 'tunnel' ? ui.dockTab : 'sftp'
@@ -757,8 +714,6 @@ async function connectBackend(
     s.retryAt = null
     s.resetSeq++
     setSessionState(s.id, 'online')
-    // 记录历史会话（首页右栏展示，用于快速重连）
-    addRecentConnection(s)
     // 端口转发：首连按 tunnelAutoStart 批量启动 enabled 规则；重连按期望集恢复
     //（内部各自清理旧快照/期望集；失败只 toast，不回滚连接状态、不写终端缓冲）
     if (wasReconnecting) void restoreOnReconnect(s)

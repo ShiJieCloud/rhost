@@ -1,5 +1,6 @@
 import { reactive, ref } from 'vue'
 import { onConfigLoad, persistSectionNow } from './appConfig'
+import { applyAccent, applyTheme } from '../styles/theme'
 
 /** 设置弹窗显隐（模块级单例，同 showNewConn 模式） */
 export const showSettings = ref(false)
@@ -77,8 +78,6 @@ export interface AppSettings {
   memPauseHidden: boolean
   /** 内存告警阈值（MB）：主进程 RSS 持续超过该值时状态栏告警 */
   memAlertMb: number
-  /** 历史会话保留数量上限（超出后丢弃最旧的记录） */
-  recentConnectionsLimit: number
   /* ---- 安全（应用锁 / 会话锁；密码哈希存后端独立 lock.json，不在配置文件中） ---- */
   /** 应用锁总开关；置 true 前必须已设置应用锁密码 */
   appLockEnabled: boolean
@@ -237,7 +236,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   metricsInterval: 3,
   memPauseHidden: true,
   memAlertMb: 300,
-  recentConnectionsLimit: 20,
 
   appLockEnabled: false,
   appLockIdleSec: 300,
@@ -355,6 +353,7 @@ function applyLogsSection(logs: Record<string, unknown>) {
 onConfigLoad(snap => {
   applySettingsSection(snap.settings)
   applyLogsSection(snap.logs)
+  applyTheme(savedSettings.uiTheme)
   applyAccent(savedSettings.accent)
 })
 
@@ -371,31 +370,15 @@ export function persistSettings() {
   persistSectionNow('settings', all).catch(e => console.error('设置写穿失败:', e))
 }
 
-/** 强调色应用到全局（view-card 等处 var(--accent) 生效）。
- *  同时注入 --accent-rgb（"r,g,b"）供 rgba() 派生半透明色（如日志搜索高亮），
- *  避免依赖 color-mix（老版本 WKWebView 不支持）。 */
-export function applyAccent(color: string) {
-  const root = document.documentElement.style
-  root.setProperty('--accent', color)
-  const rgb = hexToRgbTriplet(color)
-  if (rgb) root.setProperty('--accent-rgb', rgb)
-}
-
-/** #rgb / #rrggbb → "r,g,b"；非法输入返回 null */
-function hexToRgbTriplet(hex: string): string | null {
-  const m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(hex.trim())
-  if (!m) return null
-  let h = m[1]
-  if (h.length === 3) h = h.split('').map(c => c + c).join('')
-  const n = parseInt(h, 16)
-  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`
-}
+/** 强调色与主题在启动时立即应用；配置快照到达后由 onConfigLoad 再次覆盖 */
+applyTheme(savedSettings.uiTheme)
 applyAccent(savedSettings.accent)
 
 export function saveSettings(draft: AppSettings) {
   const next = JSON.parse(JSON.stringify(draft)) as AppSettings
   Object.assign(savedSettings, next)
   persistSettings()
+  applyTheme(savedSettings.uiTheme)
   applyAccent(savedSettings.accent)
 }
 

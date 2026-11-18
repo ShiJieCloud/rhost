@@ -1,0 +1,211 @@
+/*
+ * OpenIDEA "Islands" 视觉语言，适配 Rhost。
+ * 来源：OpenIDEA src/styles/tokens.css（Islands Dark / Islands Light）。
+ * 规则：
+ *   - 组件只消费变量，不写死颜色；
+ *   - 间距走 4px 网格（--space-N = N * 4px）；
+ *   - 圆角 4 / 6 / 8 / 10px；
+ *   - 纯色立面 + 1px 细边框，不使用装饰性渐变与发光。
+ * 强调色保留 Rhost 品牌绿，可在设置中自定义；浅色主题下自动使用加深变体。
+ */
+
+/* Inter Variable（latin 子集，随应用打包，离线可用） */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../assets/fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+:root {
+  color-scheme: dark;
+
+  /* ---- 间距（4px 网格） ---- */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* ---- 字体 ---- */
+  --font-ui: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mono: var(--font-mono);
+  --fs-ui: 13px;
+  --fs-small: 12px;
+  --fs-tiny: 11px;
+
+  /* ---- 尺寸 ---- */
+  --h-titlebar: 40px;
+  --h-tabbar: 38px;
+  --h-tab: 28px;
+  --h-row: 24px;
+  --h-statusbar: 30px;
+  --h-field: 28px;
+  --h-button: 28px;
+  --h-control: 24px;
+  --radius-small: 4px;
+  --radius-control: 4px;
+  --radius-row: 4px;
+  --radius-selection: 5px;
+  --radius-tab: 6px;
+  --radius-popup: 8px;
+  --radius-popup-large: 10px;
+  --radius-dialog: 10px;
+
+  /* ---- 动效 ---- */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 80ms;
+  --dur: 140ms;
+  --dur-slow: 220ms;
+
+  /* ---- 立面（Islands Dark） ---- */
+  --bg-app: #191a1c;
+  --bg-elev: #212326;
+  --panel-2: #26282c;
+  --bg-popup: #26282c;
+  --bg-input: #191a1c;
+  --bg-hover: #2e2f30;
+  --bg-selected: #2a4371;
+  --bg-backdrop: rgba(0, 0, 0, .45);
+
+  /* ---- 分隔线 ---- */
+  --border: #26282c;
+  --border-soft: #232528;
+  --border-popup: #33353b;
+  --border-strong: #40434a;
+  --control-off: #5f6269;
+
+  /* ---- 文本 ---- */
+  --fg-strong: #dfe1e5;
+  --fg: #d1d3d9;
+  --fg-secondary: #9fa2a8;
+  --fg-muted: #8c8f95;
+  --fg-subtle: #73767c;
+  --fg-faint: #5f6269;
+  --fg-icon: #ced0d6;
+
+  /* ---- 强调色（品牌绿；--*-strong 为浅色主题的加深变体） ---- */
+  --accent-raw: #3ddc84;
+  --accent-rgb-raw: 61, 220, 132;
+  --accent-strong: #0f8a4a;
+  --accent-rgb-strong: 15, 138, 74;
+  --accent: var(--accent-raw);
+  --accent-rgb: var(--accent-rgb-raw);
+  --accent-hover: var(--accent-hover-raw);
+  --accent-hover-raw: #5ee69c;
+  --accent-hover-strong: #0b6b39;
+  --on-accent: #191a1c;
+  --link: #71a1fe;
+  --link-hover: #92b7ff;
+
+  /* ---- 状态与语义色 ---- */
+  --green: var(--accent);
+  --cyan: #4fd6e0;
+  --blue: #7aa2f7;
+  --yellow: #e5b567;
+  --red: #f7768e;
+  --purple: #bb9af7;
+  --orange: #ff9e64;
+  --danger: #f57e84;
+  --warning: #d59637;
+  --success: #6db083;
+  --info: #71a1fe;
+  --info-rgb: 113, 161, 254;
+
+  --rhost-status-success: #6db083;
+  --rhost-status-processing: #71a1fe;
+  --rhost-status-warning: #d59637;
+  --rhost-status-error: #f57e84;
+  --rhost-status-idle: #8c8f95;
+
+  /* ---- 覆盖层 / 阴影 ---- */
+  --hover-overlay: rgba(255, 255, 255, .06);
+  --hover-overlay-strong: rgba(255, 255, 255, .1);
+  --selected-overlay: rgba(var(--accent-rgb), .16);
+  --selected-overlay-strong: rgba(var(--accent-rgb), .26);
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, .28);
+  --shadow-popup: 0 6px 20px rgba(0, 0, 0, .45);
+  --shadow-balloon: 0 8px 24px rgba(0, 0, 0, .45);
+  --shadow-dialog: 0 0 0 .5px rgba(0, 0, 0, .6), 0 10px 24px rgba(0, 0, 0, .35), 0 24px 72px rgba(0, 0, 0, .45);
+  --shadow-tooltip: 0 4px 12px rgba(0, 0, 0, .4);
+  --scrollbar-thumb: rgba(255, 255, 255, .2);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, .35);
+  --focus-ring: var(--accent);
+  --bg-editor-selection: rgba(var(--accent-rgb), .22);
+
+  /* ---- Rhost 旧变量别名（组件按旧名消费，随主题自动切换） ---- */
+  --bg: var(--bg-app);
+  --panel: var(--bg-elev);
+  --hover: var(--hover-overlay);
+  --border-legacy: var(--border);
+  --text: var(--fg);
+  --muted: var(--fg-muted);
+  --muted-2: var(--fg-subtle);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* ---- 立面（Islands Light） ---- */
+  --bg-app: #ffffff;
+  --bg-elev: #f7f8f9;
+  --panel-2: #ffffff;
+  --bg-popup: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: #ededed;
+  --bg-selected: #d0ffe4;
+  --bg-backdrop: rgba(0, 0, 0, .25);
+
+  /* ---- 分隔线 ---- */
+  --border: #e9eaee;
+  --border-soft: #f0f2f5;
+  --border-popup: #d1d3d9;
+  --border-strong: #d1d3d9;
+  --control-off: #c3c5cb;
+
+  /* ---- 文本 ---- */
+  --fg-strong: #000000;
+  --fg: #1f2328;
+  --fg-secondary: #5f6269;
+  --fg-muted: #6c707e;
+  --fg-subtle: #73767c;
+  --fg-faint: #9fa2a8;
+  --fg-icon: #6c707e;
+
+  /* ---- 强调色：浅色底使用加深绿，保证文字对比度 ---- */
+  --accent: var(--accent-strong);
+  --accent-rgb: var(--accent-rgb-strong);
+  --accent-hover: var(--accent-hover-strong);
+  --on-accent: #ffffff;
+  --link: #2f5eb9;
+  --link-hover: #2e4d89;
+
+  /* ---- 状态与语义色 ---- */
+  --danger: #c54e58;
+  --warning: #a56906;
+  --success: #338555;
+  --info: #3871e1;
+  --info-rgb: 56, 113, 225;
+  --rhost-status-success: #338555;
+  --rhost-status-processing: #3871e1;
+  --rhost-status-warning: #a56906;
+  --rhost-status-error: #c54e58;
+  --rhost-status-idle: #9fa2a8;
+
+  /* ---- 覆盖层 / 阴影 ---- */
+  --hover-overlay: rgba(0, 0, 0, .05);
+  --hover-overlay-strong: rgba(0, 0, 0, .08);
+  --shadow-card: 0 1px 4px rgba(0, 0, 0, .08);
+  --shadow-popup: 0 6px 20px rgba(0, 0, 0, .12);
+  --shadow-balloon: 0 8px 24px rgba(0, 0, 0, .14);
+  --shadow-dialog: 0 0 0 .5px rgba(0, 0, 0, .1), 0 10px 24px rgba(0, 0, 0, .1), 0 24px 72px rgba(0, 0, 0, .2);
+  --shadow-tooltip: 0 4px 12px rgba(0, 0, 0, .12);
+  --scrollbar-thumb: rgba(0, 0, 0, .2);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, .35);
+}

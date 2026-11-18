@@ -227,11 +227,12 @@ onMounted(async () => {
   <div class="app" :class="[platformClass, { 'is-fullscreen': isFullscreen }]">
     <TitleBar v-if="appView === 'home'" />
     <WbTitleBar v-else />
-    <div class="app-body" :class="{ 'rp-maximized': rightPanelVisible && rightPanelMaximized }">
+    <div class="app-body" :class="{ 'rp-maximized': appView === 'workbench' && rightPanelVisible && rightPanelMaximized }">
       <HomeView v-show="appView === 'home'" />
       <Workbench v-if="workbenchMounted" v-show="appView === 'workbench'" />
-      <RightPanel v-show="rightPanelVisible" />
-      <RightIconRail />
+      <!-- 右侧栏仅工作台提供：首页专注主机管理，AI 为会话级能力 -->
+      <RightPanel v-if="appView === 'workbench'" v-show="rightPanelVisible" />
+      <RightIconRail v-if="appView === 'workbench'" />
     </div>
 
     <!-- 状态栏提升到 App 层横贯全窗：右侧栏/图标栏底部对齐状态栏上沿，不再覆盖状态栏高度带 -->

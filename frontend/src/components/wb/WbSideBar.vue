@@ -21,7 +21,7 @@ const groups = computed(() => {
 </script>
 
 <template>
-  <aside class="sidebar" :class="{ hide: false }">
+  <aside class="sidebar wb-sidebar" :class="{ hide: false }">
     <div class="search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
            stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle>

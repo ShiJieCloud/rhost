@@ -3142,8 +3142,8 @@ const configHint = computed(() => {
 
 <template>
   <div class="ai-panel">
-    <!-- 操作按钮注入 RightPanel 头部 -->
-    <Teleport v-if="rightPanelTab === 'ai'" to="#rp-head-actions">
+    <!-- 操作按钮注入 RightPanel 头部（defer 同 Inspector：目标随面板同批挂载，需等渲染结束再解析） -->
+    <Teleport v-if="rightPanelTab === 'ai'" defer to="#rp-head-actions">
       <button class="ai-action-btn" title="清空对话" :disabled="messages.length === 0" @click="clearChat">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3961,7 +3961,7 @@ const configHint = computed(() => {
 }
 .chat-scroll::-webkit-scrollbar { width: 6px; }
 .chat-scroll::-webkit-scrollbar-thumb {
-  background: #1c2836;
+  background: var(--border-strong);
   border-radius: 3px;
 }
 
@@ -4122,7 +4122,7 @@ const configHint = computed(() => {
 }
 .config-hint {
   font-size: 11.5px;
-  color: #e5a13a;
+  color: var(--warning);
   border: 1px solid rgba(229, 161, 58, 0.35);
   background: rgba(229, 161, 58, 0.08);
   border-radius: 8px;
@@ -4227,7 +4227,7 @@ const configHint = computed(() => {
   padding-top: 2px;
 }
 .bubble.assistant.error .md {
-  color: #e57a7a;
+  color: var(--danger);
 }
 /* ---------- 命令授权弹窗（输入框上方，占据布局不遮挡消息） ---------- */
 .auth-wrap {
@@ -4256,7 +4256,7 @@ const configHint = computed(() => {
 .auth-cmd {
   margin: 8px 0;
   padding: 8px 10px;
-  background: #0d1219;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   font-family: var(--mono);
@@ -4352,10 +4352,10 @@ const configHint = computed(() => {
   color: var(--muted);
 }
 .proposal.pending .proposal-state {
-  color: #e5a13a;
+  color: var(--warning);
 }
 .proposal.rejected .proposal-state {
-  color: #e57a7a;
+  color: var(--danger);
 }
 .proposal-reason {
   font-size: 11.5px;
@@ -4364,14 +4364,14 @@ const configHint = computed(() => {
 }
 .proposal-error {
   font-size: 11.5px;
-  color: #e57a7a;
+  color: var(--danger);
   line-height: 1.45;
 }
 .proposal-cmd {
   margin: 0;
   padding: 7px 9px;
   border-radius: 7px;
-  background: #0d1219;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 11.5px;
@@ -4395,7 +4395,7 @@ const configHint = computed(() => {
   border-color: rgba(86, 156, 214, 0.4);
 }
 .proposal.readonly-tool .readonly-tag {
-  color: #569cd6;
+  color: var(--info);
 }
 .proposal.readonly-tool .proposal-args {
   font-family: var(--mono);
@@ -4514,7 +4514,7 @@ const configHint = computed(() => {
 .plan-badge {
   flex-shrink: 0;
   font-weight: 600;
-  color: #569cd6;
+  color: var(--info);
 }
 .plan-goal {
   overflow: hidden;
@@ -4547,10 +4547,10 @@ const configHint = computed(() => {
   color: var(--green);
 }
 .plan-step.failed .plan-step-icon {
-  color: #e57a7a;
+  color: var(--danger);
 }
 .plan-step.skipped .plan-step-icon {
-  color: #e5a13a;
+  color: var(--warning);
 }
 /* running 步：蓝色脉冲圆点（与「思考中…」同一脉冲动画） */
 .plan-dot {
@@ -4558,7 +4558,7 @@ const configHint = computed(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #569cd6;
+  background: var(--info);
   animation: reasoning-pulse 1.2s ease-in-out infinite;
 }
 .plan-step-body {
@@ -4573,7 +4573,7 @@ const configHint = computed(() => {
   font-weight: 500;
 }
 .plan-step.running .plan-step-title {
-  color: #569cd6;
+  color: var(--info);
 }
 /* draft 态编辑输入框 */
 .plan-step-title-input {
@@ -4589,7 +4589,7 @@ const configHint = computed(() => {
   font-family: inherit;
 }
 .plan-step-title-input:focus {
-  border-color: #569cd6;
+  border-color: var(--info);
 }
 /* 操作按钮行（规划面板 / 文件变更面板共用）：按钮统一靠右对齐 */
 .plan-actions {
@@ -4616,14 +4616,14 @@ const configHint = computed(() => {
   cursor: not-allowed;
 }
 .plan-btn.primary {
-  background: #569cd6;
-  border-color: #569cd6;
-  color: #0b1118;
+  background: var(--info);
+  border-color: var(--info);
+  color: var(--bg-input);
   font-weight: 600;
 }
 .plan-btn.danger {
   border-color: rgba(229, 90, 90, 0.5);
-  color: #e57a7a;
+  color: var(--danger);
 }
 
 /* ---- 活动计划面板：固定输入框上方，可折叠，授权弹窗出现时让位（v-if 隐藏） ---- */
@@ -4738,7 +4738,7 @@ const configHint = computed(() => {
 .agent-logo svg {
   width: 11px;
   height: 11px;
-  color: #0b1118;
+  color: var(--bg-input);
 }
 .agent-name {
   font-size: 12px;
@@ -4780,7 +4780,7 @@ const configHint = computed(() => {
   background: var(--panel-2);
 }
 .foot-btn.danger:hover {
-  color: #e57a7a;
+  color: var(--danger);
   background: rgba(229, 90, 90, 0.12);
 }
 .stopped-tag {
@@ -5098,11 +5098,11 @@ const configHint = computed(() => {
 }
 .add-item.active,
 .add-item.active svg {
-  color: #569cd6;
+  color: var(--info);
 }
 .add-check {
   margin-left: auto;
-  color: #569cd6;
+  color: var(--info);
 }
 /* 隐藏的文件选择 input */
 .file-hidden {
@@ -5200,7 +5200,7 @@ const configHint = computed(() => {
   place-items: center;
   background: var(--green);
   border: none;
-  color: #0b1118;
+  color: var(--bg-input);
   cursor: pointer;
   transition: opacity 0.15s;
   flex-shrink: 0;
@@ -5235,7 +5235,7 @@ const configHint = computed(() => {
   width: 10px;
   height: 10px;
   border-radius: 2px;
-  background: #e57a7a;
+  background: var(--danger);
 }
 
 /* 头部操作按钮（Teleport 到 RightPanel） */
@@ -5252,8 +5252,8 @@ const configHint = computed(() => {
   transition: background 0.15s, color 0.15s;
 }
 .ai-action-btn:hover:not(:disabled) {
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--hover);
+  color: var(--fg-strong);
 }
 .ai-action-btn:disabled {
   opacity: 0.35;
@@ -5290,13 +5290,13 @@ const configHint = computed(() => {
 }
 .exec-warn {
   font-size: 11px;
-  color: #e5a13a;
+  color: var(--warning);
   margin: 4px 0 0;
 }
 .exec-preview {
   max-height: 200px;
   overflow: auto;
-  background: #0d1319;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
@@ -5330,10 +5330,10 @@ const configHint = computed(() => {
 .exec-btn.primary {
   background: var(--green);
   border-color: var(--green);
-  color: #0b1118;
+  color: var(--bg-input);
 }
 .exec-btn.primary:hover {
   opacity: 0.85;
-  color: #0b1118;
+  color: var(--bg-input);
 }
 </style>

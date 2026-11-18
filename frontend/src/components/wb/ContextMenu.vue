@@ -172,7 +172,7 @@ watch(appLocked, (locked) => {
   background:rgba(13,19,28,.97);
   border:1px solid var(--border);
   border-radius:7px;
-  box-shadow:0 10px 34px rgba(0,0,0,.52),0 0 0 1px rgba(255,255,255,.02);
+  box-shadow:var(--shadow-popup);
   backdrop-filter:blur(8px);
   user-select:none;
 }

@@ -213,7 +213,7 @@ onUnmounted(() => {
   <footer ref="barEl" class="statusbar">
     <!-- 应用锁手动上锁入口：状态栏最左侧开头 -->
     <AppLockButton class="status-lock-btn" />
-    <span class="item" :class="statusText().cls">
+    <span class="item state-item" :class="statusText().cls">
       <span class="pulse"></span>
       {{ statusText().label }}
     </span>

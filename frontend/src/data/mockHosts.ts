@@ -49,11 +49,4 @@ export const COLOR_MAP: Record<HostColor, string> = {
   red: '#f7768e',
 }
 
-export const STYLE_LABELS = {
-  list: '列表视图',
-  card: '卡片视图',
-  grid: '网格视图',
-  compact: '紧凑视图',
-} as const
-
 export const GROUP_OPTIONS = ['生产环境', '测试环境', '开发环境', '其他', '+ 新建分组…']
