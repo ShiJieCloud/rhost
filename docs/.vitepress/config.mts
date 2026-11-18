@@ -65,6 +65,7 @@ export default defineConfig({
         activeMatch: '/reference/',
         items: [
           { text: '全局设置', link: '/reference/global-settings' },
+          { text: 'CSS 格式规范', link: '/reference/css-formatting' },
           { text: '发版 Release notes 模板', link: '/reference/release-notes-template' },
         ],
       },
@@ -150,6 +151,7 @@ export default defineConfig({
         text: '参考',
         items: [
           { text: '全局设置', link: '/reference/global-settings' },
+          { text: 'CSS 格式规范', link: '/reference/css-formatting' },
           { text: '发版 Release notes 模板', link: '/reference/release-notes-template' },
         ],
       },
