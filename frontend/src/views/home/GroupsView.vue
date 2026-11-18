@@ -25,14 +25,6 @@ const visible = computed<GroupStat[]>(() => {
   )
 })
 
-const filterInfo = computed(() =>
-  q.value.trim() ? `筛选出 ${visible.value.length} 个分组` : '无筛选',
-)
-
-const onlineTotal = computed(
-  () => hosts.value.filter(h => h.status === 'online').length,
-)
-
 /* ================= 跳转主机视图 ================= */
 function openGroup(s: GroupStat) {
   filter.value = s.def.name
@@ -120,9 +112,7 @@ function accent(s: GroupStat) {
   <div class="list-meta">
     共 <b>{{ groupStats.length }}</b> 个分组
     <span class="sep">·</span>
-    <span>覆盖 <b>{{ hosts.length }}</b> 台主机（在线 <b>{{ onlineTotal }}</b>）</span>
-    <span class="sep">·</span>
-    <span>{{ filterInfo }}</span>
+    <span>覆盖 <b>{{ hosts.length }}</b> 台主机</span>
   </div>
 
   <div class="gp-list">
@@ -145,11 +135,6 @@ function accent(s: GroupStat) {
           <div class="gp-name">{{ s.def.name }}</div>
           <div class="gp-count">
             {{ s.total }} 台主机
-            <template v-if="s.total">
-              · 在线 <span class="gp-state ok">{{ s.online }}</span>
-              · 告警 <span class="gp-state warn">{{ s.warn }}</span>
-              · 离线 <span class="gp-state off">{{ s.offline }}</span>
-            </template>
           </div>
         </div>
 

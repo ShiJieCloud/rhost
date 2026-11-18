@@ -1,6 +1,5 @@
 export type HostStatus = 'online' | 'idle' | 'offline' | 'warn'
 export type HostColor = 'green' | 'blue' | 'cyan' | 'purple' | 'yellow' | 'red'
-export type ViewStyle = 'list' | 'card' | 'grid' | 'compact'
 export type ToastType = 'ok' | 'info' | 'warn' | 'err'
 
 export type KeyType = 'ED25519' | 'RSA' | 'ECDSA'

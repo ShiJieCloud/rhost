@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import WbSideBar from '../components/wb/WbSideBar.vue'
+import LeftIconRail from '../components/LeftIconRail.vue'
 import WbTabs from '../components/wb/WbTabs.vue'
 import TerminalPane from '../components/wb/TerminalPane.vue'
 import DockPanel from '../components/wb/DockPanel.vue'
@@ -9,6 +10,7 @@ import { dockVisible, sidebarVisible } from '../stores/session'
 <template>
   <div class="workbench-root">
     <div class="body">
+      <LeftIconRail />
       <WbSideBar v-show="sidebarVisible" />
 
       <main class="workspace">

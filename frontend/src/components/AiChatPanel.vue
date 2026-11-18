@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { activeSession, activeHost, activeSessionId, appView, rightPanelTab, rightPanelVisible, sendInput, sendInputAndCapture, sessions } from '../stores/session'
 import { savedSettings } from '../stores/settings'
+import { appLocked } from '../stores/appLock'
 import { aiQuote } from '../stores/aiQuote'
 import { toast } from '../composables/useToast'
 import { matchHighRisk } from '../lib/aiRisk'
@@ -67,6 +68,14 @@ const EXTRACT_TRIGGER_CHARS = 4000
 /** 对话归属：首页 'global'，终端为当前 SSH 会话 id */
 const scope = computed<AiScope>(() =>
   appView.value === 'home' ? 'global' : activeSession.value?.id ?? 'global',
+)
+
+/** 当前 scope 绑定的会话是否处于会话锁定态。
+ *  会话锁语义是单会话冻结，该会话发起的 AI 对话与之同为「该会话的操作」，
+ *  锁定后整体冻结（停流 + 发送拦截 + 输入禁用），与终端/粘贴/SFTP 拦截点对称。
+ *  首页 global 对话不绑定会话，不受会话锁影响（工具出口 aiExecTool 仍按 scope 拦）。 */
+const activeSessionLocked = computed(
+  () => appView.value !== 'home' && activeSession.value?.locked === true,
 )
 
 const messages = ref<AiChatMessage[]>([])
@@ -1194,6 +1203,12 @@ async function runSftpTransfer(p: AiToolProposal) {
     p.error = '无可用会话或会话已断开'
     return
   }
+  // 两级锁拦截（app-lock-design.md §6.5）：授权弹窗期间也可能被锁，执行前复检
+  if (appLocked.value || activeSession.value.locked) {
+    p.state = 'rejected'
+    p.error = appLocked.value ? '应用已锁定，请先解锁' : '会话已锁定，请先解锁'
+    return
+  }
   const paths = sftpPaths(p)
   if (!paths) {
     p.state = 'rejected'
@@ -1337,6 +1352,11 @@ function buildSessionContext(): AiWireMessage | null {
 function send(override?: string) {
   const input = (override ?? draft.value).trim()
   if ((!input && !attachments.value.length) || streaming.value) return
+  // 会话锁定：该 scope 的对话整体冻结，发送直接拦截（设计 §6.5 拦截矩阵）
+  if (activeSessionLocked.value) {
+    toast('会话已锁定，请先解锁', 'warn', 2400)
+    return
+  }
 
   // 编辑重发：截断发生在真正发送时（填回时不截断，用户可能取消编辑）
   if (editFromId.value) {
@@ -2483,6 +2503,16 @@ function stop() {
   void aiStopChat(scope.value)
 }
 
+// 应用锁锁定瞬间停止本面板在飞 AI 流（global 与会话 scope 均生效；设计 §6.4/§6.5）
+watch(appLocked, locked => {
+  if (locked) stop()
+})
+
+// 会话锁定瞬间停止本 scope 在飞 AI 流（设计 §6.5：会话锁冻结该会话的 AI 交互）
+watch(activeSessionLocked, locked => {
+  if (locked) stop()
+})
+
 function clearChat() {
   messages.value = []
   streaming.value = false
@@ -3112,8 +3142,8 @@ const configHint = computed(() => {
 
 <template>
   <div class="ai-panel">
-    <!-- 操作按钮注入 RightPanel 头部 -->
-    <Teleport v-if="rightPanelTab === 'ai'" to="#rp-head-actions">
+    <!-- 操作按钮注入 RightPanel 头部（defer 同 Inspector：目标随面板同批挂载，需等渲染结束再解析） -->
+    <Teleport v-if="rightPanelTab === 'ai'" defer to="#rp-head-actions">
       <button class="ai-action-btn" title="清空对话" :disabled="messages.length === 0" @click="clearChat">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3734,8 +3764,10 @@ const configHint = computed(() => {
         v-model="draft"
         class="composer-input"
         rows="1"
-        :disabled="!!configHint"
-        :placeholder="configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…')"
+        :disabled="!!configHint || activeSessionLocked"
+        :placeholder="activeSessionLocked
+          ? '会话已锁定，请先解锁'
+          : (configHint || (appView === 'home' ? '询问 AI…' : '询问 AI（携带当前会话上下文）…'))"
         @keydown="onKeydown"
         @focus="composerFocused = true"
         @blur="composerFocused = false"
@@ -3748,7 +3780,7 @@ const configHint = computed(() => {
             type="button"
             class="icon-btn"
             title="更多"
-            :disabled="!!configHint || streaming"
+            :disabled="!!configHint || streaming || activeSessionLocked"
             @click="addOpen = !addOpen"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -3863,7 +3895,13 @@ const configHint = computed(() => {
           </div>
         </div>
         <div class="bar-spacer"></div>
-        <button v-if="!streaming" class="send-btn" title="发送 (Enter)" @click="send()">
+        <button
+          v-if="!streaming"
+          class="send-btn"
+          :disabled="activeSessionLocked"
+          :title="activeSessionLocked ? '会话已锁定，请先解锁' : '发送 (Enter)'"
+          @click="send()"
+        >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="19" x2="12" y2="5" />
@@ -3923,7 +3961,7 @@ const configHint = computed(() => {
 }
 .chat-scroll::-webkit-scrollbar { width: 6px; }
 .chat-scroll::-webkit-scrollbar-thumb {
-  background: #1c2836;
+  background: var(--border-strong);
   border-radius: 3px;
 }
 
@@ -4084,7 +4122,7 @@ const configHint = computed(() => {
 }
 .config-hint {
   font-size: 11.5px;
-  color: #e5a13a;
+  color: var(--warning);
   border: 1px solid rgba(229, 161, 58, 0.35);
   background: rgba(229, 161, 58, 0.08);
   border-radius: 8px;
@@ -4189,7 +4227,7 @@ const configHint = computed(() => {
   padding-top: 2px;
 }
 .bubble.assistant.error .md {
-  color: #e57a7a;
+  color: var(--danger);
 }
 /* ---------- 命令授权弹窗（输入框上方，占据布局不遮挡消息） ---------- */
 .auth-wrap {
@@ -4218,7 +4256,7 @@ const configHint = computed(() => {
 .auth-cmd {
   margin: 8px 0;
   padding: 8px 10px;
-  background: #0d1219;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   font-family: var(--mono);
@@ -4314,10 +4352,10 @@ const configHint = computed(() => {
   color: var(--muted);
 }
 .proposal.pending .proposal-state {
-  color: #e5a13a;
+  color: var(--warning);
 }
 .proposal.rejected .proposal-state {
-  color: #e57a7a;
+  color: var(--danger);
 }
 .proposal-reason {
   font-size: 11.5px;
@@ -4326,14 +4364,14 @@ const configHint = computed(() => {
 }
 .proposal-error {
   font-size: 11.5px;
-  color: #e57a7a;
+  color: var(--danger);
   line-height: 1.45;
 }
 .proposal-cmd {
   margin: 0;
   padding: 7px 9px;
   border-radius: 7px;
-  background: #0d1219;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 11.5px;
@@ -4357,7 +4395,7 @@ const configHint = computed(() => {
   border-color: rgba(86, 156, 214, 0.4);
 }
 .proposal.readonly-tool .readonly-tag {
-  color: #569cd6;
+  color: var(--info);
 }
 .proposal.readonly-tool .proposal-args {
   font-family: var(--mono);
@@ -4476,7 +4514,7 @@ const configHint = computed(() => {
 .plan-badge {
   flex-shrink: 0;
   font-weight: 600;
-  color: #569cd6;
+  color: var(--info);
 }
 .plan-goal {
   overflow: hidden;
@@ -4509,10 +4547,10 @@ const configHint = computed(() => {
   color: var(--green);
 }
 .plan-step.failed .plan-step-icon {
-  color: #e57a7a;
+  color: var(--danger);
 }
 .plan-step.skipped .plan-step-icon {
-  color: #e5a13a;
+  color: var(--warning);
 }
 /* running 步：蓝色脉冲圆点（与「思考中…」同一脉冲动画） */
 .plan-dot {
@@ -4520,7 +4558,7 @@ const configHint = computed(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #569cd6;
+  background: var(--info);
   animation: reasoning-pulse 1.2s ease-in-out infinite;
 }
 .plan-step-body {
@@ -4535,7 +4573,7 @@ const configHint = computed(() => {
   font-weight: 500;
 }
 .plan-step.running .plan-step-title {
-  color: #569cd6;
+  color: var(--info);
 }
 /* draft 态编辑输入框 */
 .plan-step-title-input {
@@ -4551,7 +4589,7 @@ const configHint = computed(() => {
   font-family: inherit;
 }
 .plan-step-title-input:focus {
-  border-color: #569cd6;
+  border-color: var(--info);
 }
 /* 操作按钮行（规划面板 / 文件变更面板共用）：按钮统一靠右对齐 */
 .plan-actions {
@@ -4578,14 +4616,14 @@ const configHint = computed(() => {
   cursor: not-allowed;
 }
 .plan-btn.primary {
-  background: #569cd6;
-  border-color: #569cd6;
-  color: #0b1118;
+  background: var(--info);
+  border-color: var(--info);
+  color: var(--bg-input);
   font-weight: 600;
 }
 .plan-btn.danger {
   border-color: rgba(229, 90, 90, 0.5);
-  color: #e57a7a;
+  color: var(--danger);
 }
 
 /* ---- 活动计划面板：固定输入框上方，可折叠，授权弹窗出现时让位（v-if 隐藏） ---- */
@@ -4700,7 +4738,7 @@ const configHint = computed(() => {
 .agent-logo svg {
   width: 11px;
   height: 11px;
-  color: #0b1118;
+  color: var(--bg-input);
 }
 .agent-name {
   font-size: 12px;
@@ -4742,7 +4780,7 @@ const configHint = computed(() => {
   background: var(--panel-2);
 }
 .foot-btn.danger:hover {
-  color: #e57a7a;
+  color: var(--danger);
   background: rgba(229, 90, 90, 0.12);
 }
 .stopped-tag {
@@ -5060,11 +5098,11 @@ const configHint = computed(() => {
 }
 .add-item.active,
 .add-item.active svg {
-  color: #569cd6;
+  color: var(--info);
 }
 .add-check {
   margin-left: auto;
-  color: #569cd6;
+  color: var(--info);
 }
 /* 隐藏的文件选择 input */
 .file-hidden {
@@ -5162,7 +5200,7 @@ const configHint = computed(() => {
   place-items: center;
   background: var(--green);
   border: none;
-  color: #0b1118;
+  color: var(--bg-input);
   cursor: pointer;
   transition: opacity 0.15s;
   flex-shrink: 0;
@@ -5172,6 +5210,15 @@ const configHint = computed(() => {
 }
 .send-btn:active {
   transform: scale(0.94);
+}
+/* 会话锁冻结：发送按钮不可用（与冻结输入区呼应） */
+.send-btn:disabled,
+.send-btn:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.send-btn:disabled:active {
+  transform: none;
 }
 .stop-btn {
   width: 28px;
@@ -5188,7 +5235,7 @@ const configHint = computed(() => {
   width: 10px;
   height: 10px;
   border-radius: 2px;
-  background: #e57a7a;
+  background: var(--danger);
 }
 
 /* 头部操作按钮（Teleport 到 RightPanel） */
@@ -5205,8 +5252,8 @@ const configHint = computed(() => {
   transition: background 0.15s, color 0.15s;
 }
 .ai-action-btn:hover:not(:disabled) {
-  background: var(--panel-2);
-  color: var(--text);
+  background: var(--hover);
+  color: var(--fg-strong);
 }
 .ai-action-btn:disabled {
   opacity: 0.35;
@@ -5243,13 +5290,13 @@ const configHint = computed(() => {
 }
 .exec-warn {
   font-size: 11px;
-  color: #e5a13a;
+  color: var(--warning);
   margin: 4px 0 0;
 }
 .exec-preview {
   max-height: 200px;
   overflow: auto;
-  background: #0d1319;
+  background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
@@ -5283,10 +5330,10 @@ const configHint = computed(() => {
 .exec-btn.primary {
   background: var(--green);
   border-color: var(--green);
-  color: #0b1118;
+  color: var(--bg-input);
 }
 .exec-btn.primary:hover {
   opacity: 0.85;
-  color: #0b1118;
+  color: var(--bg-input);
 }
 </style>

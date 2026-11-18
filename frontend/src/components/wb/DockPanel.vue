@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
 import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCollapsed, dockHeight, DOCK_DEFAULT_HEIGHT, dockTab, dockVisible, searchTick, sftpLocalRatio, sftpQueueCollapsed, sftpQueueHeight } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
+import { appLocked } from '../../stores/appLock'
 import { toast } from '../../composables/useToast'
 import TunnelPane from './TunnelPane.vue'
 import { isTauri } from '../../lib/tauri'
@@ -19,6 +20,10 @@ import {
 import type { LogLevel } from '../../stores/applog'
 
 type Side = 'local' | 'remote'
+
+/** SFTP 操作冻结条件（app-lock-design.md §6.5）：应用锁（遮罩兜底）或激活会话被锁。
+ *  进行中的传输不中断，但新建传输/文件管理/任务控制一律禁止。 */
+const sftpLocked = computed(() => appLocked.value || activeSession.value?.locked === true)
 
 /* ---- SFTP 文件系统（本地/远程均为后端真实数据） ---- */
 interface FsEntry {
@@ -163,6 +168,7 @@ let remoteReqSeq = 0 // 竞态守卫：快速切目录/切会话时丢弃过期�
 async function loadRemote(path?: string) {
   const backendId = activeSession.value?.backendId
   if (!isTauri || !backendId) return // 浏览器 dev 模式 / 未连接：保持空列表
+  if (sftpLocked.value) return // 锁定期间不发起远端浏览，保留锁定前列表
   const req = ++remoteReqSeq
   remoteLoading.value = true
   try {
@@ -258,6 +264,7 @@ async function invokeSide(
     const cmd = ({ mkdir: 'sftp_mkdir', create_file: 'sftp_create_file', rename: 'sftp_rename', remove: 'sftp_remove', copy: 'sftp_copy' } as const)[kind]
     const backendId = activeSession.value?.backendId
     if (!backendId) throw new Error('未连接')
+    if (sftpLocked.value) throw new Error('会话已锁定，请先解锁')
     await invoke(cmd, { sessionId: backendId, ...args })
   }
 }
@@ -458,6 +465,11 @@ function startTask(
   dir: 'up' | 'down', name: string, size: number,
   extra: { localPath: string; remotePath: string; cutSrc?: string },
 ) {
+  // 会话锁/应用锁：禁止新建传输（进行中的不中断，见拦截矩阵）
+  if (sftpLocked.value) {
+    toast('会话已锁定，请先解锁', 'warn')
+    return
+  }
   /* 仅在队列从空闲进入活动（首个任务）时自动展开；
      活动期间用户手动折叠后，后续入队保持折叠，进度看头部摘要 */
   const wasIdle = transfers.value.length === 0
@@ -477,6 +489,7 @@ function startTask(
 /** 空闲时取下一个排队任务启动（完成/失败回调中再次调用形成串行链）。
  *  单文件走真实 SFTP invoke，进度由后端 Channel 流式推送。 */
 async function pumpQueue() {
+  if (sftpLocked.value) return // 锁定期间排队任务不启动，解锁后由 watcher 续跑
   if (transfers.value.some(t => t.status === 'running')) return
   const t = transfers.value.find(x => x.status === 'pending')
   if (!t) return
@@ -569,6 +582,7 @@ async function pumpQueue() {
 
 /** 取消/移除任务：进行中的任务先通知后端取消，再出队启动下一个 */
 function removeTask(t: Transfer) {
+  if (sftpLocked.value) return
   if (t.status === 'running') {
     const backendId = activeSession.value?.backendId
     if (backendId) {
@@ -584,6 +598,7 @@ function removeTask(t: Transfer) {
 
 /** 暂停任务：通知后端暂停开关，invoke 仍挂起（保留串行槽位避免并发） */
 function pauseTask(t: Transfer) {
+  if (sftpLocked.value) return
   const backendId = activeSession.value?.backendId
   if (t.status === 'running') {
     if (backendId) {
@@ -600,6 +615,7 @@ function pauseTask(t: Transfer) {
 /** 继续任务：通知后端恢复并直接回到 running（invoke 仍在） */
 function resumeTask(t: Transfer) {
   if (t.status !== 'paused') return
+  if (sftpLocked.value) return
   const backendId = activeSession.value?.backendId
   if (backendId) {
     void invoke('sftp_transfer_pause', { sessionId: backendId, taskId: t.id, paused: false }).catch(() => {})
@@ -613,6 +629,7 @@ function resumeTask(t: Transfer) {
 /** 失败任务重试：进度归零、清错误后重新入队 */
 function retryTask(t: Transfer) {
   if (t.status !== 'error') return
+  if (sftpLocked.value) return
   t.pct = 0
   t.speed = 0
   t.error = undefined
@@ -622,6 +639,14 @@ function retryTask(t: Transfer) {
   })
   void pumpQueue()
 }
+
+// 解锁后续跑冻结期间滞留的排队任务（进行中的任务从未中断，无需恢复动作）
+watch(sftpLocked, locked => {
+  // 锁定瞬间关闭已打开的右键菜单：菜单 Teleport 到 body 且 z-index:9999，
+  // 会越过两级遮罩残留可点
+  if (locked) menu.value = null
+  else void pumpQueue()
+})
 /** 打开目录：上传完成 → 远程目录；下载完成 → 本地目录 */
 function openTaskDir(t: Transfer) {
   if (t.status !== 'success') return
@@ -823,6 +848,7 @@ function selectAll(side: Side) {
 
 /* ---- 右键事件：源头一次性写全坐标/侧/目标 ---- */
 function onRowContext(e: MouseEvent, side: Side, entry: FsEntry) {
+  if (sftpLocked.value) return
   lastSide.value = side
   const sel = sideSel(side)
   // 右键未选中项 → 仅选该项；右键已选中项 → 保持多选
@@ -830,6 +856,7 @@ function onRowContext(e: MouseEvent, side: Side, entry: FsEntry) {
   menu.value = { x: e.clientX, y: e.clientY, side, targets: selectedEntries(side) }
 }
 function onBlankContext(e: MouseEvent, side: Side) {
+  if (sftpLocked.value) return
   lastSide.value = side
   sideSel(side).value = new Set()
   menu.value = { x: e.clientX, y: e.clientY, side, targets: [] }
@@ -951,6 +978,7 @@ function syncShellCwd(path: string) {
 
 function onRowDblClick(side: Side, entry: FsEntry) {
   lastSide.value = side
+  if (side === 'remote' && sftpLocked.value) return // 锁定期：禁导航/禁双击下载
   const sel = side === 'local' ? localSelected : remoteSelected
   if (entry.type === 'dir') {
     sel.value = new Set()
@@ -971,6 +999,7 @@ function onRowDblClick(side: Side, entry: FsEntry) {
 function goUp(side: 'local' | 'remote') {
   if (side === 'local') void loadLocal(parentPath(localPath.value))
   else {
+    if (sftpLocked.value) return
     const next = parentPath(remotePath.value)
     void loadRemote(next)
     syncShellCwd(next)
@@ -979,6 +1008,7 @@ function goUp(side: 'local' | 'remote') {
 function gotoCrumb(side: 'local' | 'remote', path: string) {
   if (side === 'local') void loadLocal(path)
   else {
+    if (sftpLocked.value) return
     void loadRemote(path)
     syncShellCwd(path)
   }
@@ -1477,7 +1507,7 @@ onUnmounted(() => {
               SFTP · <span class="dock-badge" :class="{ off: !connected }">{{ connected ? activeHost?.id : '未连接' }}</span>
             </div>
             <div class="spacer"></div>
-            <button class="sftp-btn" title="刷新本地与远端目录" @click="refreshAll">
+            <button class="sftp-btn" title="刷新本地与远端目录" :disabled="sftpLocked" @click="refreshAll">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                    stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/>
@@ -1523,7 +1553,7 @@ onUnmounted(() => {
                 <span class="sep"></span>
                 <button class="pane-btn transfer-btn" :class="{ ready: localSel.length }"
                         :title="localSel.length ? `上传选中的 ${localSel.length} 个文件到远程` : '先在列表中选择文件'"
-                        :disabled="!localSel.length"
+                        :disabled="!localSel.length || sftpLocked"
                         @click="onUpload">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -1619,20 +1649,20 @@ onUnmounted(() => {
                     <span class="crumb" @click="gotoCrumb('remote', c.path)">{{ c.label }}</span>
                   </template>
                 </div>
-                <button class="pane-btn" title="上一级" :disabled="!connected" @click="goUp('remote')">
+                <button class="pane-btn" title="上一级" :disabled="!connected || sftpLocked" @click="goUp('remote')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
                     <path d="M19 12H5M12 19l-7-7 7-7"/>
                   </svg>
                 </button>
-                <button class="pane-btn" title="刷新" :disabled="!connected || remoteLoading"
+                <button class="pane-btn" title="刷新" :disabled="!connected || remoteLoading || sftpLocked"
                         @click="loadRemote(remotePath)">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/>
                   </svg>
                 </button>
-                <button class="pane-btn" title="新建文件夹" :disabled="!connected" @click="startEdit('remote', 'mkdir')">
+                <button class="pane-btn" title="新建文件夹" :disabled="!connected || sftpLocked" @click="startEdit('remote', 'mkdir')">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 7a2 2 0 012-2h3l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V7z"/>
@@ -1643,7 +1673,7 @@ onUnmounted(() => {
                 <span class="sep"></span>
                 <button class="pane-btn transfer-btn" :class="{ ready: remoteSel.length }"
                         :title="remoteSel.length ? `下载选中的 ${remoteSel.length} 个文件到本地` : '先在列表中选择文件'"
-                        :disabled="!remoteSel.length"
+                        :disabled="!remoteSel.length || sftpLocked"
                         @click="onDownload">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">

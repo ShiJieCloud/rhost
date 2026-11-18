@@ -8,11 +8,14 @@ import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager'
 import '@xterm/xterm/css/xterm.css'
 import AppLogo from '../AppLogo.vue'
 import ContextMenu, { type MenuItem } from './ContextMenu.vue'
+import SessionLockOverlay from './SessionLockOverlay.vue'
 import { toast } from '../../composables/useToast'
 import { registerTerm, unregisterTerm } from '../../lib/termRegistry'
 import { addToAiChat } from '../../stores/aiQuote'
 import { hosts, showNewConn } from '../../stores/hosts'
+import { appLocked } from '../../stores/appLock'
 import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
+import { accentColor, resolvedTheme, terminalPalette } from '../../styles/theme'
 import {
   activeReconnectAttempt, activeSession, activeSessionId, attachTerminal,
   autoReconnectDelayMs, detachTerminal, disconnectSession, openSession, reconnectBackend,
@@ -133,10 +136,19 @@ watch(pasteGuardOpen, open => {
   else window.removeEventListener('keydown', onPasteGuardKey, true)
 })
 
+/** 输入冻结判定：应用全局锁定 或 该会话被会话锁锁定。
+ *  键盘 onData 与粘贴 pasteWithGuard 两个写入点共用此断言。 */
+function isInputLocked(id: string): boolean {
+  if (appLocked.value) return true
+  return sessions.value.find(s => s.id === id)?.locked === true
+}
+
 /** 统一粘贴入口（快捷键事件 / 右键 paste 模式 / 菜单"粘贴"项共用）：
  *  开启保护且内容有风险时转确认弹窗，否则直接经 term.paste() 发送 */
 function pasteWithGuard(id: string, text: string) {
   if (!text) return
+  // 应用锁 / 会话锁冻结一切向终端的写入（遮罩已夺焦，此为断言兜底）
+  if (isInputLocked(id)) return
   if (savedSettings.pasteGuard && pasteNeedsGuard(text)) {
     pasteGuardText.value = text
     pasteGuardSession = id
@@ -157,6 +169,18 @@ function selectionText(term: Terminal): string {
 const termMenuOpen = ref(false)
 const termMenuPos = ref({ x: 0, y: 0 })
 const termMenuItems = ref<MenuItem[]>([])
+/** 当前菜单所属会话：该会话被会话锁锁定（或切走）时关闭已打开的菜单，
+ *  避免 z-index:9999 的菜单越过会话锁遮罩残留可点 */
+const termMenuSession = ref<string | null>(null)
+watch(
+  () => {
+    const id = termMenuSession.value
+    return id ? sessions.value.find(s => s.id === id)?.locked === true : false
+  },
+  locked => {
+    if (locked && termMenuOpen.value) termMenuOpen.value = false
+  },
+)
 
 const ICON_COPY = 'M9 9h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2V9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'
 const ICON_PASTE = 'M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'
@@ -186,8 +210,11 @@ function pasteFromClipboard(id: string) {
 
 /** 打开终端右键菜单（每次重建动作项，复制项随选区有无禁用） */
 function openTermMenu(id: string, x: number, y: number) {
+  // 应用锁 / 会话锁：不弹菜单（粘贴/清屏/全选/添加到 AI 均须冻结）
+  if (isInputLocked(id)) return
   const inst = termInsts.get(id)
   if (!inst) return
+  termMenuSession.value = id
   termMenuItems.value = [
     { label: '复制', icon: ICON_COPY, shortcut: '⌘C', disabled: !inst.term.hasSelection(), action: () => copySelection(id) },
     { label: '粘贴', icon: ICON_PASTE, shortcut: '⌘V', action: () => pasteFromClipboard(id) },
@@ -226,30 +253,13 @@ function resolveLineHeight(percent: number): number {
   return Math.max(1, percent / 100)
 }
 
-/** xterm 主题：与项目配色（--status-ok 等设计令牌）对齐 */
-const XTERM_THEME = {
-  background: '#00000000', // 透明，透出 .terminal 的背景渐变
-  foreground: '#e6edf3',
-  cursor: '#3fb950',
-  cursorAccent: '#0d1117',
-  selectionBackground: 'rgba(88, 166, 255, .28)',
-  black: '#484f58',
-  red: '#ff7b72',
-  green: '#3fb950',
-  yellow: '#f0883e',
-  blue: '#58a6ff',
-  magenta: '#bc8cff',
-  cyan: '#39c5cf',
-  white: '#b1bac4',
-  brightBlack: '#6e7681',
-  brightRed: '#ffa198',
-  brightGreen: '#56d364',
-  brightYellow: '#e3b341',
-  brightBlue: '#79c0ff',
-  brightMagenta: '#d2a8ff',
-  brightCyan: '#56d4dd',
-  brightWhite: '#f0f6fc',
-}
+/** xterm 主题：跟随应用明暗主题（配色定义见 styles/theme.ts） */
+const termTheme = () => terminalPalette()
+
+/** 明暗主题或强调色切换时同步所有活动终端的配色 */
+watch([resolvedTheme, accentColor], () => {
+  for (const { term } of termInsts.values()) term.options.theme = terminalPalette()
+})
 
 /** v-for 容器 ref 收集 */
 function setTermEl(id: string, el: Element | null) {
@@ -280,7 +290,7 @@ function mountTerminal(id: string) {
     scrollback: Math.max(0, Math.trunc(savedSettings.scrollback) || 0),
     allowTransparency: true,
     macOptionIsMeta: false,
-    theme: XTERM_THEME,
+    theme: termTheme(),
   })
   const fit = new FitAddon()
   term.loadAddon(fit)
@@ -300,7 +310,10 @@ function mountTerminal(id: string) {
   const screenEl: HTMLElement = term.element!
 
   // 键盘原始字节 → 后端 PTY（先绑定再 fit，fit 触发的尺寸事件也能被捕获）
-  term.onData(data => sendInput(id, data))
+  // 应用锁 / 会话锁锁定时丢弃全部按键（遮罩已夺焦，此为断言兜底）
+  term.onData(data => {
+    if (!isInputLocked(id)) sendInput(id, data)
+  })
   // xterm 尺寸变化（fit 计算出新行列）→ window-change 同步远端 PTY
   // 订阅挂在 term 上，term.dispose() 时自动回收，无监听泄漏
   term.onResize(({ cols, rows }) => resizeTerminal(id, cols, rows))
@@ -849,7 +862,10 @@ function dotClass(status: HostStatus) {
         v-show="s.id === activeSessionId"
         :ref="el => setTermEl(s.id, el as Element | null)"
         class="term-instance"
-      ></div>
+      >
+        <!-- 会话锁遮罩：absolute 覆盖终端区，锁定态遮住历史输出并冻结输入 -->
+        <SessionLockOverlay :session-id="s.id" />
+      </div>
     </div>
 
     <!-- ============ 连接/断线/重连/终态：统一用顶部状态条，全程不遮挡快照 ============ -->
@@ -1102,8 +1118,8 @@ function dotClass(status: HostStatus) {
   animation:rcb-pulse-blue 1.6s ease-in-out infinite;
 }
 @keyframes rcb-pulse-blue{
-  0%,100%{box-shadow:0 0 0 2px rgba(122,162,247,.15)}
-  50%{box-shadow:0 0 0 5px rgba(122,162,247,0)}
+  0%,100%{box-shadow:0 0 0 2px rgba(var(--info-rgb),.15)}
+  50%{box-shadow:0 0 0 5px rgba(var(--info-rgb),0)}
 }
 /* 离线终态：红色常亮，不再脉冲（自动流程已停止） */
 .p-offline .rcb-dot{
@@ -1113,7 +1129,7 @@ function dotClass(status: HostStatus) {
 }
 .rc-banner.ok .rcb-dot{
   background:var(--green);
-  box-shadow:0 0 0 2px rgba(61,220,132,.15);
+  box-shadow:0 0 0 2px rgba(var(--accent-rgb),.15);
   animation:none;
 }
 
@@ -1144,19 +1160,20 @@ function dotClass(status: HostStatus) {
   transition:background .15s,border-color .15s,box-shadow .15s;
 }
 .rcb-btn.primary{
-  background:linear-gradient(180deg,rgba(61,220,132,.17),rgba(61,220,132,.07));
-  border:1px solid rgba(61,220,132,.32);
-  color:var(--green);
+  background:var(--accent);
+  border:1px solid rgba(var(--accent-rgb),.32);
+  /* 文字必须用强调色上的对比色：此前用 --green 与背景同色，且不随主题明暗/强调色变化 */
+  color:var(--on-accent);
 }
 .rcb-btn.primary:hover{
-  background:linear-gradient(180deg,rgba(61,220,132,.26),rgba(61,220,132,.11));
-  border-color:rgba(61,220,132,.52);
-  box-shadow:0 0 12px rgba(61,220,132,.12);
+  background:var(--accent-hover);
+  border-color:rgba(var(--accent-rgb),.52);
+  box-shadow:0 0 12px rgba(var(--accent-rgb),.12);
 }
 .rcb-btn.ghost{
-  background:transparent;border:1px solid var(--border);color:var(--muted);
+  background:transparent;border:1px solid var(--border);color:var(--fg-muted);
 }
-.rcb-btn.ghost:hover{background:var(--hover);color:var(--text)}
+.rcb-btn.ghost:hover{background:var(--hover);color:var(--fg-strong)}
 .rcb-spin{
   width:10px;height:10px;border-radius:50%;
   border:2px solid rgba(255,158,100,.25);
@@ -1164,7 +1181,7 @@ function dotClass(status: HostStatus) {
   animation:rcb-rot .7s linear infinite;
 }
 .p-connecting .rcb-spin{
-  border-color:rgba(122,162,247,.25);border-top-color:var(--blue);
+  border-color:rgba(var(--info-rgb),.25);border-top-color:var(--blue);
 }
 @keyframes rcb-rot{to{transform:rotate(360deg)}}
 
@@ -1177,7 +1194,7 @@ function dotClass(status: HostStatus) {
 /* 退避倒计时：满→空线性收缩，时长=真实退避窗口（内联 animationDuration） */
 .rcb-bar .shrink{
   width:100%;
-  background:linear-gradient(90deg,var(--orange),var(--yellow));
+  background:var(--warning);
   animation-name:rcb-shrink;animation-timing-function:linear;animation-fill-mode:forwards;
 }
 @keyframes rcb-shrink{from{width:100%}to{width:0%}}
@@ -1207,13 +1224,13 @@ function dotClass(status: HostStatus) {
 .tp-paste-modal{width:440px;max-width:calc(100vw - 48px);height:auto}
 .tp-paste-modal .modal-head{padding:12px 18px}
 .tp-paste-modal .modal-foot{padding:10px 18px}
-.tp-paste-icon{color:#f0883e}
+.tp-paste-icon{color:var(--orange)}
 .tp-paste-body{padding:10px 18px 12px}
-.tp-paste-label{font-size:12px;color:var(--text-dim,#8b949e);margin-bottom:6px}
+.tp-paste-label{font-size:12px;color:var(--text-dim,var(--fg-muted));margin-bottom:6px}
 .tp-paste-preview{
   margin:0;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;
   background:rgba(110,118,129,.12);border:1px solid rgba(110,118,129,.25);
   border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.55;
-  font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;color:#e6edf3;
+  font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;color:var(--fg-strong);
 }
 </style>

@@ -17,6 +17,35 @@ export function unregisterTerm(sessionId: string) {
   terms.delete(sessionId)
 }
 
+/** 夺走全部终端焦点（应用锁屏时调用，防止遮罩盖住后按键仍走 onData） */
+export function blurAllTerms() {
+  for (const t of terms.values()) {
+    try {
+      t.blur()
+    } catch {
+      // 忽略已销毁实例
+    }
+  }
+}
+
+/** 夺走指定会话终端焦点（会话上锁时调用） */
+export function blurTerm(sessionId: string) {
+  try {
+    terms.get(sessionId)?.blur()
+  } catch {
+    // 实例尚未挂载时忽略
+  }
+}
+
+/** 聚焦指定会话终端（解锁后恢复输入） */
+export function focusTerm(sessionId: string) {
+  try {
+    terms.get(sessionId)?.focus()
+  } catch {
+    // 实例尚未挂载时忽略
+  }
+}
+
 /** 默认采集行数：约一屏，覆盖报错现场又不至于撑爆上下文 */
 const DEFAULT_LINES = 30
 /** 采集字符上限：防止全屏 TUI 残留/超长单行刷爆请求体（约 2k token） */

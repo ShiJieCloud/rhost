@@ -3,12 +3,12 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { toast } from '../../composables/useToast'
 import {
   METRICS_HEARTBEAT_MS, activeHost, activeHostInfo, activeMetrics, activeNetHist,
-  activeReconnectAttempt, activeSession, appView,
-  connected, disconnectSession, metricsHeartbeat, openDock, openSession, recentConnections, reconnectTick, rightPanelTab, rightPanelVisible,
+  activeReconnectAttempt, activeSession,
+  connected, disconnectSession, metricsHeartbeat, openDock, reconnectTick, rightPanelTab, rightPanelVisible,
   startMetrics, stopMetrics,
 } from '../../stores/session'
 import { savedSettings } from '../../stores/settings'
-import { hosts } from '../../stores/hosts'
+import { appLocked } from '../../stores/appLock'
 
 /* ---------- 会话时长计时 ---------- */
 const uptime = ref('00:00:00')
@@ -70,18 +70,6 @@ const stateDotVar = computed(() => {
     default: return 'var(--rhost-status-idle)'
   }
 })
-
-/* ---------- 首页模式：历史会话列表（数据源为 recentConnections，模板直接渲染） ---------- */
-const isHome = computed(() => appView.value === 'home')
-
-/** 点击历史会话：主机已被删除时仅提示，保留记录 */
-function onRecentClick(r: { hostId: string }) {
-  if (!hosts.value.some(h => h.id === r.hostId)) {
-    toast('主机已删除', 'warn')
-    return
-  }
-  openSession(r.hostId)
-}
 
 /* ---------- 主机地址（带复制） ---------- */
 const hostLabel = computed(() => activeSession.value?.host.id ?? '—')
@@ -265,6 +253,8 @@ const docVisible = ref(typeof document === 'undefined' ? true : document.visibil
 const metricsTarget = computed<{ id: string; iface: string | null; intervalMs: number } | null>(() => {
   const s = activeSession.value
   if (!s || s.state !== 'online' || !s.backendId) return null
+  // 两级锁门控：应用锁定全停；激活会话被锁时停该会话采集，切到未锁会话自动恢复（设计 §6.6）
+  if (appLocked.value || s.locked) return null
   if (!autoRefresh.value || !rightPanelVisible.value || !panelVisible.value || !docVisible.value) {
     return null
   }
@@ -354,8 +344,10 @@ async function onDisconnect() {
 
 <template>
   <aside ref="rootEl" class="ri-root">
-    <!-- 操作按钮注入 RightPanel 头部（仅工作台模式且当前为监控页签） -->
-    <Teleport v-if="!isHome && rightPanelTab === 'monitor'" to="#rp-head-actions">
+    <!-- 操作按钮注入 RightPanel 头部（当前为监控页签时）。
+         defer：首页不再挂载右侧栏，进入工作台时本组件与目标同批挂载，
+         目标元素要等本轮渲染结束才进入 document，需延后解析 -->
+    <Teleport v-if="rightPanelTab === 'monitor'" defer to="#rp-head-actions">
       <button class="ri-icon-btn" title="重新连接" @click="onReconnect">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -390,25 +382,6 @@ async function onDisconnect() {
 
     <!-- 滚动内容 -->
     <div class="ri-body">
-      <!-- 首页模式：历史会话列表（最近成功连接的主机，含已关闭，点击快速重连） -->
-      <template v-if="isHome">
-        <div class="ri-home-summary">
-          <div v-if="recentConnections.length === 0" class="ri-home-empty">暂无历史会话</div>
-          <button
-            v-for="r in recentConnections"
-            :key="r.hostId"
-            class="ri-home-item"
-            :title="`连接到 ${r.name}`"
-            @click="onRecentClick(r)"
-          >
-            <span class="ri-home-name">{{ r.name }}</span>
-            <span class="ri-home-addr">{{ r.user }}@{{ r.ip }}:{{ r.port }}</span>
-          </button>
-        </div>
-      </template>
-
-      <!-- 工作台模式：单会话详情 -->
-      <template v-else>
       <!-- 连接状态：扁平信息网格 -->
       <div class="ri-conn">
         <div class="ri-conn-grid">
@@ -648,7 +621,6 @@ async function onDisconnect() {
           </div>
         </div>
       </section>
-      </template>
     </div>
   </aside>
 </template>
@@ -662,57 +634,6 @@ async function onDisconnect() {
   height: 100%;
   padding: 0;
   overflow: hidden;
-}
-
-/* ============ 首页历史会话列表 ============ */
-.ri-home-summary {
-  margin: 4px 0 2px;
-}
-.ri-home-empty {
-  font-size: 11.5px;
-  color: var(--muted);
-  padding: 12px 0;
-  text-align: center;
-}
-.ri-home-item {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  background: transparent;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-  text-align: left;
-}
-.ri-home-item:hover {
-  background: var(--panel-2);
-  border-color: var(--border);
-}
-.ri-home-name {
-  width: 100%;
-  font-size: 12px;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ri-home-addr {
-  width: 100%;
-  font-size: 11px;
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ri-home-state {
-  font-size: 11px;
-  color: var(--muted-2);
-  flex-shrink: 0;
 }
 
 /* ============ 头部 ============ */
@@ -761,9 +682,8 @@ async function onDisconnect() {
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .ri-icon-btn:hover {
-  background: var(--panel-2);
-  border-color: var(--border);
-  color: var(--text);
+  background: var(--hover);
+  color: var(--fg-strong);
 }
 .ri-icon-btn:active {
   transform: scale(0.94);
@@ -774,9 +694,10 @@ async function onDisconnect() {
   color: var(--red);
 }
 
-/* 自动刷新开关：开启=品牌绿+持续旋转，关闭=与普通按钮一致 */
+/* 自动刷新开关：开启=主色填充+持续旋转，关闭=与普通按钮一致 */
 .ri-toggle.on {
-  color: var(--green);
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.14);
 }
 .ri-toggle.on svg {
   transform-origin: 50% 50%;
@@ -809,12 +730,12 @@ async function onDisconnect() {
   width: 8px;
 }
 .ri-body::-webkit-scrollbar-thumb {
-  background: #1c2836;
+  background: var(--border-strong);
   border-radius: 4px;
   border: 2px solid var(--panel);
 }
 .ri-body::-webkit-scrollbar-thumb:hover {
-  background: #2a3a4d;
+  background: var(--border-strong);
 }
 
 /* ============ 连接状态卡片 ============ */
@@ -858,7 +779,7 @@ async function onDisconnect() {
 .ri-value.ri-host {
   font-size: 13.5px;
   font-weight: 600;
-  color: #fff;
+  color: var(--fg-strong);
 }
 .ri-value.st-ok {
   display: flex;
@@ -1033,7 +954,7 @@ async function onDisconnect() {
 .ri-meter {
   height: 6px;
   border-radius: 3px;
-  background: #1a222c;
+  background: var(--bg-elev);
   overflow: hidden;
 }
 .ri-meter > i {

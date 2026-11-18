@@ -23,12 +23,11 @@
       .splash-active body{background:transparent}
       .splash-active #app{visibility:hidden}
       /* 深色底模式（设置关闭透明）：html.splash-solid 特异度 (0,1,2) 覆盖 .splash-active body */
-      html.splash-solid,html.splash-solid body{background:#06090d}
+      html.splash-solid,html.splash-solid body{background:#191a1c}
       /* LOGO 悬浮层自身无任何背景 */
       #splash{position:fixed;inset:0;z-index:99999;pointer-events:none;
         display:flex;align-items:center;justify-content:center;
-        font-family:'JetBrains Mono','Cascadia Code','SF Mono',ui-monospace,
-        Menlo,Consolas,'Courier New',monospace;
+        font-family:'Inter Variable',Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
         transition:opacity .25s ease-out}
       #splash.splash--done{opacity:0;pointer-events:none}
       /* 上移偏移放在 LOGO 自身（keyframes 两帧都要带，缺帧会导致位移渐变丢失），
@@ -36,9 +35,7 @@
       .splash-mark{position:relative;width:96px;height:96px;color:#3ddc84;
         transform:translateY(-4vh);
         animation:splash-breathe 2s ease-in-out infinite alternate}
-      .splash-glow{position:absolute;inset:-70%;border-radius:50%;opacity:.35;
-        background:radial-gradient(circle,rgba(61,220,132,.28),transparent 70%);
-        animation:splash-glow 2s ease-in-out infinite alternate}
+      .splash-glow{display:none}
       .splash-logo{position:relative;width:100%;height:100%;display:block}
       @keyframes splash-breathe{
         from{transform:translateY(-4vh) scale(1)}

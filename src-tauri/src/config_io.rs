@@ -954,6 +954,34 @@ mod tests {
     }
 
     #[test]
+    fn export_never_carries_lock_credentials() {
+        // 设计 app-lock-design.md §6.1/§8：锁密码哈希存独立 lock.json，
+        // assemble_export 不接收该文件；settings 仅可携带开关偏好。
+        let cfg = AppConfigFile::default(); // settings 为内置默认（含 appLock* 开关）
+        let doc = assemble_export(
+            &[],
+            &cfg,
+            ExportScope::Full,
+            true,
+            true,
+            "1.0.0",
+            "ts",
+            "h",
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&doc.json).unwrap();
+        let s = &v["data"]["settings"];
+        assert_eq!(s["appLockEnabled"], false); // 开关偏好允许导出
+        assert_eq!(s["appLockIdleSec"], 300);
+        // 任何哈希材料 / 锁文件名均不得出现在导出产物中
+        for forbidden in ["salt", "hash", "iters", "lockPassword", "appPassword", "sessionPassword"] {
+            assert!(s.get(forbidden).is_none(), "settings 不得携带 {forbidden}");
+        }
+        assert!(!doc.json.contains("lock.json"));
+        assert!(!doc.json.contains("corrupt-"));
+    }
+
+    #[test]
     fn import_ignores_ai_settings() {
         let mut existing = AppConfigFile::default();
         existing.settings = serde_json::json!({

@@ -186,8 +186,8 @@ function gotoRuleEditor() {
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
-.tnl-title { font-size: 12px; font-weight: 600; color: var(--text, #dbe4f0); }
-.tnl-count { font-size: 11px; color: var(--dim, #7d8aa0); }
+.tnl-title { font-size: 12px; font-weight: 600; color: var(--fg); }
+.tnl-count { font-size: 11px; color: var(--fg-muted); }
 .spacer { flex: 1; }
 .tnl-bar-btn {
   flex: none;
@@ -196,7 +196,7 @@ function gotoRuleEditor() {
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: transparent;
-  color: var(--text, #dbe4f0);
+  color: var(--fg);
   cursor: pointer;
 }
 .tnl-bar-btn:hover { background: rgba(255, 255, 255, 0.07); }
@@ -210,7 +210,7 @@ function gotoRuleEditor() {
 .tnl-group { margin-bottom: 10px; }
 .tnl-group-label {
   font-size: 11px;
-  color: var(--dim, #7d8aa0);
+  color: var(--fg-muted);
   margin: 6px 0 4px;
 }
 .tnl-row {
@@ -229,9 +229,9 @@ function gotoRuleEditor() {
   border-radius: 50%;
 }
 .dot-active { background: var(--green, #3ddc84); }
-.dot-starting { background: #e8c34a; animation: tnl-pulse 1.1s ease-in-out infinite; }
-.dot-error { background: #ef5b58; }
-.dot-stopped { background: #55606f; }
+.dot-starting { background: var(--warning); animation: tnl-pulse 1.1s ease-in-out infinite; }
+.dot-error { background: var(--danger); }
+.dot-stopped { background: var(--fg-faint); }
 @keyframes tnl-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -243,7 +243,7 @@ function gotoRuleEditor() {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-  color: var(--text, #dbe4f0);
+  color: var(--fg);
 }
 .tnl-ep {
   flex: 1;
@@ -253,13 +253,13 @@ function gotoRuleEditor() {
   white-space: nowrap;
   font-size: 11px;
   font-family: var(--mono, monospace);
-  color: var(--dim, #7d8aa0);
+  color: var(--fg-muted);
 }
 .tnl-traffic {
   flex: none;
   font-size: 11px;
   font-family: var(--mono, monospace);
-  color: var(--dim, #7d8aa0);
+  color: var(--fg-muted);
 }
 .tnl-state {
   flex: none;
@@ -268,10 +268,10 @@ function gotoRuleEditor() {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
-  color: var(--dim, #7d8aa0);
+  color: var(--fg-muted);
 }
 .tnl-state.act { color: var(--green, #3ddc84); }
-.tnl-state.err { color: #ef5b58; }
+.tnl-state.err { color: var(--danger); }
 .tnl-row .st-switch { margin-left: 4px; }
 
 .tnl-empty {
@@ -281,7 +281,7 @@ function gotoRuleEditor() {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  color: var(--dim, #7d8aa0);
+  color: var(--fg-muted);
   font-size: 12px;
 }
 .tnl-empty-btn {
@@ -290,7 +290,7 @@ function gotoRuleEditor() {
   border-radius: 7px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: transparent;
-  color: var(--text, #dbe4f0);
+  color: var(--fg);
   cursor: pointer;
 }
 .tnl-empty-btn:hover { background: rgba(255, 255, 255, 0.07); }
