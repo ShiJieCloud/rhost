@@ -1,31 +1,25 @@
 <script setup lang="ts">
 /**
- * 锁密码管理编辑器（设置 → 安全；app-lock-design.md §6.3）。
+ * 应用锁密码管理编辑器（设置 → 安全；app-lock-design.md §6.3）。
  *
  * 折叠态显示密码槽位状态 + 「设置 / 修改 / 清除」按钮；展开后行内表单：
  * - 首次设置：新密码 + 确认密码（oldPassword 传 null）
  * - 修改：旧密码 + 新密码 + 确认
  * - 清除：走全局密码弹窗验证后调 lock_clear_password
- * 成功后 refreshLockSlots() 同步槽位，标签锁 / 应用锁入口即时出现。
+ * 成功后 refreshLockSlots() 同步槽位，应用锁入口即时出现。
  */
 import { computed, ref } from 'vue'
-import { lockSetPassword, lockClearPassword, type LockKind } from '../lib/lock'
+import { lockSetPassword, lockClearPassword } from '../lib/lock'
 import { lockSlots, refreshLockSlots } from '../stores/appLock'
 import { toast } from '../composables/useToast'
 import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmDialog } from '../composables/useConfirm'
 import { isTauri } from '../lib/tauri'
 
-const props = defineProps<{ kind: LockKind }>()
-
-/** 密码槽位清除成功后发出：父级负责收回依赖该槽位的开关并解除受影响的会话锁，
- *  避免「槽位已消失但 locked 仍在」的永久死锁 */
+/** 密码槽位清除成功后发出：父级负责同步收回应用锁总开关，避免半启用态 */
 const emit = defineEmits<{ cleared: [] }>()
 
-const passwordSet = computed(() =>
-  props.kind === 'app' ? lockSlots.value.appPasswordSet : lockSlots.value.sessionPasswordSet,
-)
-const kindLabel = computed(() => (props.kind === 'app' ? '应用锁' : '会话锁'))
+const passwordSet = computed(() => lockSlots.value.appPasswordSet)
 
 const PWD_MIN = 6
 const PWD_MAX = 128
@@ -68,13 +62,9 @@ async function submit() {
   if (!validate()) return
   busy.value = true
   try {
-    await lockSetPassword(
-      props.kind,
-      newPwd.value,
-      mode.value === 'change' ? oldPwd.value : null,
-    )
+    await lockSetPassword(newPwd.value, mode.value === 'change' ? oldPwd.value : null)
     await refreshLockSlots()
-    toast(`${kindLabel.value}密码已${mode.value === 'change' ? '修改' : '设置'}`, 'ok', 2000)
+    toast(`应用锁密码已${mode.value === 'change' ? '修改' : '设置'}`, 'ok', 2000)
     reset()
   } catch (e) {
     error.value = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
@@ -85,22 +75,22 @@ async function submit() {
 
 async function clearPwd() {
   const ok = await confirmDialog(
-    `清除后${kindLabel.value}将不再受密码保护，需重新设置密码后才能再次使用。确认清除？`,
-    `清除${kindLabel.value}密码`,
+    '清除后应用锁将不再受密码保护，需重新设置密码后才能再次使用。确认清除？',
+    '清除应用锁密码',
     { confirmText: '去验证密码', danger: true },
   )
   if (!ok) return
   const pwd = await promptPassword(
-    `清除${kindLabel.value}密码需要验证当前密码`,
+    '清除应用锁密码需要验证当前密码',
     '验证密码',
     '输入当前密码',
   )
   if (pwd == null) return
   busy.value = true
   try {
-    await lockClearPassword(props.kind, pwd)
+    await lockClearPassword(pwd)
     await refreshLockSlots()
-    toast(`${kindLabel.value}密码已清除`, 'ok', 2000)
+    toast('应用锁密码已清除', 'ok', 2000)
     emit('cleared')
   } catch (e) {
     toast(typeof e === 'string' ? e : (e as Error)?.message ?? String(e), 'warn', 3000)

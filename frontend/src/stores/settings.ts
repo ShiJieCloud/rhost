@@ -79,14 +79,12 @@ export interface AppSettings {
   /** 内存告警阈值（MB）：主进程 RSS 持续超过该值时状态栏告警 */
   memAlertMb: number
   /* ---- 安全（应用锁 / 会话锁；密码哈希存后端独立 lock.json，不在配置文件中） ---- */
-  /** 应用锁总开关；置 true 前必须已设置应用锁密码 */
+  /** 应用锁总开关；置 true 前必须已设置应用锁密码。关闭仅停用锁屏，不清除密码 */
   appLockEnabled: boolean
   /** 无操作自动锁屏秒数，取值必须 ∈ APP_LOCK_IDLE_OPTIONS；0 = 关闭 */
   appLockIdleSec: number
   /** 窗口失焦即锁屏 */
   appLockLockOnBlur: boolean
-  /** 会话锁复用应用锁密码验证（默认关闭，关闭时使用独立会话锁密码） */
-  sessionLockUseAppPassword: boolean
   /* ---- AI 助手 ---- */
   /** AI 功能总开关：关闭后右侧栏隐藏 AI 入口 */
   aiEnabled: boolean
@@ -240,7 +238,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   appLockEnabled: false,
   appLockIdleSec: 300,
   appLockLockOnBlur: false,
-  sessionLockUseAppPassword: false,
 
   aiEnabled: true,
   aiProvider: 'custom',
@@ -323,7 +320,6 @@ function applySettingsSection(section: Record<string, unknown>) {
   savedSettings.appLockEnabled = section.appLockEnabled === true
   savedSettings.appLockIdleSec = normalizeAppLockIdleSec(section.appLockIdleSec)
   savedSettings.appLockLockOnBlur = section.appLockLockOnBlur === true
-  savedSettings.sessionLockUseAppPassword = section.sessionLockUseAppPassword === true
 }
 
 /** logs 节字段（磁盘 snake_case，与后端 LogsSection 序列化一致）→ savedSettings 的 log* 字段；

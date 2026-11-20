@@ -1,10 +1,10 @@
-//! 应用锁 / 会话锁凭据存储与验证（docs/explanation/design/app-lock-design.md）。
+//! 应用锁凭据存储与验证（docs/explanation/design/app-lock-design.md）。
 //!
 //! 方案：
 //! - 锁密码不可恢复，`PBKDF2-HMAC-SHA256`（210000 轮，复用
 //!   [`crate::config_crypto::KDF_ITERS`]）派生 32B 哈希，与 16B 随机 salt
 //!   一起存入独立文件 `<app_config_dir>/lock.json`；
-//! - 文件分 `app` / `session` 两个槽位，`null` 表示该类锁未设置密码；
+//! - 文件只有一个 `app` 槽位，`null` 表示未设置密码；
 //! - 凭据**不进** `app_config.json`，因此天然不参与配置导入导出；
 //! - 连续验证失败限速：每 5 次失败冷却 30s 起指数翻倍、300s 封顶；
 //! - 密码只以 `Zeroizing<String>` 存在于命令调用栈，不落日志。
@@ -63,8 +63,6 @@ struct LockFile {
     version: u32,
     #[serde(default)]
     app: Option<HashEntry>,
-    #[serde(default)]
-    session: Option<HashEntry>,
 }
 
 impl Default for LockFile {
@@ -72,7 +70,6 @@ impl Default for LockFile {
         Self {
             version: LOCK_FILE_VERSION,
             app: None,
-            session: None,
         }
     }
 }
@@ -102,7 +99,7 @@ fn lock_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
 
 /// 读取 lock.json。
 ///
-/// - 文件不存在：返回默认（两槽位均空）；
+/// - 文件不存在：返回默认（槽位空）；
 /// - 文件损坏（解析失败 / 字段非法）：改名为 `lock.json.corrupt-<unix_ms>`
 ///   隔离，返回默认，由调用方按「未设置」继续（设计 §6.1 降级）。
 ///
@@ -114,9 +111,7 @@ fn load_lock_file(path: &std::path::Path) -> (LockFile, bool) {
     };
     let parsed: Result<LockFile, _> = serde_json::from_str(&raw);
     let file = match parsed {
-        Ok(f) if f.version == LOCK_FILE_VERSION && f.app.as_ref().map_or(true, HashEntry::valid)
-            && f.session.as_ref().map_or(true, HashEntry::valid) =>
-        {
+        Ok(f) if f.version == LOCK_FILE_VERSION && f.app.as_ref().map_or(true, HashEntry::valid) => {
             f
         }
         _ => {
@@ -238,11 +233,11 @@ fn backoff_secs(batch: u32) -> u64 {
 /// 执行一次带限速的密码验证，调用方必须持 `LockState` 锁。
 fn verify_locked(
     map: &mut HashMap<&'static str, FailState>,
-    kind: &'static str,
     slot: Option<&HashEntry>,
     password: &str,
 ) -> VerifyOutcome {
-    let st = map.entry(kind).or_default();
+    const KIND: &str = "app";
+    let st = map.entry(KIND).or_default();
 
     if let Some(until) = st.until {
         if let Some(secs) = until.checked_duration_since(Instant::now()) {
@@ -275,54 +270,10 @@ fn verify_locked(
 }
 
 /* =========================================================
- *  锁类型
- * ========================================================= */
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LockKind {
-    App,
-    Session,
-}
-
-impl LockKind {
-    fn key(self) -> &'static str {
-        match self {
-            LockKind::App => "app",
-            LockKind::Session => "session",
-        }
-    }
-
-    fn slot<'a>(self, file: &'a LockFile) -> Option<&'a HashEntry> {
-        match self {
-            LockKind::App => file.app.as_ref(),
-            LockKind::Session => file.session.as_ref(),
-        }
-    }
-
-    fn set_slot(self, file: &mut LockFile, entry: Option<HashEntry>) {
-        match self {
-            LockKind::App => file.app = entry,
-            LockKind::Session => file.session = entry,
-        }
-    }
-}
-
-impl TryFrom<&str> for LockKind {
-    type Error = String;
-    fn try_from(v: &str) -> Result<Self, String> {
-        match v {
-            "app" => Ok(LockKind::App),
-            "session" => Ok(LockKind::Session),
-            other => Err(format!("未知的锁类型: {other}")),
-        }
-    }
-}
-
-/* =========================================================
  *  applog
  * ========================================================= */
 
-fn log_verify(kind: &str, outcome: &VerifyOutcome) {
+fn log_verify(outcome: &VerifyOutcome) {
     let (ok, backoff) = match outcome {
         VerifyOutcome::Ok => (true, false),
         VerifyOutcome::BadPassword { .. } => (false, false),
@@ -334,7 +285,7 @@ fn log_verify(kind: &str, outcome: &VerifyOutcome) {
         "lock.verify",
         None,
         "锁密码验证",
-        Some(serde_json::json!({ "kind": kind, "ok": ok, "backoff": backoff })),
+        Some(serde_json::json!({ "ok": ok, "backoff": backoff })),
     );
 }
 
@@ -346,24 +297,22 @@ fn log_verify(kind: &str, outcome: &VerifyOutcome) {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LockStatusPayload {
     app_password_set: bool,
-    session_password_set: bool,
     /// 本次读取是否发生了 lock.json 损坏隔离（前端用于告警文案）
     file_corrupted: bool,
 }
 
-/// 查询两级锁是否已设置密码（只返回布尔，不返回任何哈希材料）。
+/// 查询应用锁是否已设置密码（只返回布尔，不返回任何哈希材料）。
 #[tauri::command]
 pub fn lock_status(app: AppHandle) -> Result<LockStatusPayload, String> {
     let path = lock_path(&app)?;
     let (file, corrupted) = load_lock_file(&path);
     Ok(LockStatusPayload {
         app_password_set: file.app.is_some(),
-        session_password_set: file.session.is_some(),
         file_corrupted: corrupted,
     })
 }
 
-/// 设置 / 修改锁密码。
+/// 设置 / 修改应用锁密码。
 ///
 /// 槽位为空时 `oldPassword` 必须为 null（首次设置）；槽位已有密码时必须传
 /// 正确旧密码，旧密码验证同样受限速约束。
@@ -371,11 +320,9 @@ pub fn lock_status(app: AppHandle) -> Result<LockStatusPayload, String> {
 pub fn lock_set_password(
     app: AppHandle,
     state: State<'_, LockState>,
-    kind: String,
     password: String,
     old_password: Option<String>,
 ) -> Result<(), String> {
-    let kind = LockKind::try_from(kind.as_str())?;
     let password = Zeroizing::new(password);
     if !valid_password_len(&password) {
         return Err(format!(
@@ -387,11 +334,11 @@ pub fn lock_set_password(
     let mut map = state.inner.lock().map_err(|e| format!("锁状态锁中毒: {e}"))?;
     let (mut file, _) = load_lock_file(&path);
 
-    if kind.slot(&file).is_some() {
+    if file.app.is_some() {
         // 修改密码：必须验证旧密码（与解锁共用限速通道）
         let old = Zeroizing::new(old_password.unwrap_or_default());
-        let outcome = verify_locked(&mut map, kind.key(), kind.slot(&file), &old);
-        log_verify(kind.key(), &outcome);
+        let outcome = verify_locked(&mut map, file.app.as_ref(), &old);
+        log_verify(&outcome);
         match outcome {
             VerifyOutcome::Ok => {}
             VerifyOutcome::BadPassword { .. } => return Err("原密码错误".to_string()),
@@ -402,27 +349,25 @@ pub fn lock_set_password(
     }
 
     let entry = new_entry(&password)?;
-    kind.set_slot(&mut file, Some(entry));
+    file.app = Some(entry);
     save_lock_file(&path, &file)
 }
 
-/// 验证密码（解锁）。失败计入限速；冷却期不执行 KDF。
+/// 验证应用锁密码（解锁）。失败计入限速；冷却期不执行 KDF。
 #[tauri::command]
 pub fn lock_unlock(
     app: AppHandle,
     state: State<'_, LockState>,
-    kind: String,
     password: String,
 ) -> Result<(), String> {
-    let kind = LockKind::try_from(kind.as_str())?;
     let password = Zeroizing::new(password);
 
     let path = lock_path(&app)?;
     let mut map = state.inner.lock().map_err(|e| format!("锁状态锁中毒: {e}"))?;
     let (file, _) = load_lock_file(&path);
 
-    let outcome = verify_locked(&mut map, kind.key(), kind.slot(&file), &password);
-    log_verify(kind.key(), &outcome);
+    let outcome = verify_locked(&mut map, file.app.as_ref(), &password);
+    log_verify(&outcome);
     match outcome {
         VerifyOutcome::Ok => Ok(()),
         VerifyOutcome::BadPassword { remaining } => {
@@ -434,27 +379,25 @@ pub fn lock_unlock(
     }
 }
 
-/// 清除锁密码（关闭锁）。清除前必须验证当前密码。
+/// 清除应用锁密码（关闭锁）。清除前必须验证当前密码。
 #[tauri::command]
 pub fn lock_clear_password(
     app: AppHandle,
     state: State<'_, LockState>,
-    kind: String,
     password: String,
 ) -> Result<(), String> {
-    let kind = LockKind::try_from(kind.as_str())?;
     let password = Zeroizing::new(password);
 
     let path = lock_path(&app)?;
     let mut map = state.inner.lock().map_err(|e| format!("锁状态锁中毒: {e}"))?;
     let (mut file, _) = load_lock_file(&path);
 
-    if kind.slot(&file).is_none() {
+    if file.app.is_none() {
         // 槽位本就为空：幂等成功
         return Ok(());
     }
-    let outcome = verify_locked(&mut map, kind.key(), kind.slot(&file), &password);
-    log_verify(kind.key(), &outcome);
+    let outcome = verify_locked(&mut map, file.app.as_ref(), &password);
+    log_verify(&outcome);
     match outcome {
         VerifyOutcome::Ok => {}
         VerifyOutcome::BadPassword { remaining } => {
@@ -464,7 +407,7 @@ pub fn lock_clear_password(
             return Err(format!("尝试过于频繁，请在 {secs} 秒后重试"));
         }
     }
-    kind.set_slot(&mut file, None);
+    file.app = None;
     save_lock_file(&path, &file)
 }
 
@@ -535,13 +478,13 @@ mod tests {
 
         for _ in 0..3 {
             assert!(matches!(
-                verify_locked(&mut map, "app", Some(&e), "bad"),
+                verify_locked(&mut map, Some(&e), "bad"),
                 VerifyOutcome::BadPassword { .. }
             ));
         }
-        assert_eq!(verify_locked(&mut map, "app", Some(&e), "pw-1234"), VerifyOutcome::Ok);
+        assert_eq!(verify_locked(&mut map, Some(&e), "pw-1234"), VerifyOutcome::Ok);
         // 清零后重新给 4 次错误额度
-        match verify_locked(&mut map, "app", Some(&e), "bad") {
+        match verify_locked(&mut map, Some(&e), "bad") {
             VerifyOutcome::BadPassword { remaining } => assert_eq!(remaining, 4),
             other => panic!("应为 BadPassword，实际 {other:?}"),
         }
@@ -553,26 +496,26 @@ mod tests {
         let e = entry_for("pw-1234");
 
         for i in 1..=4u32 {
-            match verify_locked(&mut map, "app", Some(&e), "bad") {
+            match verify_locked(&mut map, Some(&e), "bad") {
                 VerifyOutcome::BadPassword { remaining } => assert_eq!(remaining, 5 - i),
                 other => panic!("第 {i} 次应为 BadPassword，实际 {other:?}"),
             }
         }
         // 第 5 次直接进入冷却，且不消耗尝试额度文案
-        match verify_locked(&mut map, "app", Some(&e), "bad") {
+        match verify_locked(&mut map, Some(&e), "bad") {
             VerifyOutcome::Backoff { secs } => assert_eq!(secs, 30),
             other => panic!("第 5 次应为 Backoff，实际 {other:?}"),
         }
         // 冷却期即使密码正确也拒绝
         assert!(matches!(
-            verify_locked(&mut map, "app", Some(&e), "pw-1234"),
+            verify_locked(&mut map, Some(&e), "pw-1234"),
             VerifyOutcome::Backoff { .. }
         ));
 
         // 手动制造冷却已过期
         map.get_mut("app").unwrap().until = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(
-            verify_locked(&mut map, "app", Some(&e), "pw-1234"),
+            verify_locked(&mut map, Some(&e), "pw-1234"),
             VerifyOutcome::Ok
         );
     }
@@ -583,17 +526,17 @@ mod tests {
         let e = entry_for("pw-1234");
         // 第一批 5 次 → 30s 冷却，令其过期
         for _ in 0..5 {
-            let _ = verify_locked(&mut map, "app", Some(&e), "bad");
+            let _ = verify_locked(&mut map, Some(&e), "bad");
         }
         map.get_mut("app").unwrap().until = Some(Instant::now() - Duration::from_secs(1));
         // 第二批再 5 次 → 60s
         for _ in 0..4 {
             assert!(matches!(
-                verify_locked(&mut map, "app", Some(&e), "bad"),
+                verify_locked(&mut map, Some(&e), "bad"),
                 VerifyOutcome::BadPassword { .. }
             ));
         }
-        match verify_locked(&mut map, "app", Some(&e), "bad") {
+        match verify_locked(&mut map, Some(&e), "bad") {
             VerifyOutcome::Backoff { secs } => assert_eq!(secs, 60),
             other => panic!("第二批应为 60s Backoff，实际 {other:?}"),
         }
@@ -604,7 +547,7 @@ mod tests {
         let mut map: HashMap<&'static str, FailState> = HashMap::new();
         // 槽位 None：任何密码（含空串）都按失败计入限速
         assert!(matches!(
-            verify_locked(&mut map, "session", None, "anything"),
+            verify_locked(&mut map, None, "anything"),
             VerifyOutcome::BadPassword { .. }
         ));
     }
@@ -614,7 +557,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rhost-lock-nonexistent-{}.json", Uuid::new_v4()));
         let (f, corrupted) = load_lock_file(&p);
         assert!(!corrupted);
-        assert!(f.app.is_none() && f.session.is_none());
+        assert!(f.app.is_none());
     }
 
     #[test]
@@ -622,13 +565,11 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rhost-lock-roundtrip-{}.json", Uuid::new_v4()));
         let mut f = LockFile::default();
         f.app = Some(entry_for("app-pw-1"));
-        f.session = Some(entry_for("sess-pw-1"));
         save_lock_file(&p, &f).unwrap();
 
         let (loaded, corrupted) = load_lock_file(&p);
         assert!(!corrupted);
         assert!(verify_entry("app-pw-1", loaded.app.as_ref().unwrap()));
-        assert!(verify_entry("sess-pw-1", loaded.session.as_ref().unwrap()));
         let _ = fs::remove_file(&p);
     }
 
@@ -638,7 +579,7 @@ mod tests {
         fs::write(&p, b"{ this is not json").unwrap();
         let (f, corrupted) = load_lock_file(&p);
         assert!(corrupted);
-        assert!(f.app.is_none() && f.session.is_none());
+        assert!(f.app.is_none());
         // 原文件已改名隔离，同目录存在 corrupt 文件
         let dir = p.parent().unwrap();
         let mut found = false;

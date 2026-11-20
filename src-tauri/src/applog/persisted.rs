@@ -185,11 +185,10 @@ pub(crate) struct SettingsSection {
     metrics_interval: i64,
     mem_pause_hidden: bool,
     mem_alert_mb: i64,
-    // 安全（应用锁 / 会话锁；锁密码哈希存独立 lock.json，不在此文件）
+    // 安全（应用锁；锁密码哈希存独立 lock.json，不在此文件）
     app_lock_enabled: bool,
     app_lock_idle_sec: i64,
     app_lock_lock_on_blur: bool,
-    session_lock_use_app_password: bool,
     // SFTP
     sftp_chunk_kb: i64,
     sftp_resume: bool,
@@ -274,7 +273,6 @@ impl Default for SettingsSection {
             app_lock_enabled: false,
             app_lock_idle_sec: 300,
             app_lock_lock_on_blur: false,
-            session_lock_use_app_password: false,
 
             sftp_chunk_kb: 64,
             sftp_resume: true,

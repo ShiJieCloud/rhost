@@ -23,7 +23,7 @@ type Side = 'local' | 'remote'
 
 /** SFTP 操作冻结条件（app-lock-design.md §6.5）：应用锁（遮罩兜底）或激活会话被锁。
  *  进行中的传输不中断，但新建传输/文件管理/任务控制一律禁止。 */
-const sftpLocked = computed(() => appLocked.value || activeSession.value?.locked === true)
+const sftpLocked = computed(() => appLocked.value)
 
 /* ---- SFTP 文件系统（本地/远程均为后端真实数据） ---- */
 interface FsEntry {
