@@ -14,8 +14,6 @@ import {
 import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
 import { lockSlots, refreshLockSlots, suppressBlurLock } from '../stores/appLock'
-import { lockClearPassword } from '../lib/lock'
-import { unlockAllSessions } from '../stores/session'
 import LockPasswordEditor from './LockPasswordEditor.vue'
 import { aiClearMemories, aiGetApiKey, aiListMemories, aiListPromptAssets, aiRevealPromptDir, aiSaveMemories, aiSetApiKey, aiTestConnection, AI_MEMORY_CONTENT_MAX_CHARS, type AiMemoryItem, type AiPromptAsset, type AiPromptAssets } from '../lib/ai'
 import { promptPassword } from '../composables/usePasswordPrompt'
@@ -80,7 +78,7 @@ interface RowDef {
 interface GroupDef {
   label: string
   rows: RowDef[]
-  extra?: 'envEditor' | 'preview' | 'lockApp' | 'lockSession'
+  extra?: 'envEditor' | 'preview' | 'lockApp'
 }
 interface PanelDef {
   id: string
@@ -223,25 +221,18 @@ const PANELS: PanelDef[] = [
   },
   {
     id: 'security', label: '安全', glyph: 'security',
-    title: '安全', sub: '应用锁与会话锁：两级独立密码，锁凭据仅保存在本机',
+    title: '安全', sub: '应用锁密码仅保存在本机（lock.json），卸载清理配置目录即删除',
     groups: [
       {
         label: '应用锁',
         rows: [
-          { key: 'appLockEnabled', title: '启用应用锁', desc: '开启后冷启动即锁定，可用 ⌘/Ctrl+Shift+L 或状态栏锁图标手动锁屏；开启前需先在下方设置应用锁密码', kind: 'switch', keywords: '应用锁 锁屏 密码 启用 开关 冷启动 启动' },
+          { key: 'appLockEnabled', title: '启用应用锁', desc: '开启后冷启动即锁定，可用 ⌘/Ctrl+Shift+L 或状态栏锁图标手动锁屏；关闭开关仅停用锁屏并保留密码，如需删除密码请用下方「应用锁密码」中的清除操作', kind: 'switch', keywords: '应用锁 锁屏 密码 启用 开关 冷启动 启动' },
           { key: 'appLockIdleSec', title: '闲置自动锁定', desc: '无键盘、鼠标操作达到该时长后自动锁屏', kind: 'select', num: true, width: 180, disabledKey: 'appLockEnabled', keywords: '闲置 自动 锁屏 时间 分钟 超时 idle',
             options: APP_LOCK_IDLE_OPTS },
           { key: 'appLockLockOnBlur', title: '窗口失焦锁定', desc: '切换到其他应用、窗口失去焦点时立即锁屏', kind: 'switch', disabledKey: 'appLockEnabled', keywords: '失焦 切换窗口 锁屏 后台 blur 焦点' },
         ],
       },
       { label: '应用锁密码', extra: 'lockApp', rows: [] },
-      {
-        label: '会话锁',
-        rows: [
-          { key: 'sessionLockUseAppPassword', title: '会话锁使用应用锁密码', desc: '勾选后单个会话的解锁验证使用应用锁密码；取消勾选则需设置独立的会话锁密码。会话锁运行时态生效，重启后全部解锁', kind: 'switch', keywords: '会话锁 密码 复用 应用锁 独立 标签' },
-        ],
-      },
-      { label: '会话锁密码', extra: 'lockSession', rows: [] },
     ],
   },
   {
@@ -861,50 +852,16 @@ async function save() {
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
 
-  /* ---- 两级锁开关联动（app-lock-design.md §6.3） ---- */
-  // 禁止「裸开」：启用应用锁前必须已有密码槽位
+  /* ---- 应用锁开关联动（app-lock-design.md §6.3） ---- */
+  // 禁止「裸开」：启用应用锁前必须已有密码槽位。
+  // 关闭开关只停用锁屏，不清除密码；清除密码在密码编辑器单独操作。
   if (draft.appLockEnabled && !lockSlots.value.appPasswordSet) {
     toast('请先在下方设置应用锁密码，再启用应用锁', 'warn', 3000)
     activePanelId.value = 'security'
     return
   }
-  // 复用应用锁密码的前提同样是应用锁密码存在
-  if (draft.sessionLockUseAppPassword && !lockSlots.value.appPasswordSet) {
-    toast('应用锁密码未设置，无法复用；请先设置应用锁密码', 'warn', 3000)
-    activePanelId.value = 'security'
-    return
-  }
-  // 关闭应用锁总开关：验证当前密码并清除凭据（应用内不允许无验证关闭）
-  // 注意：先记录「复用通道是否被收回」，saveSettings 之后 savedSettings 即被覆盖。
-  const reuseWasOn = savedSettings.sessionLockUseAppPassword
-  let forceUnlock: 'credential-cleared' | 'channel-changed' | null = null
-  if (savedSettings.appLockEnabled && !draft.appLockEnabled && lockSlots.value.appPasswordSet) {
-    const pwd = await promptPassword(
-      '关闭应用锁需要验证当前密码，验证通过后将同时清除应用锁密码',
-      '关闭应用锁',
-      '输入应用锁密码',
-    )
-    if (pwd == null) return
-    try {
-      await lockClearPassword('app', pwd)
-    } catch (e) {
-      toast(`密码验证失败：${typeof e === 'string' ? e : (e as Error)?.message ?? e}`, 'err', 3000)
-      return
-    }
-    await refreshLockSlots()
-    // 凭据已清除，会话锁复用选项同步收回（否则进入无凭据的半启用态）
-    if (draft.sessionLockUseAppPassword) draft.sessionLockUseAppPassword = false
-    forceUnlock = 'credential-cleared'
-    toast('应用锁已关闭，密码已清除', 'ok', 2200)
-  }
-  // 复用开关由开变关（且不是上面清 app 密码路径已覆盖的情况）：
-  // 已锁会话的验证通道从 app 槽位移走，通道切换必须解锁，防止旧 locked 滞留死锁
-  if (!forceUnlock && reuseWasOn && !draft.sessionLockUseAppPassword) {
-    forceUnlock = 'channel-changed'
-  }
 
   saveSettings(draft)
-  if (forceUnlock) unlockAllSessions(forceUnlock)
   syncLogConfig()
   if (storagePathChanged) {
     toast('日志存储路径已变更，重启应用后生效', 'warn', 3200)
@@ -920,25 +877,12 @@ function discard() {
 }
 
 /* ---- 密码编辑器「清除密码」成功后的联动（不经 save() 的直接清除路径） ----
- * 槽位消失后仍保留开关 / 复用勾选 / 会话 locked 会造成死锁或半启用态，
- * 这里就地收回并同步 draft（避免下次保存把旧值写回）。 */
+ * 槽位消失后仍保留 appLockEnabled 会造成半启用态，就地收回并同步 draft。 */
 function onAppPasswordCleared() {
-  let changed = false
-  if (savedSettings.appLockEnabled) {
-    savedSettings.appLockEnabled = false
-    draft.appLockEnabled = false
-    changed = true
-  }
-  if (savedSettings.sessionLockUseAppPassword) {
-    savedSettings.sessionLockUseAppPassword = false
-    draft.sessionLockUseAppPassword = false
-    changed = true
-  }
-  if (changed) persistSettings()
-  unlockAllSessions('credential-cleared')
-}
-function onSessionPasswordCleared() {
-  unlockAllSessions('credential-cleared')
+  if (!savedSettings.appLockEnabled) return
+  savedSettings.appLockEnabled = false
+  draft.appLockEnabled = false
+  persistSettings()
 }
 /* ---- 配置文件：导入 / 导出 / 重置（§7） ---- */
 
@@ -1786,17 +1730,7 @@ function optionList(r: RowDef): Opt[] {
 
               <!-- 应用锁密码管理 -->
               <div v-if="g.extra === 'lockApp' && !p.searching" class="st-extra-lock">
-                <LockPasswordEditor kind="app" @cleared="onAppPasswordCleared" />
-              </div>
-
-              <!-- 会话锁密码管理：勾选复用应用锁密码时隐藏独立表单 -->
-              <div v-if="g.extra === 'lockSession' && !p.searching" class="st-extra-lock">
-                <LockPasswordEditor
-                  v-if="!draft.sessionLockUseAppPassword"
-                  kind="session"
-                  @cleared="onSessionPasswordCleared"
-                />
-                <div v-else class="lpe-follow-hint">已复用应用锁密码，单个会话解锁时输入应用锁密码即可。</div>
+                <LockPasswordEditor @cleared="onAppPasswordCleared" />
               </div>
             </div>
 

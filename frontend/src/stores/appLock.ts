@@ -26,7 +26,7 @@ export const appLockReason = ref<LockReason>('manual')
 let activeBeforeLock: HTMLElement | null = null
 
 /** 后端锁槽位状态（密码是否已设置 / lock.json 是否损坏） */
-export const lockSlots = ref({ appPasswordSet: false, sessionPasswordSet: false })
+export const lockSlots = ref({ appPasswordSet: false })
 
 /* ---- 失焦锁抑制 ----
  * 原生文件对话框（plugin-dialog 的 open/save）弹出期间主窗口会收到
@@ -103,7 +103,6 @@ export async function initAppLock(): Promise<void> {
     const st = await ipcLockStatus()
     lockSlots.value = {
       appPasswordSet: st.appPasswordSet,
-      sessionPasswordSet: st.sessionPasswordSet,
     }
     if (!savedSettings.appLockEnabled) {
       appLocked.value = false
@@ -140,7 +139,6 @@ export async function refreshLockSlots(): Promise<void> {
     const st = await ipcLockStatus()
     lockSlots.value = {
       appPasswordSet: st.appPasswordSet,
-      sessionPasswordSet: st.sessionPasswordSet,
     }
   } catch (e) {
     console.warn('lock_status 刷新失败:', e)
@@ -149,7 +147,7 @@ export async function refreshLockSlots(): Promise<void> {
 
 /** 解锁应用。成功 resolve；失败抛出 Error（message 为后端中文文案）供遮罩展示。 */
 export async function unlockApp(password: string): Promise<void> {
-  const outcome = await lockUnlockOrReset('app', password)
+  const outcome = await lockUnlockOrReset(password)
   if (outcome === 'slot_missing') {
     // 运行中 lock.json 被删 / 损坏：按设计 §7 视为已重置，解除锁定并关回开关
     await refreshLockSlots()
