@@ -340,6 +340,8 @@ interface Transfer {
   cutSrc?: string
   /** ask 覆盖策略下用户确认覆盖后，强制以 overwrite 重试本次任务 */
   forceOverwrite?: boolean
+  /** 任务所属会话 backendId：用于按主机并发计数与断线后归属判断 */
+  backendId?: string
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
@@ -501,21 +503,69 @@ function startTask(
     localPath: extra.localPath,
     remotePath: extra.remotePath,
     cutSrc: extra.cutSrc,
+    backendId: activeSession.value?.backendId || '',
   })
   if (wasIdle) sftpQueueCollapsed.value = false
   reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dir === 'up' ? '上传' : '下载'}加入队列`, {
     name, size, dir, from: extra.localPath, to: extra.remotePath,
   })
-  pumpQueue()
+  schedulePump()
 }
 
-/** 空闲时取下一个排队任务启动（完成/失败回调中再次调用形成串行链）。
- *  单文件走真实 SFTP invoke，进度由后端 Channel 流式推送。 */
-async function pumpQueue() {
+/** 调度入口：合并同一微任务批次内的多次触发，避免并发完成事件重入调度。 */
+let pumpScheduled = false
+function schedulePump() {
+  if (pumpScheduled) return
+  pumpScheduled = true
+  queueMicrotask(() => {
+    pumpScheduled = false
+    pumpQueue()
+  })
+}
+
+/** 按 sftpGlobalConcurrency / sftpHostConcurrency 配额，同步循环启动所有可跑的 pending 任务。
+ *  实际传输在 runTask 中异步执行；runTask 首句同步置 running，防止同一任务被重复派发。 */
+function pumpQueue() {
   if (sftpLocked.value) return // 锁定期间排队任务不启动，解锁后由 watcher 续跑
-  if (transfers.value.some(t => t.status === 'running')) return
-  const t = transfers.value.find(x => x.status === 'pending')
-  if (!t) return
+  const globalLimit = Math.max(1, savedSettings.sftpGlobalConcurrency | 0)
+  const hostLimit = Math.max(1, savedSettings.sftpHostConcurrency | 0)
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const running = transfers.value.filter(t => t.status === 'running')
+    if (running.length >= globalLimit) break
+    const hostCount = new Map<string, number>()
+    for (const r of running) hostCount.set(r.backendId || '', (hostCount.get(r.backendId || '') || 0) + 1)
+    const next = transfers.value.find(
+      x => x.status === 'pending' && (hostCount.get(x.backendId || '') || 0) < hostLimit,
+    )
+    if (!next) break
+    void runTask(next)
+  }
+}
+
+/** 单任务限速分配：全局限速均分到当前并发数，再与单任务上限取小（0 表示不限）。 */
+function computeTaskRateKb(runningBefore: number): number {
+  const globalKb = savedSettings.sftpGlobalRateKb | 0
+  const taskKb = savedSettings.sftpTaskRateKb | 0
+  if (globalKb <= 0) return taskKb
+  const share = Math.floor(globalKb / Math.max(1, runningBefore + 1))
+  return taskKb <= 0 ? share : Math.min(taskKb, share)
+}
+
+/** 是否仍有并发配额（供恢复任务前检查，避免超过上限） */
+function hasCapacity(backendId: string): boolean {
+  const globalLimit = Math.max(1, savedSettings.sftpGlobalConcurrency | 0)
+  const hostLimit = Math.max(1, savedSettings.sftpHostConcurrency | 0)
+  const running = transfers.value.filter(t => t.status === 'running')
+  if (running.length >= globalLimit) return false
+  return running.filter(t => (t.backendId || '') === backendId).length < hostLimit
+}
+
+/** 启动单个传输任务：真实 SFTP invoke，进度由后端 Channel 流式推送。 */
+async function runTask(t: Transfer) {
+  const taskBackendId = t.backendId || activeSession.value?.backendId || ''
+  const runningBefore = transfers.value.filter(x => x.status === 'running').length
+  const taskRateKb = computeTaskRateKb(runningBefore)
   t.status = 'running'
   if (t.startAt === 0) t.startAt = Date.now() // 仅首次开始计时；暂停后续传不重置
   // pct > 0 为暂停/重试后的恢复，不再重复"开始"提示
@@ -538,7 +588,7 @@ async function pumpQueue() {
       name: t.name, err: msg, transferred: Math.round(t.size * t.pct / 100), total: t.size,
     })
     toast(`${t.dir === 'up' ? '上传' : '下载'}失败：${taskName(t)}`, 'warn', 2200)
-    void pumpQueue()
+    schedulePump()
   }
   const finishTask = () => {
     t.pct = 100
@@ -558,18 +608,17 @@ async function pumpQueue() {
         void invoke('local_remove', { path: t.cutSrc })
           .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: t.cutSrc, err: String(e) }))
       } else {
-        void invoke('sftp_remove', { sessionId: backendId, path: t.cutSrc })
+        void invoke('sftp_remove', { sessionId: taskBackendId, path: t.cutSrc })
           .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: t.cutSrc, err: String(e) }))
       }
     }
     // 传输完成自动刷新对侧目录，免去手动点刷新：上传→远端，下载→本地
     if (t.dir === 'up') void loadRemote(remotePath.value)
     else void loadLocal(localPath.value)
-    void pumpQueue()
+    schedulePump()
   }
 
-  const backendId = activeSession.value?.backendId
-  if (!backendId) { failTask('未建立 SSH 连接'); return }
+  if (!taskBackendId) { failTask('未建立 SSH 连接'); return }
   if (!t.localPath || !t.remotePath) { failTask('传输路径缺失'); return }
   const cmd = t.dir === 'up' ? 'sftp_upload' : 'sftp_download'
   // 每个任务独立 Channel：后端流式推送进度，前端 onmessage 按 taskId 更新对应任务
@@ -580,19 +629,19 @@ async function pumpQueue() {
     t.speed = p.speed
   }
   // 单次传输选项：从全局设置组装（camelCase 与后端 SftpTransferOptions 对齐）；
-  // ask 策略下用户确认覆盖后 forceOverwrite 强制走 overwrite
+  // ask 策略下用户确认覆盖后 forceOverwrite 强制走 overwrite；taskRateKb 按当前并发均分
   const forceOverwrite = t.forceOverwrite === true
   const options = {
     overwritePolicy: forceOverwrite ? 'overwrite' : savedSettings.sftpOverwritePolicy,
     uploadTemp: savedSettings.sftpUploadTemp,
     preserveMeta: savedSettings.sftpPreserveMeta,
     resumeCheck: savedSettings.sftpResumeCheck,
-    taskRateKb: savedSettings.sftpTaskRateKb,
+    taskRateKb,
     verifyHash: savedSettings.sftpVerifyHash,
   }
   const args = t.dir === 'up'
-    ? { sessionId: backendId, taskId: t.id, localPath: t.localPath, remotePath: t.remotePath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
-    : { sessionId: backendId, taskId: t.id, remotePath: t.remotePath, localPath: t.localPath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
+    ? { sessionId: taskBackendId, taskId: t.id, localPath: t.localPath, remotePath: t.remotePath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
+    : { sessionId: taskBackendId, taskId: t.id, remotePath: t.remotePath, localPath: t.localPath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
   try {
     await invoke(cmd, args)
     finishTask()
@@ -607,7 +656,7 @@ async function pumpQueue() {
       reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
         name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
       })
-      void pumpQueue()
+      schedulePump()
     } else if (msg.startsWith('NEED_CONFIRM:')) {
       // ask 覆盖策略：目标已存在，弹原生确认框；确认→强制 overwrite 重试，取消→跳过
       const path = msg.slice('NEED_CONFIRM:'.length)
@@ -622,7 +671,7 @@ async function pumpQueue() {
         t.status = 'pending'
         t.error = undefined
         reportLog('info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}用户确认覆盖，重试`, { name: t.name })
-        void pumpQueue()
+        schedulePump()
       } else {
         t.status = 'error'
         t.speed = 0
@@ -631,7 +680,7 @@ async function pumpQueue() {
           name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
         })
         toast(`已跳过：${taskName(t)}`, 'warn', 1800)
-        void pumpQueue()
+        schedulePump()
       }
     } else {
       failTask(msg)
@@ -652,10 +701,10 @@ function removeTask(t: Transfer) {
   reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}${t.status === 'success' ? '记录移除' : '已取消'}`, {
     name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
   })
-  if (t.status === 'running') void pumpQueue()
+  if (t.status === 'running') schedulePump()
 }
 
-/** 暂停任务：通知后端暂停开关，invoke 仍挂起（保留串行槽位避免并发） */
+/** 暂停任务：通知后端暂停开关，invoke 仍挂起；running→paused 释放一个并发槽位 */
 function pauseTask(t: Transfer) {
   if (sftpLocked.value) return
   const backendId = activeSession.value?.backendId
@@ -666,6 +715,7 @@ function pauseTask(t: Transfer) {
     t.status = 'paused'
     t.speed = 0
     reportLog('warn', SFTP_TRANSFER_PAUSE, '已暂停', { name: t.name, pct: Math.floor(t.pct) })
+    schedulePump() // 释放槽位，启动下一个排队任务
   } else if (t.status === 'pending') {
     t.status = 'paused'
     reportLog('warn', SFTP_TRANSFER_PAUSE, '排队任务已挂起', { name: t.name, pct: 0 })
@@ -675,9 +725,14 @@ function pauseTask(t: Transfer) {
 function resumeTask(t: Transfer) {
   if (t.status !== 'paused') return
   if (sftpLocked.value) return
-  const backendId = activeSession.value?.backendId
-  if (backendId) {
-    void invoke('sftp_transfer_pause', { sessionId: backendId, taskId: t.id, paused: false }).catch(() => {})
+  const bid = t.backendId || activeSession.value?.backendId || ''
+  // 恢复前校验并发配额，避免暂停期间补位的任务导致超过上限
+  if (!hasCapacity(bid)) {
+    toast('并发任务已达上限，请先暂停其他任务', 'warn', 2000)
+    return
+  }
+  if (bid) {
+    void invoke('sftp_transfer_pause', { sessionId: bid, taskId: t.id, paused: false }).catch(() => {})
   }
   t.status = 'running'
   // 与暂停（WARN）配对的显式用户动作，INFO 保证默认级别下可见
@@ -696,7 +751,7 @@ function retryTask(t: Transfer) {
   reportLog('info', SFTP_TRANSFER_ENQUEUE, `${t.dir === 'up' ? '上传' : '下载'}重新加入队列`, {
     name: t.name, size: t.size, dir: t.dir, from: t.localPath, to: t.remotePath,
   })
-  void pumpQueue()
+  schedulePump()
 }
 
 // 解锁后续跑冻结期间滞留的排队任务（进行中的任务从未中断，无需恢复动作）
@@ -704,7 +759,7 @@ watch(sftpLocked, locked => {
   // 锁定瞬间关闭已打开的右键菜单：菜单 Teleport 到 body 且 z-index:9999，
   // 会越过两级遮罩残留可点
   if (locked) menu.value = null
-  else void pumpQueue()
+  else schedulePump()
 })
 /** 打开目录：上传完成 → 远程目录；下载完成 → 本地目录 */
 function openTaskDir(t: Transfer) {

@@ -269,10 +269,10 @@ const PANELS: PanelDef[] = [
       {
         label: '并发与限速',
         rows: [
-          { key: 'sftpGlobalConcurrency', title: '全局最大并发传输任务', desc: '整个客户端所有主机同时运行的上传与下载任务总数上限，超出上限的任务进入排队', kind: 'number', width: 100, min: 1, max: 20, step: 1, unit: ' 个', keywords: 'sftp 全局 并发 任务 上传 下载 排队 上限 TODO', todo: '后端未消费' },
-          { key: 'sftpHostConcurrency', title: '单主机最大并发传输任务', desc: '同一台服务器同时运行的上传、下载任务上限，防止单台服务器并发过高导致连接卡顿', kind: 'number', width: 100, min: 1, max: 10, step: 1, unit: ' 个', keywords: 'sftp 单主机 服务器 并发 任务 卡顿 上限 TODO', todo: '后端未消费' },
-          { key: 'sftpGlobalRateKb', title: '全局带宽限速', desc: '全部传输任务合计的总带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 全局 带宽 限速 速率 限流 总带宽 KB TODO', todo: '后端未消费' },
-          { key: 'sftpTaskRateKb', title: '单任务带宽限速', desc: '单个文件传输任务的最大带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 单任务 带宽 限速 速率 限流 KB TODO', todo: '后端未消费' },
+          { key: 'sftpGlobalConcurrency', title: '全局最大并发传输任务', desc: '整个客户端所有主机同时运行的上传与下载任务总数上限，超出上限的任务进入排队', kind: 'number', width: 100, min: 1, max: 20, step: 1, unit: ' 个', keywords: 'sftp 全局 并发 任务 上传 下载 排队 上限' },
+          { key: 'sftpHostConcurrency', title: '单主机最大并发传输任务', desc: '同一台服务器同时运行的上传、下载任务上限，防止单台服务器并发过高导致连接卡顿', kind: 'number', width: 100, min: 1, max: 10, step: 1, unit: ' 个', keywords: 'sftp 单主机 服务器 并发 任务 卡顿 上限' },
+          { key: 'sftpGlobalRateKb', title: '全局带宽限速', desc: '全部传输任务合计的总带宽上限，各任务按当前并发数均分，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 全局 带宽 限速 速率 限流 总带宽 KB' },
+          { key: 'sftpTaskRateKb', title: '单任务带宽限速', desc: '单个文件传输任务的最大带宽上限，填写 0 代表不限制带宽', kind: 'number', width: 130, min: 0, step: 64, unit: ' KB/s', keywords: 'sftp 单任务 带宽 限速 速率 限流 KB' },
           { key: 'sftpRetryCount', title: '失败重试次数', desc: '遇到网络抖动、临时超时等可恢复错误时自动重试的最大次数，达到次数后任务标记失败', kind: 'number', width: 100, min: 0, max: 20, step: 1, unit: ' 次', keywords: 'sftp 失败 重试 次数 网络抖动 超时 错误 TODO', todo: '后端未消费' },
           { key: 'sftpRetryIntervalMs', title: '重试间隔', desc: '单次传输失败后等待指定毫秒再发起下一次重试，避免短时间密集请求冲击服务器', kind: 'number', width: 130, min: 0, step: 100, unit: ' ms', keywords: 'sftp 重试 间隔 等待 毫秒 退避 backoff TODO', todo: '后端未消费' },
         ],

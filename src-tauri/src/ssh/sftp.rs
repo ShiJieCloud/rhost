@@ -32,6 +32,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use super::SshError;
@@ -624,6 +625,7 @@ impl SshSession {
             if offset > 0 {
                 emit_progress(&channel, task_id, transferred, total, 0, false);
             }
+            let mut limiter = RateLimiter::new(options.task_rate_kb);
 
             loop {
                 wait_if_paused(&mut paused_rx, &cancel)
@@ -651,6 +653,7 @@ impl SshSession {
                             total,
                         )
                     })?;
+                limiter.allow(n as u64).await;
                 offset += n as u64;
                 transferred += n as u64;
 
@@ -910,6 +913,7 @@ impl SshSession {
             if offset > 0 {
                 emit_progress(&channel, task_id, transferred, total, 0, false);
             }
+            let mut limiter = RateLimiter::new(options.task_rate_kb);
 
             loop {
                 wait_if_paused(&mut paused_rx, &cancel)
@@ -943,6 +947,7 @@ impl SshSession {
                         total,
                     )
                 })?;
+                limiter.allow(data.len() as u64).await;
                 offset += data.len() as u64;
                 transferred += data.len() as u64;
 
@@ -1245,6 +1250,38 @@ async fn copy_recursive(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(
         copy_file_stream(sftp, src, dst).await?;
     }
     Ok(())
+}
+
+/// 单任务令牌桶限速：按 `rate_kb`（KB/s）节流，0 表示不限速。
+/// 1 秒固定窗口：窗口内累计字节达到上限即睡眠到窗口结束，实现粗略速率控制
+/// （进度上报的瞬时速率会自然反映节流后的速率）。
+struct RateLimiter {
+    rate_bps: u64,
+    window_start: Instant,
+    window_bytes: u64,
+}
+impl RateLimiter {
+    fn new(rate_kb: u64) -> Self {
+        Self {
+            rate_bps: rate_kb.saturating_mul(1024),
+            window_start: Instant::now(),
+            window_bytes: 0,
+        }
+    }
+    async fn allow(&mut self, bytes: u64) {
+        if self.rate_bps == 0 {
+            return;
+        }
+        self.window_bytes += bytes;
+        if self.window_bytes >= self.rate_bps {
+            let elapsed = self.window_start.elapsed();
+            if elapsed < Duration::from_secs(1) {
+                sleep(Duration::from_secs(1) - elapsed).await;
+            }
+            self.window_start = Instant::now();
+            self.window_bytes = 0;
+        }
+    }
 }
 
 /// 断点续传 sha256 校验：比对远端前 `len` 字节与本地文件前 `len` 字节的哈希，
