@@ -24,7 +24,9 @@ use russh::client;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::rawsession::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use filetime::FileTime;
 use tauri::ipc::Channel;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -116,6 +118,43 @@ pub struct TransferProgress {
     pub total: u64,
     pub speed: u64,
     pub done: bool,
+}
+
+/// 覆盖策略为 `ask` 且目标文件已存在时返回此前缀，前端据此弹确认框；
+/// 与 KEY_ENCRYPTED / HOSTKEY_UNKNOWN 同为前后端约定的协议标记，不得改为普通文案。
+pub(crate) const NEED_CONFIRM: &str = "NEED_CONFIRM";
+
+/// SFTP 单次传输选项：由前端从全局设置组装后随每次传输传入（camelCase）。
+/// 仅含传输时即需后端消费的项；调度类（并发/重试/全局限速/黑名单）由前端实现，
+/// 不进入此结构体。字段均设 `default`，保证旧前端缺传时后端可用安全缺省值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SftpTransferOptions {
+    /// 覆盖策略：skip / overwrite / newer / ask
+    pub overwrite_policy: String,
+    /// 上传先写 `.tmp` 临时文件再原子重命名（失败不留半成品）
+    pub upload_temp: bool,
+    /// 传输完成后保留源文件 mtime 与权限属性
+    pub preserve_meta: bool,
+    /// 断点校验方式：size / sizeMtime / sha256
+    pub resume_check: String,
+    /// 单任务带宽限速 KB/s，0=不限（阶段 2 实现，先接收参数）
+    pub task_rate_kb: u64,
+    /// 传输完成后 SHA256 校验（阶段 4 实现，先接收参数）
+    pub verify_hash: bool,
+}
+
+impl Default for SftpTransferOptions {
+    fn default() -> Self {
+        Self {
+            overwrite_policy: "newer".into(),
+            upload_temp: false,
+            preserve_meta: false,
+            resume_check: "size".into(),
+            task_rate_kb: 0,
+            verify_hash: false,
+        }
+    }
 }
 
 /// 每会话的 SFTP 长驻会话缓存：懒加载，坏通道可失效重建；
@@ -383,6 +422,7 @@ impl SshSession {
         chunk_kb: Option<u32>,
         resume: Option<bool>,
         max_bytes: Option<u64>,
+        options: SftpTransferOptions,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let chunk = chunk_kb
@@ -418,17 +458,33 @@ impl SshSession {
                     0,
                 )
             })?;
-            let total = src
-                .metadata()
-                .await
-                .map_err(|e| {
-                    (
-                        SshError::Channel(format!("读取本地文件大小失败: {e}")),
-                        0,
-                        0,
-                    )
-                })?
-                .len();
+            let src_meta = src.metadata().await.map_err(|e| {
+                (
+                    SshError::Channel(format!("读取本地文件元数据失败: {e}")),
+                    0,
+                    0,
+                )
+            })?;
+            let total = src_meta.len();
+            // 源 mtime（Unix 秒）：用于 newer 覆盖比较与保留元数据
+            let src_mtime: u64 = src_meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // 源权限 mode（unix）；非 unix 平台回退 0o644
+            let src_perm: u32 = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    src_meta.permissions().mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    0o644
+                }
+            };
 
             // 体积上限预检：在打开远端文件写入前拒绝，避免生成残留的远端空/截断文件
             if let Some(max) = max_bytes {
@@ -444,10 +500,11 @@ impl SshSession {
                 }
             }
 
-            // 断点续传：探测远端已有大小，决定续写起点
-            let remote_size = match sftp.lstat(&remote_path).await {
-                Ok(meta) => meta.attrs.size.unwrap_or(0),
-                Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => 0,
+            // 探测远端目标：是否存在 + 属性（size/mtime），用于覆盖策略与断点校验
+            let remote_meta = sftp.lstat(&remote_path).await;
+            let (target_exists, remote_attrs) = match remote_meta {
+                Ok(m) => (true, Some(m.attrs)),
+                Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => (false, None),
                 Err(e) => {
                     return Err((
                         SshError::Channel(format!("探测远端文件 {remote_path} 失败: {e}")),
@@ -456,12 +513,71 @@ impl SshSession {
                     ));
                 }
             };
-            let offset = if !resume {
-                0 // 关闭断点续传：一律截断全量重传
+
+            // 覆盖策略：目标存在时判定跳过 / 询问；overwrite 与未知策略放行继续传输
+            if target_exists {
+                let rsize = remote_attrs.as_ref().and_then(|a| a.size).unwrap_or(0);
+                let skip = match options.overwrite_policy.as_str() {
+                    "skip" => true,
+                    "newer" => {
+                        // size 不同视为源有变化；size 相同则要求源 mtime 更新才覆盖
+                        if rsize != total {
+                            false
+                        } else {
+                            let rmtime =
+                                remote_attrs.as_ref().and_then(|a| a.mtime).unwrap_or(0) as u64;
+                            src_mtime <= rmtime
+                        }
+                    }
+                    "ask" => {
+                        return Err((
+                            SshError::TransferRejected(format!("{NEED_CONFIRM}:{remote_path}")),
+                            0,
+                            total,
+                        ));
+                    }
+                    _ => false, // overwrite / 未知 → 不跳过
+                };
+                if skip {
+                    return Ok((total, total));
+                }
+            }
+
+            // 断点续传 offset 判定：overwrite 强制截断；否则按 resume + resume_check 决定
+            let remote_size = remote_attrs.as_ref().and_then(|a| a.size).unwrap_or(0);
+            let force_truncate = matches!(options.overwrite_policy.as_str(), "overwrite");
+            let offset = if force_truncate || !resume {
+                0 // 强制覆盖或关闭续传：一律截断全量重传
             } else if remote_size == total {
                 return Ok((total, total)); // 已完整，直接完成
             } else if remote_size < total {
-                remote_size // 从已有偏移续写
+                let can_resume = match options.resume_check.as_str() {
+                    "sizeMtime" => {
+                        // mtime 一致才认为远端半截是同一源的延续，否则截断重传
+                        let rmtime =
+                            remote_attrs.as_ref().and_then(|a| a.mtime).unwrap_or(0) as u64;
+                        src_mtime == rmtime
+                    }
+                    "sha256" => {
+                        // 读远端已有部分与源前缀比对哈希；>32MB 退化为 sizeMtime 避免耗时
+                        if remote_size > 32 * 1024 * 1024 {
+                            let rmtime = remote_attrs
+                                .as_ref()
+                                .and_then(|a| a.mtime)
+                                .unwrap_or(0)
+                                as u64;
+                            src_mtime == rmtime
+                        } else {
+                            verify_prefix_sha256(&sftp, &remote_path, &local, remote_size).await
+                        }
+                    }
+                    _ => true, // size：仅比大小（默认）
+                };
+                if can_resume {
+                    remote_size // 从已有偏移续写
+                } else {
+                    0 // 校验未通过，截断重传
+                }
             } else {
                 0 // 远端比本地大（源文件变更），截断重传
             };
@@ -475,6 +591,12 @@ impl SshSession {
                 })?;
             }
 
+            // 上传临时文件：写入 remote_path.tmp，成功后原子重命名，失败不留半成品
+            let write_path = if options.upload_temp {
+                format!("{remote_path}.tmp")
+            } else {
+                remote_path.clone()
+            };
             // 续传时不带 TRUNCATE 保留已有内容；从头传时 TRUNCATE 清除残留
             let flags = if offset > 0 {
                 OpenFlags::WRITE | OpenFlags::CREATE
@@ -482,11 +604,11 @@ impl SshSession {
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
             };
             let rhandle = sftp
-                .open(&remote_path, flags, FileAttributes::default())
+                .open(&write_path, flags, FileAttributes::default())
                 .await
                 .map_err(|e| {
                     (
-                        SshError::Channel(format!("打开远端文件 {remote_path} 失败: {e}")),
+                        SshError::Channel(format!("打开远端文件 {write_path} 失败: {e}")),
                         0,
                         total,
                     )
@@ -518,7 +640,7 @@ impl SshSession {
                     )
                 })?;
                 if n == 0 {
-                    return Ok((transferred, total));
+                    break; // 传输完成：退出循环执行收尾（临时文件重命名 / 保留元数据）
                 }
                 sftp.write(rhandle.as_str(), offset, buf[..n].to_vec())
                     .await
@@ -541,6 +663,37 @@ impl SshSession {
                     last_bytes = transferred;
                 }
             }
+
+            // 传输成功收尾：关闭写句柄 → 临时文件原子重命名 → 保留源 mtime/权限
+            let _ = sftp.close(rhandle.as_str()).await;
+            if options.upload_temp {
+                let tmp = format!("{remote_path}.tmp");
+                if posix_rename(&sftp, &tmp, &remote_path).await.is_err() {
+                    if let Err(e) = sftp.rename(&tmp, &remote_path).await {
+                        let _ = sftp.remove(&tmp).await;
+                        return Err((
+                            SshError::Channel(format!("重命名临时文件 {tmp} 失败: {e}")),
+                            transferred,
+                            total,
+                        ));
+                    }
+                }
+                debug!("SFTP 上传临时文件已重命名: {tmp} → {remote_path}");
+            }
+            if options.preserve_meta {
+                // 复用目标已有属性（保留 atime 等），仅覆盖 mtime 与权限
+                let mut attrs = sftp
+                    .lstat(&remote_path)
+                    .await
+                    .map(|m| m.attrs)
+                    .unwrap_or_default();
+                attrs.mtime = Some(src_mtime as u32);
+                attrs.permissions = Some(src_perm);
+                if let Err(e) = sftp.setstat(&remote_path, attrs).await {
+                    debug!("SFTP 保留元数据失败（不影响传输结果）: {e}");
+                }
+            }
+            Ok((transferred, total))
         }
         .await;
 
@@ -567,6 +720,7 @@ impl SshSession {
         chunk_kb: Option<u32>,
         resume: Option<bool>,
         max_bytes: Option<u64>,
+        options: SftpTransferOptions,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let chunk = chunk_kb
@@ -611,6 +765,9 @@ impl SshSession {
                 })?
                 .attrs;
             let total = attrs.size.unwrap_or(0);
+            // 远端 mtime / 权限：newer 覆盖比较与保留元数据用
+            let remote_mtime: u64 = attrs.mtime.unwrap_or(0) as u64;
+            let remote_perm: Option<u32> = attrs.permissions;
 
             // 体积上限预检：在创建本地文件前拒绝，避免生成残留的本地空/截断文件
             if let Some(max) = max_bytes {
@@ -626,17 +783,86 @@ impl SshSession {
                 }
             }
 
-            // 断点续传：探测本地已有大小，决定续写起点
-            let local_size = tokio::fs::metadata(&local)
-                .await
-                .map(|m| m.len())
+            // 临时文件模式：写入 local.tmp，成功后原子 rename 覆盖 local（失败不留半成品）
+            let write_path = if options.upload_temp {
+                format!("{local}.tmp")
+            } else {
+                local.clone()
+            };
+
+            // 覆盖策略：探测最终目标 local 是否存在，判定跳过 / 询问
+            let final_meta = tokio::fs::metadata(&local).await;
+            let final_exists = final_meta.is_ok();
+            let final_size = final_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let final_mtime: u64 = final_meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let offset = if !resume {
-                0 // 关闭断点续传：一律截断全量重传
-            } else if local_size == total {
-                return Ok((total, total)); // 已完整，直接完成
-            } else if local_size < total {
-                local_size // 从已有偏移续写
+            if final_exists {
+                let skip = match options.overwrite_policy.as_str() {
+                    "skip" => true,
+                    "newer" => {
+                        // size 不同视为远端源有变化；size 相同则仅当远端更新才覆盖
+                        if final_size != total {
+                            false
+                        } else {
+                            remote_mtime <= final_mtime
+                        }
+                    }
+                    "ask" => {
+                        return Err((
+                            SshError::TransferRejected(format!("{NEED_CONFIRM}:{local}")),
+                            0,
+                            total,
+                        ));
+                    }
+                    _ => false, // overwrite / 未知 → 不跳过
+                };
+                if skip {
+                    return Ok((total, total));
+                }
+            }
+
+            // 断点续传：以写入目标（write_path）已有大小 / mtime 判定续写起点
+            let write_meta = tokio::fs::metadata(&write_path).await;
+            let write_size = write_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let write_mtime: u64 = write_meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let force_truncate = matches!(options.overwrite_policy.as_str(), "overwrite");
+            let offset = if force_truncate || !resume {
+                0 // 强制覆盖或关闭续传：一律截断全量重传
+            } else if write_size == total {
+                total // 写入目标已完整：首次 read 即 EOF，退出循环走收尾（rename / 元数据）
+            } else if write_size < total {
+                let can_resume = match options.resume_check.as_str() {
+                    "sizeMtime" => {
+                        // mtime 一致才认为本地半截是同一源的延续，否则截断重传
+                        remote_mtime == write_mtime
+                    }
+                    "sha256" => {
+                        // 读本地已有部分与远端前缀比对哈希；>32MB 退化为 sizeMtime 避免耗时
+                        if write_size > 32 * 1024 * 1024 {
+                            remote_mtime == write_mtime
+                        } else {
+                            verify_prefix_sha256(&sftp, &remote_path, &write_path, write_size)
+                                .await
+                        }
+                    }
+                    _ => true, // size：仅比大小（默认）
+                };
+                if can_resume {
+                    write_size
+                } else {
+                    0
+                }
             } else {
                 0 // 本地比远端大（源文件变更），截断重传
             };
@@ -645,19 +871,19 @@ impl SshSession {
                 OpenOptions::new()
                     .append(true)
                     .create(true)
-                    .open(&local)
+                    .open(&write_path)
                     .await
                     .map_err(|e| {
                         (
-                            SshError::Channel(format!("打开本地文件 {local} 续写失败: {e}")),
+                            SshError::Channel(format!("打开本地文件 {write_path} 续写失败: {e}")),
                             0,
                             total,
                         )
                     })?
             } else {
-                File::create(&local).await.map_err(|e| {
+                File::create(&write_path).await.map_err(|e| {
                     (
-                        SshError::Channel(format!("创建本地文件 {local} 失败: {e}")),
+                        SshError::Channel(format!("创建本地文件 {write_path} 失败: {e}")),
                         0,
                         total,
                     )
@@ -697,7 +923,7 @@ impl SshSession {
                 let data = match read_res {
                     Ok(d) => d.data,
                     Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
-                        return Ok((transferred, total));
+                        break; // 传输完成：退出循环执行收尾（临时文件重命名 / 保留元数据）
                     }
                     Err(e) => {
                         return Err((
@@ -708,7 +934,7 @@ impl SshSession {
                     }
                 };
                 if data.is_empty() {
-                    return Ok((transferred, total));
+                    break;
                 }
                 dst.write_all(&data).await.map_err(|e| {
                     (
@@ -729,6 +955,27 @@ impl SshSession {
                     last_bytes = transferred;
                 }
             }
+
+            // 传输成功收尾：关闭本地句柄 → 临时文件原子重命名 → 保留远端 mtime/权限
+            let _ = dst.flush().await;
+            drop(dst);
+            let _ = sftp.close(rhandle.as_str()).await;
+            if options.upload_temp {
+                let tmp = format!("{local}.tmp");
+                if let Err(e) = tokio::fs::rename(&tmp, &local).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err((
+                        SshError::Channel(format!("重命名临时文件 {tmp} 失败: {e}")),
+                        transferred,
+                        total,
+                    ));
+                }
+                debug!("SFTP 下载临时文件已重命名: {tmp} → {local}");
+            }
+            if options.preserve_meta {
+                preserve_local_meta(&local, remote_mtime, remote_perm);
+            }
+            Ok((transferred, total))
         }
         .await;
 
@@ -998,6 +1245,105 @@ async fn copy_recursive(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(
         copy_file_stream(sftp, src, dst).await?;
     }
     Ok(())
+}
+
+/// 断点续传 sha256 校验：比对远端前 `len` 字节与本地文件前 `len` 字节的哈希，
+/// 一致才认为已有半截属于同一源文件可续写。任一读取失败 / 长度不足保守返回 false
+/// （触发截断重传）。调用方应确保 `len <= 32MB`（大文件退化为 sizeMtime），避免长耗时。
+async fn verify_prefix_sha256(
+    sftp: &RawSftpSession,
+    remote_path: &str,
+    local_path: &str,
+    len: u64,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // 读远端前 len 字节
+    let mut remote_hash = Sha256::new();
+    let rhandle = match sftp
+        .open(remote_path, OpenFlags::READ, FileAttributes::default())
+        .await
+    {
+        Ok(h) => h.handle,
+        Err(e) => {
+            debug!("sha256 校验打开远端失败，降级截断重传: {e}");
+            return false;
+        }
+    };
+    let mut off = 0u64;
+    let mut ok = true;
+    while off < len {
+        let want = ((len - off) as usize).min(DEFAULT_CHUNK) as u32;
+        match sftp.read(rhandle.as_str(), off, want).await {
+            Ok(d) => {
+                if d.data.is_empty() {
+                    break;
+                }
+                remote_hash.update(&d.data);
+                off += d.data.len() as u64;
+            }
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break,
+            Err(e) => {
+                debug!("sha256 校验读取远端失败，降级截断重传: {e}");
+                ok = false;
+                break;
+            }
+        }
+    }
+    let _ = sftp.close(rhandle.as_str()).await;
+    if !ok || off != len {
+        return false;
+    }
+
+    // 读本地前 len 字节（独立打开，不干扰调用方已打开的文件句柄位置）
+    let mut local = match File::open(local_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            debug!("sha256 校验打开本地失败，降级截断重传: {e}");
+            return false;
+        }
+    };
+    let mut local_hash = Sha256::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; DEFAULT_CHUNK.min(remaining as usize)];
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        match local.read(&mut buf[..want]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                local_hash.update(&buf[..n]);
+                remaining -= n as u64;
+            }
+            Err(e) => {
+                debug!("sha256 校验读取本地失败，降级截断重传: {e}");
+                return false;
+            }
+        }
+    }
+    if remaining != 0 {
+        return false;
+    }
+    remote_hash.finalize() == local_hash.finalize()
+}
+
+/// 下载完成后将本地文件的 mtime / 权限同步为远端值（preserve_meta 开启时）。
+/// 失败仅 debug 日志，不影响传输结果。
+fn preserve_local_meta(local_path: &str, mtime: u64, perm: Option<u32>) {
+    if mtime != 0 {
+        let ft = FileTime::from_unix_time(mtime as i64, 0);
+        if let Err(e) = filetime::set_file_mtime(local_path, ft) {
+            debug!("设置本地文件 mtime 失败（不影响传输结果）: {e}");
+        }
+    }
+    #[cfg(unix)]
+    if let Some(mode) = perm {
+        use std::os::unix::fs::PermissionsExt;
+        let p = std::fs::Permissions::from_mode(mode);
+        if let Err(e) = std::fs::set_permissions(local_path, p) {
+            debug!("设置本地文件权限失败（不影响传输结果）: {e}");
+        }
+    }
 }
 
 /// 展开路径开头的 ~ 为当前用户家目录（不引入 shellexpand 依赖）

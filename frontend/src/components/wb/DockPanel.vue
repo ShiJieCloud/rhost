@@ -7,6 +7,7 @@ import { appLocked } from '../../stores/appLock'
 import { toast } from '../../composables/useToast'
 import TunnelPane from './TunnelPane.vue'
 import { isTauri } from '../../lib/tauri'
+import { ask } from '@tauri-apps/plugin-dialog'
 import { getSnapshot, onConfigLoad, patchUiState } from '../../stores/appConfig'
 import ContextMenu from './ContextMenu.vue'
 import type { MenuItem } from './ContextMenu.vue'
@@ -309,6 +310,20 @@ function visibleEntries(list: FsEntry[]): FsEntry[] {
 const localEntries = computed(() => sortEntries(visibleEntries(localRaw.value), localSort.value))
 const remoteEntries = computed(() => sortEntries(visibleEntries(remoteRaw.value), remoteSort.value))
 
+/** 轻量 glob 匹配：支持 `*`（任意字符）与 `?`（单字符），其余正则元字符转义。
+ *  用于上传黑名单过滤，不引入 minimatch 依赖。 */
+function globMatch(name: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&') // 转义除 * ? 外的正则元字符
+  const re = '^' + escaped.replace(/\*/g, '.*').replace(/\?/g, '.') + '$'
+  return new RegExp(re).test(name)
+}
+/** 文件名是否命中上传黑名单（一行一条 glob，空行忽略） */
+function isBlacklisted(name: string): boolean {
+  const list = (savedSettings.sftpBlacklist || '')
+    .split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  return list.some(p => globMatch(name, p))
+}
+
 /* ---- 传输队列：pending → running → success，同一时刻仅一个 running（串行）
    状态色规范：pending #606266 · running #409EFF · paused #E6A23C · error #F56C6C · success 项目绿 ---- */
 type TransferStatus = 'pending' | 'running' | 'paused' | 'success' | 'error'
@@ -323,6 +338,8 @@ interface Transfer {
   remotePath?: string  // 远端绝对路径
   /** 跨侧剪切粘贴：传输成功后要删除的源文件绝对路径 */
   cutSrc?: string
+  /** ask 覆盖策略下用户确认覆盖后，强制以 overwrite 重试本次任务 */
+  forceOverwrite?: boolean
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
@@ -470,6 +487,12 @@ function startTask(
     toast('会话已锁定，请先解锁', 'warn')
     return
   }
+  // 上传黑名单：命中 glob 规则的文件不入队（仅上传，过滤本地 .DS_Store 等垃圾文件）
+  if (dir === 'up' && isBlacklisted(name)) {
+    toast(`已跳过黑名单文件：${name}`, 'warn', 1800)
+    reportLog('info', SFTP_TRANSFER_ENQUEUE, '上传命中黑名单，已跳过', { name })
+    return
+  }
   /* 仅在队列从空闲进入活动（首个任务）时自动展开；
      活动期间用户手动折叠后，后续入队保持折叠，进度看头部摘要 */
   const wasIdle = transfers.value.length === 0
@@ -556,9 +579,20 @@ async function pumpQueue() {
     t.pct = p.total > 0 ? (p.transferred / p.total) * 100 : (p.done ? 100 : t.pct)
     t.speed = p.speed
   }
+  // 单次传输选项：从全局设置组装（camelCase 与后端 SftpTransferOptions 对齐）；
+  // ask 策略下用户确认覆盖后 forceOverwrite 强制走 overwrite
+  const forceOverwrite = t.forceOverwrite === true
+  const options = {
+    overwritePolicy: forceOverwrite ? 'overwrite' : savedSettings.sftpOverwritePolicy,
+    uploadTemp: savedSettings.sftpUploadTemp,
+    preserveMeta: savedSettings.sftpPreserveMeta,
+    resumeCheck: savedSettings.sftpResumeCheck,
+    taskRateKb: savedSettings.sftpTaskRateKb,
+    verifyHash: savedSettings.sftpVerifyHash,
+  }
   const args = t.dir === 'up'
-    ? { sessionId: backendId, taskId: t.id, localPath: t.localPath, remotePath: t.remotePath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, channel }
-    : { sessionId: backendId, taskId: t.id, remotePath: t.remotePath, localPath: t.localPath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, channel }
+    ? { sessionId: backendId, taskId: t.id, localPath: t.localPath, remotePath: t.remotePath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
+    : { sessionId: backendId, taskId: t.id, remotePath: t.remotePath, localPath: t.localPath, chunkKb: savedSettings.sftpChunkKb, resume: savedSettings.sftpResume, options, channel }
   try {
     await invoke(cmd, args)
     finishTask()
@@ -574,6 +608,31 @@ async function pumpQueue() {
         name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
       })
       void pumpQueue()
+    } else if (msg.startsWith('NEED_CONFIRM:')) {
+      // ask 覆盖策略：目标已存在，弹原生确认框；确认→强制 overwrite 重试，取消→跳过
+      const path = msg.slice('NEED_CONFIRM:'.length)
+      const ok = await ask(`目标文件已存在，是否覆盖？\n${path}`, {
+        title: '覆盖确认',
+        kind: 'warning',
+        okLabel: '覆盖',
+        cancelLabel: '跳过',
+      })
+      if (ok) {
+        t.forceOverwrite = true
+        t.status = 'pending'
+        t.error = undefined
+        reportLog('info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}用户确认覆盖，重试`, { name: t.name })
+        void pumpQueue()
+      } else {
+        t.status = 'error'
+        t.speed = 0
+        t.error = '已跳过（目标已存在）'
+        reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已跳过（目标已存在）`, {
+          name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
+        })
+        toast(`已跳过：${taskName(t)}`, 'warn', 1800)
+        void pumpQueue()
+      }
     } else {
       failTask(msg)
     }

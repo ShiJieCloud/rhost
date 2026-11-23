@@ -243,22 +243,22 @@ const PANELS: PanelDef[] = [
         rows: [
           { key: 'sftpChunkKb', title: '传输块大小', desc: '单次读写的数据量；大块吞吐更高，小块进度更细腻、弱网下重试成本更低', kind: 'select', num: true, width: 150, keywords: 'sftp 传输 块 分块 缓冲 chunk 大小 吞吐 速度',
             options: [32, 64, 128, 256, 512, 1024].map(v => ({ v: String(v), t: v >= 1024 ? '1 MB' : `${v} KB${v === 64 ? '（默认）' : ''}` })) },
-          { key: 'sftpOverwritePolicy', title: '文件覆盖策略', desc: '上传或下载时，如果目标位置已存在同名文件，执行对应的处理规则', kind: 'select', width: 230, keywords: 'sftp 覆盖 策略 同名 冲突 overwrite skip 跳过 询问 更新 mtime TODO', todo: '后端未消费',
+          { key: 'sftpOverwritePolicy', title: '文件覆盖策略', desc: '上传或下载时，如果目标位置已存在同名文件，执行对应的处理规则', kind: 'select', width: 230, keywords: 'sftp 覆盖 策略 同名 冲突 overwrite skip 跳过 询问 更新 mtime',
             options: [
               { v: 'newer', t: '仅源文件更新时覆盖（默认）' },
               { v: 'skip', t: '不覆盖，跳过文件' },
               { v: 'overwrite', t: '直接覆盖全部' },
               { v: 'ask', t: '每次冲突询问' },
             ] },
-          { key: 'sftpUploadTemp', title: '上传临时文件机制', desc: '上传先写入临时文件，传输完成后原子重命名，避免远端产生损坏文件', kind: 'switch', keywords: 'sftp 上传 临时文件 原子 重命名 temp atomic rename 损坏 TODO', todo: '后端未消费' },
-          { key: 'sftpPreserveMeta', title: '保留文件元数据', desc: '传输文件时同步保留文件修改时间与权限属性，备份场景推荐开启；受服务器账号权限限制', kind: 'switch', keywords: 'sftp 元数据 保留 修改时间 权限 preserve mtime chmod 备份 TODO', todo: '后端未消费' },
+          { key: 'sftpUploadTemp', title: '临时文件机制', desc: '上传或下载先写入临时文件，传输完成后原子重命名，避免产生损坏的半成品文件', kind: 'switch', keywords: 'sftp 上传 下载 临时文件 原子 重命名 temp atomic rename 损坏' },
+          { key: 'sftpPreserveMeta', title: '保留文件元数据', desc: '传输文件时同步保留文件修改时间与权限属性，备份场景推荐开启；受服务器账号权限限制', kind: 'switch', keywords: 'sftp 元数据 保留 修改时间 权限 preserve mtime chmod 备份' },
         ],
       },
       {
         label: '断点续传',
         rows: [
           { key: 'sftpResume', title: '启用断点续传', desc: '传输中断后再次发起任务，可以从已传输完成位置继续传输，无需从头重传。关闭后所有文件每次都完整从头传输', kind: 'switch', keywords: 'sftp 断点续传 续传 resume 中断 重传 偏移' },
-          { key: 'sftpResumeCheck', title: '断点校验方式', desc: '续传前校验已存在的半截文件，确认未被改动后从偏移位置续传；仅判断能否续传，与传输完成后的完整性校验相互独立', kind: 'select', width: 200, disabledKey: 'sftpResume', keywords: 'sftp 断点 校验 大小 mtime sha256 哈希 续传 半截 TODO', todo: '后端未消费',
+          { key: 'sftpResumeCheck', title: '断点校验方式', desc: '续传前校验已存在的半截文件，确认未被改动后从偏移位置续传；仅判断能否续传，与传输完成后的完整性校验相互独立', kind: 'select', width: 200, disabledKey: 'sftpResume', keywords: 'sftp 断点 校验 大小 mtime sha256 哈希 续传 半截',
             options: [
               { v: 'size', t: '文件大小（推荐）' },
               { v: 'sizeMtime', t: '文件大小 + mtime' },
@@ -282,7 +282,7 @@ const PANELS: PanelDef[] = [
         rows: [
           { key: 'sftpIdleTimeoutSec', title: 'SFTP 会话空闲超时', desc: 'SFTP 子通道长时间没有文件操作时自动关闭释放资源，不会断开 SSH 终端会话，后续传输会自动重建通道；填 0 表示不自动关闭', kind: 'number', width: 130, min: 0, step: 10, unit: ' 秒', keywords: 'sftp 会话 空闲 超时 自动关闭 释放 通道 重建 TODO', todo: '后端未消费' },
           { key: 'sftpVerifyHash', title: '传输完成后完整性 Hash 校验', desc: '文件完整传输结束后，对整个文件计算 SHA256 哈希做完整性校验，校验失败标记任务异常；开启会增加 CPU 与 IO 开销', kind: 'switch', keywords: 'sftp 完整性 hash sha256 校验 哈希 完成 异常 cpu io TODO', todo: '后端未消费' },
-          { key: 'sftpBlacklist', title: '文件黑名单 glob 过滤列表', desc: '上传文件时，文件名匹配黑名单规则将自动跳过，不创建上传任务，一行一条 glob 表达式', kind: 'textarea', placeholder: '例如：*.tmp', keywords: 'sftp 黑名单 过滤 glob 跳过 上传 DS_Store Thumbs.db 排除 ignore TODO', todo: '前后端均未消费' },
+          { key: 'sftpBlacklist', title: '文件黑名单 glob 过滤列表', desc: '上传文件时，文件名匹配黑名单规则将自动跳过，不创建上传任务，一行一条 glob 表达式', kind: 'textarea', placeholder: '例如：*.tmp', keywords: 'sftp 黑名单 过滤 glob 跳过 上传 DS_Store Thumbs.db 排除 ignore' },
         ],
       },
       {

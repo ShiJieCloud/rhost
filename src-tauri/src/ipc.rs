@@ -8,7 +8,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::ssh::session::connect_and_auth;
-use crate::ssh::sftp::TransferProgress;
+use crate::ssh::sftp::{SftpTransferOptions, TransferProgress};
 use crate::ssh::{AuthMethod, HostKeyCheck, HostKeyPolicy, SessionConfig, SessionManager};
 use crate::store::{self, StoredHost};
 
@@ -406,6 +406,7 @@ pub async fn sftp_upload(
     chunk_kb: Option<u32>,
     resume: Option<bool>,
     max_bytes: Option<u64>,
+    options: SftpTransferOptions,
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
@@ -420,6 +421,7 @@ pub async fn sftp_upload(
             chunk_kb,
             resume,
             max_bytes,
+            options,
             channel,
         )
         .await
@@ -439,6 +441,7 @@ pub async fn sftp_download(
     chunk_kb: Option<u32>,
     resume: Option<bool>,
     max_bytes: Option<u64>,
+    options: SftpTransferOptions,
     channel: Channel<TransferProgress>,
     manager: State<'_, SessionManager>,
 ) -> Result<(), String> {
@@ -452,6 +455,7 @@ pub async fn sftp_download(
             chunk_kb,
             resume,
             max_bytes,
+            options,
             channel,
         )
         .await

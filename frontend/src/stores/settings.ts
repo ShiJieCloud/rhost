@@ -255,7 +255,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sftpResume: true,
   sftpResumeCheck: 'size',
   sftpOverwritePolicy: 'newer',
-  sftpUploadTemp: true,
+  sftpUploadTemp: false,
   sftpPreserveMeta: false,
   sftpGlobalConcurrency: 3,
   sftpHostConcurrency: 1,

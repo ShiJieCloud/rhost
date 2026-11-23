@@ -40,6 +40,8 @@ tauri-plugin-clipboard-manager = "2.4.1"
 tauri-plugin-prevent-default = "6"
 font-kit = "0.14"
 sha2 = "0.10"
+# 下载保留元数据：跨平台设置本地文件 mtime（std 不支持，filetime 纯 Rust 无系统依赖）
+filetime = "0.2"
 # 配置文件密码加密导出（§5.1）：PBKDF2-SHA256 派生 + AES-256-GCM
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }

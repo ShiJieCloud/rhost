@@ -9,7 +9,7 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use super::session::{ExecOutput, SshSession};
-use super::sftp::{RemoteDirListing, TransferProgress};
+use super::sftp::{RemoteDirListing, SftpTransferOptions, TransferProgress};
 use super::{SessionConfig, SshError};
 use tauri::ipc::Channel;
 
@@ -198,6 +198,7 @@ impl SessionManager {
         chunk_kb: Option<u32>,
         resume: Option<bool>,
         max_bytes: Option<u64>,
+        options: SftpTransferOptions,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
@@ -210,6 +211,7 @@ impl SessionManager {
                     chunk_kb,
                     resume,
                     max_bytes,
+                    options,
                     channel,
                 )
                 .await
@@ -228,6 +230,7 @@ impl SessionManager {
         chunk_kb: Option<u32>,
         resume: Option<bool>,
         max_bytes: Option<u64>,
+        options: SftpTransferOptions,
         channel: Channel<TransferProgress>,
     ) -> Result<(), SshError> {
         let session = { self.sessions.read().await.get(session_id).cloned() };
@@ -240,6 +243,7 @@ impl SessionManager {
                     chunk_kb,
                     resume,
                     max_bytes,
+                    options,
                     channel,
                 )
                 .await
