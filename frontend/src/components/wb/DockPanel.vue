@@ -342,6 +342,10 @@ interface Transfer {
   forceOverwrite?: boolean
   /** 任务所属会话 backendId：用于按主机并发计数与断线后归属判断 */
   backendId?: string
+  /** 已自动重试次数（手动重试会清零） */
+  retryCount?: number
+  /** 自动重试等待定时器句柄（用于取消/手动重试时清理） */
+  retryTimer?: number
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
@@ -581,13 +585,42 @@ async function runTask(t: Transfer) {
   }
 
   const failTask = (msg: string) => {
-    t.status = 'error'
     t.speed = 0
     t.error = msg
-    reportLog('error', SFTP_TRANSFER_FAILED, `${t.dir === 'up' ? '上传' : '下载'}失败`, {
+    const dirText = t.dir === 'up' ? '上传' : '下载'
+    const maxRetry = Math.max(0, savedSettings.sftpRetryCount | 0)
+    const attempt = t.retryCount || 0
+    // 达到重试上限（或配置为 0）时标记失败；取消与 NEED_CONFIRM 不经过此处
+    if (attempt < maxRetry) {
+      t.status = 'error'
+      t.retryCount = attempt + 1
+      const interval = Math.max(0, savedSettings.sftpRetryIntervalMs | 0)
+      reportLog('warn', SFTP_TRANSFER_FAILED, `${dirText}失败，准备自动重试`, {
+        name: t.name, err: msg, attempt: attempt + 1, max: maxRetry, interval_ms: interval,
+        transferred: Math.round(t.size * t.pct / 100), total: t.size,
+      })
+      toast(`${dirText}失败，${interval}ms 后自动重试（${attempt + 1}/${maxRetry}）`, 'warn', 2200)
+      if (t.retryTimer) clearTimeout(t.retryTimer)
+      // 延迟后置回 pending 重新排队；期间任务保持 error 状态可被手动重试/移除
+      t.retryTimer = window.setTimeout(() => {
+        t.retryTimer = undefined
+        if (!transfers.value.some(x => x.id === t.id)) return
+        if (t.status !== 'error') return
+        t.status = 'pending'
+        t.error = undefined
+        reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dirText}自动重试重新入队`, {
+          name: t.name, size: t.size, dir: t.dir, from: t.localPath, to: t.remotePath,
+        })
+        schedulePump()
+      }, interval)
+      schedulePump()
+      return
+    }
+    t.status = 'error'
+    reportLog('error', SFTP_TRANSFER_FAILED, `${dirText}失败`, {
       name: t.name, err: msg, transferred: Math.round(t.size * t.pct / 100), total: t.size,
     })
-    toast(`${t.dir === 'up' ? '上传' : '下载'}失败：${taskName(t)}`, 'warn', 2200)
+    toast(`${dirText}失败：${taskName(t)}`, 'warn', 2200)
     schedulePump()
   }
   const finishTask = () => {
@@ -691,6 +724,8 @@ async function runTask(t: Transfer) {
 /** 取消/移除任务：进行中的任务先通知后端取消，再出队启动下一个 */
 function removeTask(t: Transfer) {
   if (sftpLocked.value) return
+  // 移除任务时清理待触发的自动重试定时器，避免对已出队任务重新入队
+  if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
   if (t.status === 'running') {
     const backendId = activeSession.value?.backendId
     if (backendId) {
@@ -744,6 +779,9 @@ function resumeTask(t: Transfer) {
 function retryTask(t: Transfer) {
   if (t.status !== 'error') return
   if (sftpLocked.value) return
+  // 手动重试：取消待触发的自动重试，并重置自动重试计数
+  if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
+  t.retryCount = 0
   t.pct = 0
   t.speed = 0
   t.error = undefined
