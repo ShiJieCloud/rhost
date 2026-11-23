@@ -49,6 +49,7 @@ interface LogBatch {
 /* ---- web.* 域事件常量（与后端 applog/events.rs 同步） ---- */
 export const WEB_IPC_ERROR = 'web.ipc.error'
 export const WEB_UNHANDLED_ERROR = 'web.unhandled_error'
+export const TERMINAL_RENDERER = 'terminal.renderer'
 /** SFTP 传输事件（前端队列侧上报） */
 export const SFTP_TRANSFER_ENQUEUE = 'sftp.transfer.enqueue'
 export const SFTP_TRANSFER_START = 'sftp.transfer.start'

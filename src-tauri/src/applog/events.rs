@@ -174,7 +174,7 @@ pub const TUNNEL_LISTENER_FAILED: &str = "tunnel.listener_failed";
 /// 前端上报允许的 event_id 域（report_app_log 校验白名单）：
 /// web.* 前端通用事件 + sftp.* 传输队列事件（队列管理逻辑在前端，§7.3）
 /// + ai.plan.* 计划判定埋点（事件产生点在前端裁决处，见 ai-plan-trigger-design §6.9）
-pub const REPORT_ALLOWED_PREFIXES: &[&str] = &["web.", "sftp.", "ai."];
+pub const REPORT_ALLOWED_PREFIXES: &[&str] = &["web.", "sftp.", "ai.", "terminal."];
 
 /// 敏感设置键静态集合：settings.change 埋点统一查表脱敏，不记值只记 changed
 pub const SENSITIVE_SETTING_KEYS: &[&str] = &[

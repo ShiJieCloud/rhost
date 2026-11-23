@@ -6259,6 +6259,14 @@ body {
   background: rgba(247, 118, 142, 0.14);
   border: 1px solid rgba(247, 118, 142, 0.28);
 }
+/* 渲染后端当前值标签 */
+.st-renderer-tag {
+  flex: none;
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  white-space: nowrap;
+}
 /* 开关 */
 .st-switch {
   position: relative;

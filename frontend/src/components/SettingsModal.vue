@@ -11,7 +11,7 @@ import {
   pendingSettingsSection, persistSettings, APP_LOCK_IDLE_OPTIONS,
   type AppSettings,
 } from '../stores/settings'
-import { revealLogStorageDir, syncLogConfig } from '../stores/applog'
+import { revealLogStorageDir, syncLogConfig, report, TERMINAL_RENDERER } from '../stores/applog'
 import { isTauri } from '../lib/tauri'
 import { lockSlots, refreshLockSlots, suppressBlurLock } from '../stores/appLock'
 import LockPasswordEditor from './LockPasswordEditor.vue'
@@ -151,7 +151,6 @@ const PANELS: PanelDef[] = [
           { key: 'uiTheme', title: '界面主题', desc: '跟随系统时随系统外观自动切换', kind: 'segmented', keywords: '界面 主题 明暗 深色 浅色 跟随系统',
             options: [{ v: 'dark', t: '深色' }, { v: 'light', t: '浅色' }, { v: 'auto', t: '跟随系统' }] },
           { key: 'accent', title: '强调色', desc: '用于按钮、选中态与焦点环', kind: 'color', keywords: '强调色 主题色 accent 颜色' },
-          { key: 'opacity', title: '背景不透明度', desc: '降低数值可获得毛玻璃效果', kind: 'range', min: 60, max: 100, unit: '%', keywords: '透明度 不透明 opacity 毛玻璃 模糊 blur TODO', todo: '仅持久化，未接入窗口透明度' },
         ],
       },
       {
@@ -404,11 +403,9 @@ const PANELS: PanelDef[] = [
     title: '高级', sub: '渲染、性能与配置文件管理',
     groups: [
       {
-        label: '渲染',
+        label: '终端渲染',
         rows: [
-          { key: 'gpuAccel', title: 'GPU 加速', desc: '关闭后使用软件渲染，可解决花屏问题', kind: 'switch', keywords: 'gpu 加速 硬件 渲染 acceleration 性能 TODO', todo: '仅持久化，渲染层未消费' },
-          { key: 'renderer', title: '渲染后端', kind: 'select', width: 140, keywords: '渲染器 后端 renderer webgl webgpu TODO', todo: '仅持久化，渲染层未消费',
-            options: [{ v: 'auto', t: '自动' }, { v: 'webgl', t: 'WebGL' }, { v: 'webgpu', t: 'WebGPU' }, { v: 'canvas', t: 'Canvas' }] },
+          { key: 'gpuAccel', title: 'GPU 加速', desc: '开启使用 WebGL 渲染，异常自动降级；关闭使用 DOM 渲染，可解决花屏问题', kind: 'switch', keywords: 'gpu 加速 渲染 硬件 webgl canvas dom 花屏' },
         ],
       },
       {
@@ -851,6 +848,7 @@ async function save() {
   }
   // 日志存储路径仅重启生效：变更时醒目提醒
   const storagePathChanged = draft.logStoragePath !== savedSettings.logStoragePath
+  const gpuChanged = draft.gpuAccel !== savedSettings.gpuAccel
 
   /* ---- 应用锁开关联动（app-lock-design.md §6.3） ---- */
   // 禁止「裸开」：启用应用锁前必须已有密码槽位。
@@ -865,6 +863,9 @@ async function save() {
   syncLogConfig()
   if (storagePathChanged) {
     toast('日志存储路径已变更，重启应用后生效', 'warn', 3200)
+  } else if (gpuChanged) {
+    report('info', TERMINAL_RENDERER, `GPU 加速设置变更：${draft.gpuAccel ? '开启' : '关闭'}`, { gpu_accel: draft.gpuAccel })
+    toast('GPU 加速已即时生效', 'ok', 2200)
   } else if (keyMigrated) {
     toast('设置已保存，API 密钥已存入系统钥匙串', 'ok', 2400)
   } else {

@@ -23,7 +23,6 @@ export interface AppSettings {
   /* ---- 外观 ---- */
   uiTheme: string
   accent: string
-  opacity: number
   /** 启动动画最短展示时长（ms，200~5000，消费侧夹取）；呼吸动画不受影响，重启生效 */
   splashDurationMs: number
   /** 启动动画背景：true 透明悬浮桌面（需 macOSPrivateApi）/ false 深色底 + LOGO；重启生效 */
@@ -68,7 +67,6 @@ export interface AppSettings {
   'key.settings': string
   /* ---- 高级 ---- */
   gpuAccel: boolean
-  renderer: string
   /* ---- 监控 ---- */
   /** 工具内存采集间隔（秒），驱动底部状态栏内存指标轮询 */
   memInterval: number
@@ -192,7 +190,6 @@ export interface AppSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   uiTheme: 'dark',
   accent: '#3ddc84',
-  opacity: 96,
   splashDurationMs: 400,
   splashTransparent: true,
 
@@ -228,7 +225,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   'key.settings': '⌘+,',
 
   gpuAccel: true,
-  renderer: 'auto',
 
   memInterval: 2,
   metricsInterval: 3,
@@ -312,6 +308,9 @@ function cloneDefaults(): AppSettings {
 
 /** 启动初始/后端不可用时为默认值；loadAppConfig 后由快照 hydrate 覆盖 */
 export const savedSettings = reactive<AppSettings>(cloneDefaults())
+
+/** 终端实际使用的渲染器（运行时状态，由 TerminalPane 初始化时设置） */
+export const activeRenderer = ref<string>('')
 
 /** settings 节（非 log* 键，后端 camelCase 原样）灌入内存态 */
 function applySettingsSection(section: Record<string, unknown>) {

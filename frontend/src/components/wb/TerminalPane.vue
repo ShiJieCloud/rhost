@@ -3,6 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { WebglAddon } from '@xterm/addon-webgl'
+import { CanvasAddon } from '@xterm/addon-canvas'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager'
 import '@xterm/xterm/css/xterm.css'
@@ -14,7 +16,8 @@ import { addToAiChat } from '../../stores/aiQuote'
 import { openSnippetEditor } from '../../stores/snippetDraft'
 import { hosts, showNewConn } from '../../stores/hosts'
 import { appLocked } from '../../stores/appLock'
-import { resolveTerminalFontFamily, savedSettings } from '../../stores/settings'
+import { resolveTerminalFontFamily, savedSettings, activeRenderer } from '../../stores/settings'
+import { report, TERMINAL_RENDERER } from '../../stores/applog'
 import { accentColor, resolvedTheme, terminalPalette } from '../../styles/theme'
 import {
   activeReconnectAttempt, activeSession, activeSessionId, attachTerminal,
@@ -33,6 +36,9 @@ import type { HostStatus } from '../../types'
 interface TermInst {
   term: Terminal
   fit: FitAddon
+  /** 当前渲染器 addon（WebglAddon/CanvasAddon）；gpuAccel 关闭时为 undefined（用内置 DOM）。
+   *  热切换 gpuAccel 时先 dispose 旧实例再挂载新实例，避免渲染器叠层与上下文泄漏 */
+  rendererAddon?: { dispose(): void }
   disposables: Array<{ dispose(): void }>
 }
 
@@ -271,6 +277,36 @@ function setTermEl(id: string, el: Element | null) {
   }
 }
 
+/** 按当前 gpuAccel 设置为终端选择并挂载渲染器：开启时 WebGL → Canvas → DOM 逐级降级，
+ *  关闭时使用内置 DOM 渲染器（不挂载 addon）。返回渲染器 addon 引用与标识。
+ *  终端创建与 gpuAccel 热切换共用：切换前调用方须先 dispose 旧 addon，避免渲染器叠层。 */
+function applyRenderer(term: Terminal): { addon?: { dispose(): void }; renderer: string } {
+  if (!savedSettings.gpuAccel) {
+    activeRenderer.value = 'DOM'
+    report('info', TERMINAL_RENDERER, '终端渲染器：DOM', { gpu_accel: false, renderer: 'DOM' })
+    return { renderer: 'DOM' }
+  }
+  try {
+    const webgl = new WebglAddon()
+    term.loadAddon(webgl)
+    activeRenderer.value = 'WebGL'
+    report('info', TERMINAL_RENDERER, '终端渲染器：WebGL', { gpu_accel: true, renderer: 'WebGL' })
+    return { addon: webgl, renderer: 'WebGL' }
+  } catch {
+    try {
+      const canvas = new CanvasAddon()
+      term.loadAddon(canvas)
+      activeRenderer.value = 'Canvas'
+      report('info', TERMINAL_RENDERER, '终端渲染器：Canvas', { gpu_accel: true, renderer: 'Canvas' })
+      return { addon: canvas, renderer: 'Canvas' }
+    } catch {
+      activeRenderer.value = 'DOM'
+      report('info', TERMINAL_RENDERER, '终端渲染器：DOM', { gpu_accel: true, renderer: 'DOM' })
+      return { renderer: 'DOM' }
+    }
+  }
+}
+
 /** 为会话创建 xterm 实例并发起后端连接（幂等） */
 function mountTerminal(id: string) {
   if (termInsts.has(id)) return
@@ -302,6 +338,9 @@ function mountTerminal(id: string) {
     })
   }))
   term.open(el)
+  // GPU 加速：开启时 WebGL → Canvas → DOM 逐级降级；关闭时使用 DOM 渲染。
+  // 渲染器 addon 引用存入 inst，供 gpuAccel 变更时热切换 dispose 旧实例
+  const { addon: rendererAddon } = applyRenderer(term)
   // 注册到模块级注册表：AI 面板（App 层）读终端缓冲组装会话上下文用
   registerTerm(id, term)
   // open 后根元素必然存在，提前取出供监听注册/清理使用
@@ -359,6 +398,7 @@ function mountTerminal(id: string) {
 
   termInsts.set(id, {
     term, fit,
+    rendererAddon,
     disposables: [
       { dispose: () => screenEl.removeEventListener('copy', onCopy, true) },
       { dispose: () => screenEl.removeEventListener('paste', onPaste, true) },
@@ -404,6 +444,20 @@ watch(
     await nextTick()
     const id = activeSessionId.value
     if (id) safeFit(id)
+  },
+)
+
+/** GPU 加速开关变更 → 热切换全部活动终端的渲染器（WebGL↔Canvas↔DOM）。
+ *  渲染器仅为绘制层，终端 buffer 由 xterm core 持有，切换不丢内容；先 dispose 旧
+ *  addon 还原默认渲染器，再按新值挂载新 addon，避免渲染器叠层与 WebGL 上下文泄漏。 */
+watch(
+  () => savedSettings.gpuAccel,
+  () => {
+    for (const inst of termInsts.values()) {
+      inst.rendererAddon?.dispose()
+      inst.rendererAddon = undefined
+      inst.rendererAddon = applyRenderer(inst.term).addon
+    }
   },
 )
 

@@ -138,7 +138,6 @@ pub(crate) struct SettingsSection {
     // 外观
     ui_theme: String,
     accent: String,
-    opacity: i64,
     splash_duration_ms: i64,
     splash_transparent: bool,
     // 字体
@@ -179,7 +178,6 @@ pub(crate) struct SettingsSection {
     key_settings: String,
     // 高级
     gpu_accel: bool,
-    renderer: String,
     // 监控
     mem_interval: i64,
     metrics_interval: i64,
@@ -221,7 +219,6 @@ impl Default for SettingsSection {
         Self {
             ui_theme: "dark".into(),
             accent: "#3ddc84".into(),
-            opacity: 96,
             splash_duration_ms: 400,
             splash_transparent: true,
 
@@ -263,7 +260,6 @@ impl Default for SettingsSection {
             key_settings: "⌘+,".into(),
 
             gpu_accel: true,
-            renderer: "auto".into(),
 
             mem_interval: 2,
             metrics_interval: 3,
