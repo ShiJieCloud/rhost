@@ -188,6 +188,22 @@ impl SessionManager {
         }
     }
 
+    /// 更新会话的 SFTP 通道空闲超时（秒，0 不自动关闭）
+    pub(crate) async fn sftp_set_idle_timeout(
+        &self,
+        session_id: &str,
+        secs: u64,
+    ) -> Result<(), SshError> {
+        let session = { self.sessions.read().await.get(session_id).cloned() };
+        match session {
+            Some(s) => {
+                s.set_sftp_idle_timeout(secs);
+                Ok(())
+            }
+            None => Err(SshError::NotFound),
+        }
+    }
+
     /// 上传单个文件：本地路径 → 远端路径（同名覆盖），进度经事件推送
     pub(crate) async fn sftp_upload(
         &self,

@@ -213,4 +213,4 @@ refactor(sftp): 传输队列改为串行调度
 
 - 根目录 `README.md` 的部分技术描述已过时（写的是 Pinia、ssh2、sled、spawn_blocking、旧目录结构），与当前实现不符时**以本文档与代码为准**；
 - 仓库暂无 lint/format 配置与 CI，提交前至少保证 `npm run build` 与 `cargo test` 通过；
-- 代码中注释带"逻辑待实现"的功能（如 SFTP 覆盖策略的部分分支、SHA256 断点校验）以 `settings.ts` 字段注释为准，勿假设已生效。
+- 代码中注释带“逻辑待实现”的功能（如 SHA256 断点校验）以 `settings.ts` 字段注释为准，勿假设已生效。

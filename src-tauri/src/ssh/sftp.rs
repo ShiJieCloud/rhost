@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
@@ -111,6 +112,9 @@ pub(super) struct TransferCtl {
 
 /// 进度事件载荷（与前端约定，camelCase）。`speed` 单位 B/s，
 /// `done` 为 true 表示本次为收尾包，前端可据此切到完成态。
+/// `sha256` 仅在开启完整性校验且已算出源文件哈希时随收尾包下发，供队列展示。
+/// `skipped` 为 true 表示按覆盖策略跳过（未发生实际字节传输），前端展示"已跳过"。
+/// `verifying` 为 true 表示字节已传完、正在做 SHA256 比对（收尾前的过渡态）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
@@ -119,37 +123,36 @@ pub struct TransferProgress {
     pub total: u64,
     pub speed: u64,
     pub done: bool,
+    pub skipped: bool,
+    pub verifying: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
-
-/// 覆盖策略为 `ask` 且目标文件已存在时返回此前缀，前端据此弹确认框；
-/// 与 KEY_ENCRYPTED / HOSTKEY_UNKNOWN 同为前后端约定的协议标记，不得改为普通文案。
-pub(crate) const NEED_CONFIRM: &str = "NEED_CONFIRM";
 
 /// SFTP 单次传输选项：由前端从全局设置组装后随每次传输传入（camelCase）。
 /// 仅含传输时即需后端消费的项；调度类（并发/重试/全局限速/黑名单）由前端实现，
 /// 不进入此结构体。字段均设 `default`，保证旧前端缺传时后端可用安全缺省值。
+/// 半成品固定走同目录 `.filepart`，与覆盖策略无关。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SftpTransferOptions {
-    /// 覆盖策略：skip / overwrite / newer / ask
+    /// 目标同名文件已存在时的处理：overwrite 直接覆盖 / skip 跳过 /
+    /// newer 仅当源文件更新时覆盖 / ask 返回 NEED_CONFIRM 由前端询问
     pub overwrite_policy: String,
-    /// 上传先写 `.tmp` 临时文件再原子重命名（失败不留半成品）
-    pub upload_temp: bool,
     /// 传输完成后保留源文件 mtime 与权限属性
     pub preserve_meta: bool,
-    /// 断点校验方式：size / sizeMtime / sha256
+    /// 断点校验方式：size / sizeMtime / sha256（part 无源 mtime 语义，sizeMtime 退化为 size）
     pub resume_check: String,
-    /// 单任务带宽限速 KB/s，0=不限（阶段 2 实现，先接收参数）
+    /// 单任务带宽限速 KB/s，0=不限
     pub task_rate_kb: u64,
-    /// 传输完成后 SHA256 校验（阶段 4 实现，先接收参数）
+    /// 传输完成后 SHA256 校验：在 rename 覆盖目标前比对 part 内容
     pub verify_hash: bool,
 }
 
 impl Default for SftpTransferOptions {
     fn default() -> Self {
         Self {
-            overwrite_policy: "newer".into(),
-            upload_temp: false,
+            overwrite_policy: "overwrite".into(),
             preserve_meta: false,
             resume_check: "size".into(),
             task_rate_kb: 0,
@@ -168,6 +171,10 @@ pub(super) struct SftpState {
     manage: Mutex<()>,
     /// 会话标签（通道建立日志事件用）
     sid: String,
+    /// 最近一次 SFTP 操作时间：空闲超时监控据此判断是否需要关闭缓存通道
+    last_active: Mutex<Instant>,
+    /// 空闲超时秒数（0=不自动关闭），由前端经 IPC 下发
+    idle_timeout_sec: AtomicU64,
 }
 
 impl SftpState {
@@ -177,7 +184,30 @@ impl SftpState {
             tasks: Mutex::new(HashMap::new()),
             manage: Mutex::new(()),
             sid: sid.to_string(),
+            last_active: Mutex::new(Instant::now()),
+            idle_timeout_sec: AtomicU64::new(0),
         }
+    }
+
+    /// 更新空闲超时配置（秒，0 表示不自动关闭）
+    pub(super) fn set_idle_timeout(&self, secs: u64) {
+        self.idle_timeout_sec.store(secs, Ordering::Relaxed);
+    }
+
+    /// 是否满足空闲关闭条件：已配置超时、超时内无任何 SFTP 操作、无进行中传输，
+    /// 且当前确实缓存了通道。各锁独立获取，不与 `get` 形成嵌套死锁。
+    async fn should_close_idle(&self) -> bool {
+        let timeout = self.idle_timeout_sec.load(Ordering::Relaxed);
+        if timeout == 0 {
+            return false;
+        }
+        if self.last_active.lock().await.elapsed() < Duration::from_secs(timeout) {
+            return false;
+        }
+        if !self.tasks.lock().await.is_empty() {
+            return false;
+        }
+        self.inner.lock().await.is_some()
     }
 
     /// 注册一个新任务的控制柄并返回（键为前端传入的 task_id）
@@ -193,6 +223,8 @@ impl SftpState {
     /// 任务结束（成功/失败/取消）后从表中移除，避免表无限增长
     pub(super) async fn remove_task(&self, task_id: u64) {
         self.tasks.lock().await.remove(&task_id);
+        // 传输结束视为一次活跃操作，避免长任务刚结束时被空闲监控立即关闭通道
+        *self.last_active.lock().await = Instant::now();
     }
 
     /// 取缓存的 RawSftpSession；不存在则开新通道初始化。
@@ -201,6 +233,8 @@ impl SftpState {
         &self,
         handle: &Arc<Mutex<client::Handle<ClientHandler>>>,
     ) -> Result<Arc<RawSftpSession>, SshError> {
+        // 任何 SFTP 操作都刷新活跃时间（空闲超时以此为准）
+        *self.last_active.lock().await = Instant::now();
         let mut guard = self.inner.lock().await;
         if let Some(s) = guard.as_ref() {
             return Ok(s.clone());
@@ -222,6 +256,34 @@ impl SftpState {
     async fn invalidate(&self) {
         *self.inner.lock().await = None;
     }
+}
+
+/// 空闲监控：会话存活期间定时检查，超过 `idle_timeout_sec` 无 SFTP 操作且无进行中
+/// 传输时关闭缓存的通道（下次操作自动重建），不触碰 SSH 主连接。0 表示不自动关闭。
+/// 通过 Weak 持有自身：SshSession 释放后 Weak 升级失败，任务随之退出。
+pub(super) fn spawn_sftp_idle_watch(state: Weak<SftpState>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        const TICK: Duration = Duration::from_secs(15);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = sleep(TICK) => {}
+            }
+            let Some(st) = state.upgrade() else { break };
+            if st.should_close_idle().await {
+                let idle_s = st.idle_timeout_sec.load(Ordering::Relaxed);
+                st.invalidate().await;
+                crate::applog::emit(
+                    log::Level::Debug,
+                    "ssh",
+                    crate::applog::events::SSH_SFTP_CHANNEL_CLOSE,
+                    Some(&st.sid),
+                    "SFTP 通道空闲超时关闭",
+                    Some(serde_json::json!({ "idle_s": idle_s })),
+                );
+            }
+        }
+    });
 }
 
 /// SFTP 权限位 → "rwxr-xr-x"（与 localfs 本地面板同一套规则，含 s/S/t/T）
@@ -301,6 +363,12 @@ fn parse_longname_owner(longname: &str) -> Option<(String, String)> {
 }
 
 impl SshSession {
+    /// 更新本会话的 SFTP 空闲超时（秒，0 表示不自动关闭）。
+    /// 由前端在下发全局设置时调用，仅影响缓存通道的回收，不影响 SSH 主连接。
+    pub(crate) fn set_sftp_idle_timeout(&self, secs: u64) {
+        self.sftp.set_idle_timeout(secs);
+    }
+
     /// 列举远端目录。`path` 为 None/空串时优先用 Shell CWD（由 OSC 6667 钩子上报），
     /// 仍无则用登录默认目录（realpath "."），保持 Shell 与 SFTP 目录一致。
     /// SFTP 通道失效时自动重建并重试一次，避免偶发断流后面板永久不可用。
@@ -412,9 +480,11 @@ impl SshSession {
     }
 
     /// 单文件上传：本地 → 远端。分块大小由 `chunk_kb` 指定（缺省 64KB），进度经
-    /// IPC [`Channel`] 流式推送，支持暂停/取消。**断点续传**（`resume` 开启时）：
-    /// 若远端已存在同名文件且小于本地，从已有偏移处续写（不截断）；远端已完整则
-    /// 直接跳过；远端大于本地（源文件变更）时截断重传。`resume` 关闭时一律全量重传。
+    /// IPC [`Channel`] 流式推送，支持暂停/取消。数据先写入目标同目录的
+    /// `<目标>.filepart`，完成并（开启时）通过 SHA256 校验后同目录 rename 覆盖目标；
+    /// 校验失败只删 part，目标旧版本不受影响。**断点续传**（`resume` 开启时）：
+    /// 以 part 已有大小判定续写起点；part 比源大（源已变更）时截断重传。
+    /// `resume` 关闭时一律全量重传。
     pub(crate) async fn upload_file(
         &self,
         task_id: u64,
@@ -443,9 +513,11 @@ impl SshSession {
             )
             .await;
 
+        // 源文件 SHA256（仅 verify 开启时算出）：随收尾进度包下发，队列展示用
+        let mut final_hash: Option<String> = None;
         // async block 返回 Result<(已传, 总大小), (错误, 已传, 总大小)>，
         // 这样内部可用 ?，且错误路径也能拿到已传字节用于收尾进度
-        let outcome: Result<(u64, u64), (SshError, u64, u64)> = async {
+        let outcome: Result<(u64, u64, bool), (SshError, u64, u64)> = async {
             let sftp = self
                 .sftp
                 .get(&self.handle)
@@ -501,88 +573,93 @@ impl SshSession {
                 }
             }
 
-            // 探测远端目标：是否存在 + 属性（size/mtime），用于覆盖策略与断点校验
-            let remote_meta = sftp.lstat(&remote_path).await;
-            let (target_exists, remote_attrs) = match remote_meta {
-                Ok(m) => (true, Some(m.attrs)),
-                Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => (false, None),
+            // 覆盖策略：目标已存在时按策略决定跳过/询问；overwrite 直接进入原有覆盖流程。
+            // 仅探测一次，未命中策略（overwrite / 源更新）时继续走 .filepart + rename
+            if options.overwrite_policy != "overwrite" {
+                let target = probe_remote(&sftp, &remote_path).await.map_err(|e| {
+                    (
+                        SshError::Channel(format!("探测远端目标 {remote_path} 失败: {e}")),
+                        0u64,
+                        total,
+                    )
+                })?;
+                if let Some(attrs) = target {
+                    match options.overwrite_policy.as_str() {
+                        // skip：目标已存在即视为完成，不创建任何文件
+                        "skip" => return Ok((0, total, true)),
+                        // newer：远端不旧于源（秒级 mtime）则跳过，避免用旧内容覆盖新内容
+                        "newer" => {
+                            let target_mtime = attrs.mtime.unwrap_or(0) as u64;
+                            if target_mtime >= src_mtime {
+                                return Ok((0, total, true));
+                            }
+                        }
+                        // ask：交由前端询问，前缀 NEED_CONFIRM 是前后端约定标记
+                        "ask" => {
+                            return Err((
+                                SshError::TransferRejected(format!(
+                                    "NEED_CONFIRM: 远端文件已存在: {remote_path}"
+                                )),
+                                0u64,
+                                total,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 半成品固定写在目标同目录的 `<目标>.filepart`，完成后同目录 rename 覆盖目标：
+            // 传输与校验通过前目标保持旧版本，失败只影响 part
+            let part_path = format!("{remote_path}.filepart");
+            let part_meta = sftp.lstat(&part_path).await;
+            let part_attrs = match part_meta {
+                Ok(m) => Some(m.attrs),
+                Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => None,
                 Err(e) => {
                     return Err((
-                        SshError::Channel(format!("探测远端文件 {remote_path} 失败: {e}")),
+                        SshError::Channel(format!("探测半成品文件 {part_path} 失败: {e}")),
                         0,
                         total,
                     ));
                 }
             };
-
-            // 覆盖策略：目标存在时判定跳过 / 询问；overwrite 与未知策略放行继续传输
-            if target_exists {
-                let rsize = remote_attrs.as_ref().and_then(|a| a.size).unwrap_or(0);
-                let skip = match options.overwrite_policy.as_str() {
-                    "skip" => true,
-                    "newer" => {
-                        // size 不同视为源有变化；size 相同则要求源 mtime 更新才覆盖
-                        if rsize != total {
-                            false
-                        } else {
-                            let rmtime =
-                                remote_attrs.as_ref().and_then(|a| a.mtime).unwrap_or(0) as u64;
-                            src_mtime <= rmtime
-                        }
-                    }
-                    "ask" => {
-                        return Err((
-                            SshError::TransferRejected(format!("{NEED_CONFIRM}:{remote_path}")),
-                            0,
-                            total,
-                        ));
-                    }
-                    _ => false, // overwrite / 未知 → 不跳过
-                };
-                if skip {
-                    return Ok((total, total));
-                }
-            }
-
-            // 断点续传 offset 判定：overwrite 强制截断；否则按 resume + resume_check 决定
-            let remote_size = remote_attrs.as_ref().and_then(|a| a.size).unwrap_or(0);
-            let force_truncate = matches!(options.overwrite_policy.as_str(), "overwrite");
-            let offset = if force_truncate || !resume {
-                0 // 强制覆盖或关闭续传：一律截断全量重传
-            } else if remote_size == total {
-                return Ok((total, total)); // 已完整，直接完成
-            } else if remote_size < total {
+            // 断点续传以 part 大小为准：目标旧内容不参与续传
+            let part_size = part_attrs.as_ref().and_then(|a| a.size).unwrap_or(0);
+            let offset = if !resume || part_size > total {
+                0 // 关闭续传 / part 比源大（源文件已变更）：截断重传
+            } else if part_size == total {
+                total // part 已完整：跳过传输，直接进入校验与 rename
+            } else if part_size > 0 {
                 let can_resume = match options.resume_check.as_str() {
-                    "sizeMtime" => {
-                        // mtime 一致才认为远端半截是同一源的延续，否则截断重传
-                        let rmtime =
-                            remote_attrs.as_ref().and_then(|a| a.mtime).unwrap_or(0) as u64;
-                        src_mtime == rmtime
-                    }
                     "sha256" => {
-                        // 读远端已有部分与源前缀比对哈希；>32MB 退化为 sizeMtime 避免耗时
-                        if remote_size > 32 * 1024 * 1024 {
-                            let rmtime = remote_attrs
-                                .as_ref()
-                                .and_then(|a| a.mtime)
-                                .unwrap_or(0)
-                                as u64;
-                            src_mtime == rmtime
+                        // 前缀哈希比对；>32MB 退化为按大小续传（内容差异由完成后的校验兜底）
+                        if part_size > 32 * 1024 * 1024 {
+                            true
                         } else {
-                            verify_prefix_sha256(&sftp, &remote_path, &local, remote_size).await
+                            verify_prefix_sha256(&sftp, &part_path, &local, part_size).await
                         }
                     }
-                    _ => true, // size：仅比大小（默认）
+                    // sizeMtime：part 的 mtime 是上次写入时间，无法与源 mtime 比对，退化为按大小
+                    _ => true,
                 };
                 if can_resume {
-                    remote_size // 从已有偏移续写
+                    part_size // 从断点续写
                 } else {
                     0 // 校验未通过，截断重传
                 }
             } else {
-                0 // 远端比本地大（源文件变更），截断重传
+                0
             };
+            // 完整性校验：源（本地）哈希随传输流式累积，仅在开启校验时启用
+            let mut src_hasher = options.verify_hash.then(Sha256::new);
             if offset > 0 {
+                if let Some(h) = src_hasher.as_mut() {
+                    // 续传：先补算已存在前缀，保证最终哈希覆盖整个文件
+                    feed_local_prefix(h, &local, offset)
+                        .await
+                        .map_err(|e| (e, 0u64, total))?;
+                }
                 src.seek(SeekFrom::Start(offset)).await.map_err(|e| {
                     (
                         SshError::Channel(format!("定位本地文件偏移失败: {e}")),
@@ -592,24 +669,18 @@ impl SshSession {
                 })?;
             }
 
-            // 上传临时文件：写入 remote_path.tmp，成功后原子重命名，失败不留半成品
-            let write_path = if options.upload_temp {
-                format!("{remote_path}.tmp")
-            } else {
-                remote_path.clone()
-            };
-            // 续传时不带 TRUNCATE 保留已有内容；从头传时 TRUNCATE 清除残留
+            // 续传时不带 TRUNCATE 保留 part 已有内容；从头传时 TRUNCATE 清除残留
             let flags = if offset > 0 {
                 OpenFlags::WRITE | OpenFlags::CREATE
             } else {
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
             };
             let rhandle = sftp
-                .open(&write_path, flags, FileAttributes::default())
+                .open(&part_path, flags, FileAttributes::default())
                 .await
                 .map_err(|e| {
                     (
-                        SshError::Channel(format!("打开远端文件 {write_path} 失败: {e}")),
+                        SshError::Channel(format!("打开半成品文件 {part_path} 失败: {e}")),
                         0,
                         total,
                     )
@@ -623,18 +694,29 @@ impl SshSession {
             let mut last_bytes = offset;
             // 续传起始即上报一次，前端进度条直接跳到断点位置
             if offset > 0 {
-                emit_progress(&channel, task_id, transferred, total, 0, false);
+                emit_progress(&channel, task_id, transferred, total, 0, false, None);
             }
             let mut limiter = RateLimiter::new(options.task_rate_kb);
 
             loop {
-                wait_if_paused(&mut paused_rx, &cancel)
-                    .await
-                    .map_err(|e| (e, transferred, total))?;
+                if let Err(e) = wait_if_paused(&mut paused_rx, &cancel).await {
+                    // 用户取消：关闭句柄后删除 part；暂停/网络失败仍保留 part 供续传
+                    let _ = sftp.close(rhandle.as_str()).await;
+                    remove_part_file(&sftp, &part_path).await;
+                    return Err((e, transferred, total));
+                }
                 if cancel.is_cancelled() {
+                    let _ = sftp.close(rhandle.as_str()).await;
+                    remove_part_file(&sftp, &part_path).await;
                     return Err((SshError::Cancelled, transferred, total));
                 }
-                let n = src.read(&mut buf).await.map_err(|e| {
+                // 只读到开始时的 total 为止：源文件若被追加，不把多余字节带上（收尾 stat 会报变更）
+                let remaining = total.saturating_sub(offset);
+                if remaining == 0 {
+                    break;
+                }
+                let want = remaining.min(chunk as u64) as usize;
+                let n = src.read(&mut buf[..want]).await.map_err(|e| {
                     (
                         SshError::Channel(format!("读取本地文件失败: {e}")),
                         transferred,
@@ -642,7 +724,7 @@ impl SshSession {
                     )
                 })?;
                 if n == 0 {
-                    break; // 传输完成：退出循环执行收尾（临时文件重命名 / 保留元数据）
+                    break; // 传输完成：退出循环执行收尾（校验 / 同目录 rename）
                 }
                 sftp.write(rhandle.as_str(), offset, buf[..n].to_vec())
                     .await
@@ -653,6 +735,9 @@ impl SshSession {
                             total,
                         )
                     })?;
+                if let Some(h) = src_hasher.as_mut() {
+                    h.update(&buf[..n]);
+                }
                 limiter.allow(n as u64).await;
                 offset += n as u64;
                 transferred += n as u64;
@@ -661,60 +746,123 @@ impl SshSession {
                 if now.duration_since(last_emit) >= PROGRESS_INTERVAL {
                     let speed = ((transferred - last_bytes) * 1000)
                         / now.duration_since(last_emit).as_millis().max(1) as u64;
-                    emit_progress(&channel, task_id, transferred, total, speed, false);
+                    emit_progress(&channel, task_id, transferred, total, speed, false, None);
                     last_emit = now;
                     last_bytes = transferred;
                 }
             }
 
-            // 传输成功收尾：关闭写句柄 → 临时文件原子重命名 → 保留源 mtime/权限
+            // 收尾顺序：关闭写句柄 → 写 part 元数据 → 校验 part → 同目录 rename 覆盖目标。
+            // 校验未通过只删除 part，目标旧版本保持不动
             let _ = sftp.close(rhandle.as_str()).await;
-            if options.upload_temp {
-                let tmp = format!("{remote_path}.tmp");
-                if posix_rename(&sftp, &tmp, &remote_path).await.is_err() {
-                    if let Err(e) = sftp.rename(&tmp, &remote_path).await {
-                        let _ = sftp.remove(&tmp).await;
-                        return Err((
-                            SshError::Channel(format!("重命名临时文件 {tmp} 失败: {e}")),
-                            transferred,
-                            total,
-                        ));
-                    }
-                }
-                debug!("SFTP 上传临时文件已重命名: {tmp} → {remote_path}");
+            // 数据已传完但在校验/rename 前被取消：同样按“取消删 part”处理
+            if cancel.is_cancelled() {
+                remove_part_file(&sftp, &part_path).await;
+                return Err((SshError::Cancelled, transferred, total));
             }
             if options.preserve_meta {
-                // 复用目标已有属性（保留 atime 等），仅覆盖 mtime 与权限
+                // 属性写在 part 上，rename 覆盖后随 inode 一并生效
                 let mut attrs = sftp
-                    .lstat(&remote_path)
+                    .lstat(&part_path)
                     .await
                     .map(|m| m.attrs)
                     .unwrap_or_default();
                 attrs.mtime = Some(src_mtime as u32);
                 attrs.permissions = Some(src_perm);
-                if let Err(e) = sftp.setstat(&remote_path, attrs).await {
+                if let Err(e) = sftp.setstat(&part_path, attrs).await {
                     debug!("SFTP 保留元数据失败（不影响传输结果）: {e}");
                 }
             }
-            Ok((transferred, total))
+            if options.verify_hash {
+                // 数据已全部写完，进入整文件哈希比对：先推一个 100% 进度包，
+                // 前端据此显示"校验中"转圈（最终 done 包在比对结束后才发出）
+                emit_verifying(&channel, task_id, total);
+                // 源哈希在传输过程中已流式计算完成，无需再读本地文件
+                let local_hash = format!(
+                    "{:x}",
+                    src_hasher
+                        .take()
+                        .expect("verify 开启时已创建源哈希")
+                        .finalize()
+                );
+                final_hash = Some(local_hash.clone());
+                // 严格模式：源文件在传输期间不得被其它进程修改
+                if let Err(e) = check_local_unchanged(&local, total, src_mtime).await {
+                    remove_part_file(&sftp, &part_path).await;
+                    return Err((e, transferred, total));
+                }
+                // 目标哈希仍需回读远端 part（SFTP 写入无内容回显）；
+                // 回读失败同样删除 part，避免下次因大小相等被当成已完成而跳过校验
+                let remote_hash = match remote_file_sha256(&sftp, &part_path).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        remove_part_file(&sftp, &part_path).await;
+                        return Err((e, transferred, total));
+                    }
+                };
+                if remote_hash != local_hash {
+                    let name = local.rsplit('/').next().unwrap_or(&local);
+                    crate::applog::emit(
+                        log::Level::Error,
+                        "sftp",
+                        crate::applog::events::SFTP_TRANSFER_VERIFY_FAILED,
+                        Some(self.sftp.sid.as_str()),
+                        "完整性校验失败",
+                        Some(serde_json::json!({
+                            "name": name,
+                            "expect": local_hash,
+                            "actual": remote_hash,
+                        })),
+                    );
+                    // 校验不通过：只删 part，目标旧版本不受影响
+                    remove_part_file(&sftp, &part_path).await;
+                    return Err((
+                        SshError::TransferRejected("文件完整性校验失败".to_string()),
+                        transferred,
+                        total,
+                    ));
+                }
+                debug!("SFTP 上传 SHA256 校验通过: {part_path}");
+            }
+            // 校验通过（或未开启校验）才替换目标：同目录 rename 为原子覆盖
+            if let Err(e) = rename_overwrite(&sftp, &part_path, &remote_path).await {
+                // 保留 part：重试可继续续传或只重做 rename
+                return Err((
+                    SshError::Channel(format!(
+                        "重命名半成品 {part_path} → {remote_path} 失败: {e}"
+                    )),
+                    transferred,
+                    total,
+                ));
+            }
+            debug!("SFTP 上传完成: {part_path} → {remote_path}");
+            Ok((transferred, total, false))
         }
         .await;
 
-        let (result, transferred, total) = match outcome {
-            Ok((t, total)) => (Ok(()), t, total),
-            Err((e, t, total)) => (Err(e), t, total),
+        let (result, transferred, total, skipped) = match outcome {
+            Ok((t, total, skipped)) => (Ok(()), t, total, skipped),
+            Err((e, t, total)) => (Err(e), t, total, false),
         };
 
         self.sftp.remove_task(task_id).await;
-        emit_progress(&channel, task_id, transferred, total, 0, true);
+        emit_final_progress(
+            &channel,
+            task_id,
+            transferred,
+            total,
+            final_hash.as_deref(),
+            skipped,
+        );
         result
     }
 
     /// 单文件下载：远端 → 本地。本地父目录不存在时自动创建；分块大小由
     /// `chunk_kb` 指定（缺省 64KB），进度经 IPC [`Channel`] 流式推送，支持暂停/取消。
-    /// **断点续传**（`resume` 开启时）：若本地已有同名文件且小于远端，从已有偏移
-    /// 处续写（APPEND）；本地已完整则直接跳过；本地大于远端（源文件变更）时截断
-    /// 重传。`resume` 关闭时一律全量重传。
+    /// 数据先写入目标同目录的 `<目标>.filepart`，完成并（开启时）通过 SHA256 校验后
+    /// 同目录 rename 覆盖目标；校验失败只删 part，本地目标旧版本不受影响。
+    /// **断点续传**（`resume` 开启时）：以 part 已有大小判定续写起点；part 比源大
+    /// （源文件变更）时截断重传。`resume` 关闭时一律全量重传。
     pub(crate) async fn download_file(
         &self,
         task_id: u64,
@@ -743,7 +891,9 @@ impl SshSession {
             )
             .await;
 
-        let outcome: Result<(u64, u64), (SshError, u64, u64)> = async {
+        // 源文件 SHA256（仅 verify 开启时算出）：随收尾进度包下发，队列展示用
+        let mut final_hash: Option<String> = None;
+        let outcome: Result<(u64, u64, bool), (SshError, u64, u64)> = async {
             let sftp = self
                 .sftp
                 .get(&self.handle)
@@ -768,7 +918,7 @@ impl SshSession {
                 })?
                 .attrs;
             let total = attrs.size.unwrap_or(0);
-            // 远端 mtime / 权限：newer 覆盖比较与保留元数据用
+            // 远端 mtime / 权限：保留元数据与源变更检测用
             let remote_mtime: u64 = attrs.mtime.unwrap_or(0) as u64;
             let remote_perm: Option<u32> = attrs.permissions;
 
@@ -786,107 +936,105 @@ impl SshSession {
                 }
             }
 
-            // 临时文件模式：写入 local.tmp，成功后原子 rename 覆盖 local（失败不留半成品）
-            let write_path = if options.upload_temp {
-                format!("{local}.tmp")
-            } else {
-                local.clone()
-            };
-
-            // 覆盖策略：探测最终目标 local 是否存在，判定跳过 / 询问
-            let final_meta = tokio::fs::metadata(&local).await;
-            let final_exists = final_meta.is_ok();
-            let final_size = final_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let final_mtime: u64 = final_meta
-                .as_ref()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if final_exists {
-                let skip = match options.overwrite_policy.as_str() {
-                    "skip" => true,
-                    "newer" => {
-                        // size 不同视为远端源有变化；size 相同则仅当远端更新才覆盖
-                        if final_size != total {
-                            false
-                        } else {
-                            remote_mtime <= final_mtime
+            // 覆盖策略：本地目标已存在时按策略决定跳过/询问；overwrite 直接进入原有覆盖流程
+            if options.overwrite_policy != "overwrite" {
+                if let Ok(meta) = tokio::fs::metadata(&local).await {
+                    // 本地 mtime 秒级，与 SFTP 属性精度对齐
+                    let local_mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    match options.overwrite_policy.as_str() {
+                        // skip：目标已存在即视为完成，不创建任何本地文件
+                        "skip" => return Ok((0, total, true)),
+                        // newer：本地不旧于远端源则跳过，避免用旧内容覆盖新内容
+                        // （mtime 取不到时按 0 处理，此时宁可不跳过）
+                        "newer" if local_mtime > 0 && local_mtime >= remote_mtime => {
+                            return Ok((0, total, true))
                         }
+                        // ask：交由前端询问，前缀 NEED_CONFIRM 是前后端约定标记
+                        "ask" => {
+                            return Err((
+                                SshError::TransferRejected(format!(
+                                    "NEED_CONFIRM: 本地文件已存在: {local}"
+                                )),
+                                0u64,
+                                total,
+                            ));
+                        }
+                        _ => {}
                     }
-                    "ask" => {
-                        return Err((
-                            SshError::TransferRejected(format!("{NEED_CONFIRM}:{local}")),
-                            0,
-                            total,
-                        ));
-                    }
-                    _ => false, // overwrite / 未知 → 不跳过
-                };
-                if skip {
-                    return Ok((total, total));
                 }
             }
 
-            // 断点续传：以写入目标（write_path）已有大小 / mtime 判定续写起点
-            let write_meta = tokio::fs::metadata(&write_path).await;
-            let write_size = write_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let write_mtime: u64 = write_meta
-                .as_ref()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+            // 半成品固定写在目标同目录的 `<目标>.filepart`，完成后同目录 rename 覆盖目标：
+            // 传输与校验通过前本地目标保持旧版本，失败只影响 part
+            let part_path = format!("{local}.filepart");
+            let part_size = tokio::fs::metadata(&part_path)
+                .await
+                .map(|m| m.len())
                 .unwrap_or(0);
-            let force_truncate = matches!(options.overwrite_policy.as_str(), "overwrite");
-            let offset = if force_truncate || !resume {
-                0 // 强制覆盖或关闭续传：一律截断全量重传
-            } else if write_size == total {
-                total // 写入目标已完整：首次 read 即 EOF，退出循环走收尾（rename / 元数据）
-            } else if write_size < total {
+            let offset = if !resume || part_size > total {
+                0 // 关闭续传 / part 比源大（源文件已变更）：截断重传
+            } else if part_size == total {
+                total // part 已完整：跳过传输，直接进入校验与 rename
+            } else if part_size > 0 {
                 let can_resume = match options.resume_check.as_str() {
-                    "sizeMtime" => {
-                        // mtime 一致才认为本地半截是同一源的延续，否则截断重传
-                        remote_mtime == write_mtime
-                    }
                     "sha256" => {
-                        // 读本地已有部分与远端前缀比对哈希；>32MB 退化为 sizeMtime 避免耗时
-                        if write_size > 32 * 1024 * 1024 {
-                            remote_mtime == write_mtime
+                        // 前缀哈希比对；>32MB 退化为按大小续传（内容差异由完成后的校验兜底）
+                        if part_size > 32 * 1024 * 1024 {
+                            true
                         } else {
-                            verify_prefix_sha256(&sftp, &remote_path, &write_path, write_size)
-                                .await
+                            verify_prefix_sha256(&sftp, &remote_path, &part_path, part_size).await
                         }
                     }
-                    _ => true, // size：仅比大小（默认）
+                    // sizeMtime：part 的 mtime 是上次写入时间，无法与源 mtime 比对，退化为按大小
+                    _ => true,
                 };
                 if can_resume {
-                    write_size
+                    part_size // 从断点续写
                 } else {
-                    0
+                    0 // 校验未通过，截断重传
                 }
             } else {
-                0 // 本地比远端大（源文件变更），截断重传
+                0
             };
-            // 续传用 APPEND 保留已有内容；从头传用 CREATE 截断
+            // 完整性校验：源（远端）与目标（本地）哈希随传输流式累积
+            let mut src_hasher = options.verify_hash.then(Sha256::new);
+            let mut dst_hasher = options.verify_hash.then(Sha256::new);
+            if offset > 0 {
+                // 续传：先补算两端已存在前缀，保证最终哈希覆盖整个文件
+                if let Some(h) = src_hasher.as_mut() {
+                    feed_remote_prefix(&sftp, &remote_path, offset, h)
+                        .await
+                        .map_err(|e| (e, 0u64, total))?;
+                }
+                if let Some(h) = dst_hasher.as_mut() {
+                    feed_local_prefix(h, &part_path, offset)
+                        .await
+                        .map_err(|e| (e, 0u64, total))?;
+                }
+            }
+            // 续传用 APPEND 保留 part 已有内容；从头传用 CREATE 截断
             let mut dst = if offset > 0 {
                 OpenOptions::new()
                     .append(true)
                     .create(true)
-                    .open(&write_path)
+                    .open(&part_path)
                     .await
                     .map_err(|e| {
                         (
-                            SshError::Channel(format!("打开本地文件 {write_path} 续写失败: {e}")),
+                            SshError::Channel(format!("打开本地半成品 {part_path} 续写失败: {e}")),
                             0,
                             total,
                         )
                     })?
             } else {
-                File::create(&write_path).await.map_err(|e| {
+                File::create(&part_path).await.map_err(|e| {
                     (
-                        SshError::Channel(format!("创建本地文件 {write_path} 失败: {e}")),
+                        SshError::Channel(format!("创建本地半成品 {part_path} 失败: {e}")),
                         0,
                         total,
                     )
@@ -911,23 +1059,38 @@ impl SshSession {
             let mut last_bytes = offset;
             // 续传起始即上报一次，前端进度条直接跳到断点位置
             if offset > 0 {
-                emit_progress(&channel, task_id, transferred, total, 0, false);
+                emit_progress(&channel, task_id, transferred, total, 0, false, None);
             }
             let mut limiter = RateLimiter::new(options.task_rate_kb);
 
             loop {
-                wait_if_paused(&mut paused_rx, &cancel)
-                    .await
-                    .map_err(|e| (e, transferred, total))?;
+                if let Err(e) = wait_if_paused(&mut paused_rx, &cancel).await {
+                    // 用户取消：关闭句柄后删除 part；暂停/网络失败仍保留 part 供续传
+                    let _ = dst.flush().await;
+                    drop(dst);
+                    let _ = sftp.close(rhandle.as_str()).await;
+                    remove_part_file_local(&part_path).await;
+                    return Err((e, transferred, total));
+                }
                 if cancel.is_cancelled() {
+                    let _ = dst.flush().await;
+                    drop(dst);
+                    let _ = sftp.close(rhandle.as_str()).await;
+                    remove_part_file_local(&part_path).await;
                     return Err((SshError::Cancelled, transferred, total));
                 }
+                // 只读到开始时的 total 为止：远端若被追加，不把多余字节写入本地（收尾 stat 会报变更）
+                let remaining = total.saturating_sub(offset);
+                if remaining == 0 {
+                    break;
+                }
+                let want = remaining.min(chunk as u64) as u32;
                 // russh-sftp 的 read 在 EOF 时返回 Status(Eof) 错误，而非空数据
-                let read_res = sftp.read(rhandle.as_str(), offset, chunk as u32).await;
+                let read_res = sftp.read(rhandle.as_str(), offset, want).await;
                 let data = match read_res {
                     Ok(d) => d.data,
                     Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
-                        break; // 传输完成：退出循环执行收尾（临时文件重命名 / 保留元数据）
+                        break; // 传输完成：退出循环执行收尾（校验 / 同目录 rename）
                     }
                     Err(e) => {
                         return Err((
@@ -947,6 +1110,12 @@ impl SshSession {
                         total,
                     )
                 })?;
+                if let Some(h) = src_hasher.as_mut() {
+                    h.update(&data);
+                }
+                if let Some(h) = dst_hasher.as_mut() {
+                    h.update(&data);
+                }
                 limiter.allow(data.len() as u64).await;
                 offset += data.len() as u64;
                 transferred += data.len() as u64;
@@ -955,42 +1124,107 @@ impl SshSession {
                 if now.duration_since(last_emit) >= PROGRESS_INTERVAL {
                     let speed = ((transferred - last_bytes) * 1000)
                         / now.duration_since(last_emit).as_millis().max(1) as u64;
-                    emit_progress(&channel, task_id, transferred, total, speed, false);
+                    emit_progress(&channel, task_id, transferred, total, speed, false, None);
                     last_emit = now;
                     last_bytes = transferred;
                 }
             }
 
-            // 传输成功收尾：关闭本地句柄 → 临时文件原子重命名 → 保留远端 mtime/权限
+            // 收尾顺序：关闭本地句柄 → 写 part 元数据 → 校验 part → 同目录 rename 覆盖目标。
+            // 校验未通过只删除 part，本地目标旧版本保持不动
             let _ = dst.flush().await;
             drop(dst);
             let _ = sftp.close(rhandle.as_str()).await;
-            if options.upload_temp {
-                let tmp = format!("{local}.tmp");
-                if let Err(e) = tokio::fs::rename(&tmp, &local).await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
+            // 数据已传完但在校验/rename 前被取消：同样按“取消删 part”处理
+            if cancel.is_cancelled() {
+                remove_part_file_local(&part_path).await;
+                return Err((SshError::Cancelled, transferred, total));
+            }
+            if options.preserve_meta {
+                // 属性写在 part 上，rename 覆盖后随 inode 一并生效
+                preserve_local_meta(&part_path, remote_mtime, remote_perm);
+            }
+            if options.verify_hash {
+                // 数据已全部写完，进入整文件哈希比对：先推一个 100% 进度包，
+                // 前端据此显示"校验中"转圈（最终 done 包在比对结束后才发出）
+                emit_verifying(&channel, task_id, total);
+                // 源、目标哈希都已在传输过程中流式算完，无需再读任何一端
+                let remote_hash = format!(
+                    "{:x}",
+                    src_hasher
+                        .take()
+                        .expect("verify 开启时已创建源哈希")
+                        .finalize()
+                );
+                let local_hash = format!(
+                    "{:x}",
+                    dst_hasher
+                        .take()
+                        .expect("verify 开启时已创建目标哈希")
+                        .finalize()
+                );
+                final_hash = Some(remote_hash.clone());
+                // 严格模式：远端源文件在传输期间不得被其它进程修改
+                if let Err(e) =
+                    check_remote_unchanged(&sftp, &remote_path, total, remote_mtime).await
+                {
+                    remove_part_file_local(&part_path).await;
+                    return Err((e, transferred, total));
+                }
+                if local_hash != remote_hash {
+                    let name = remote_path.rsplit('/').next().unwrap_or(&remote_path);
+                    crate::applog::emit(
+                        log::Level::Error,
+                        "sftp",
+                        crate::applog::events::SFTP_TRANSFER_VERIFY_FAILED,
+                        Some(self.sftp.sid.as_str()),
+                        "完整性校验失败",
+                        Some(serde_json::json!({
+                            "name": name,
+                            "expect": remote_hash,
+                            "actual": local_hash,
+                        })),
+                    );
+                    // 校验不通过：只删 part，目标旧版本不受影响
+                    remove_part_file_local(&part_path).await;
                     return Err((
-                        SshError::Channel(format!("重命名临时文件 {tmp} 失败: {e}")),
+                        SshError::TransferRejected("文件完整性校验失败".to_string()),
                         transferred,
                         total,
                     ));
                 }
-                debug!("SFTP 下载临时文件已重命名: {tmp} → {local}");
+                debug!("SFTP 下载 SHA256 校验通过: {part_path}");
             }
-            if options.preserve_meta {
-                preserve_local_meta(&local, remote_mtime, remote_perm);
+            // 校验通过（或未开启校验）才替换目标：同目录 rename 为原子覆盖
+            if let Err(e) = tokio::fs::rename(&part_path, &local).await {
+                // 保留 part：重试可继续续传或只重做 rename
+                return Err((
+                    SshError::Channel(format!(
+                        "重命名半成品 {part_path} → {local} 失败: {e}"
+                    )),
+                    transferred,
+                    total,
+                ));
             }
-            Ok((transferred, total))
+            debug!("SFTP 下载完成: {part_path} → {local}");
+            Ok((transferred, total, false))
         }
         .await;
 
-        let (result, transferred, total) = match outcome {
-            Ok((t, total)) => (Ok(()), t, total),
-            Err((e, t, total)) => (Err(e), t, total),
+        let (result, transferred, total, skipped) = match outcome {
+            Ok((t, total, skipped)) => (Ok(()), t, total, skipped),
+            Err((e, t, total)) => (Err(e), t, total, false),
         };
 
         self.sftp.remove_task(task_id).await;
-        emit_progress(&channel, task_id, transferred, total, 0, true);
+        emit_final_progress(
+            &channel,
+            task_id,
+            transferred,
+            total,
+            final_hash.as_deref(),
+            skipped,
+        );
         result
     }
 
@@ -1169,6 +1403,44 @@ async fn posix_rename(
     Ok(())
 }
 
+/// 同目录原子覆盖：优先 posix-rename（目标存在也覆盖），不支持时降级标准 rename
+async fn rename_overwrite(sftp: &RawSftpSession, from: &str, to: &str) -> Result<(), SshError> {
+    if posix_rename(sftp, from, to).await.is_ok() {
+        return Ok(());
+    }
+    sftp.rename(from, to)
+        .await
+        .map(|_| ())
+        .map_err(|e| SshError::Channel(format!("rename {from} → {to} 失败: {e}")))
+}
+
+/// 校验失败时删除远端半成品；删除失败只记日志（目标未被触碰，不影响数据安全）
+async fn remove_part_file(sftp: &RawSftpSession, part_path: &str) {
+    if let Err(e) = sftp.remove(part_path).await {
+        debug!("删除远端半成品 {part_path} 失败: {e}");
+    }
+}
+
+/// 探测远端目标是否存在：`NoSuchFile` 视为不存在（Ok(None)），其余错误上抛。
+/// 网络类错误不能被当成"目标不存在"，否则覆盖策略会误判并直接覆盖。
+async fn probe_remote(
+    sftp: &RawSftpSession,
+    path: &str,
+) -> Result<Option<FileAttributes>, SftpError> {
+    match sftp.lstat(path).await {
+        Ok(meta) => Ok(Some(meta.attrs)),
+        Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 本地半成品删除，语义同 `remove_part_file`
+async fn remove_part_file_local(part_path: &str) {
+    if let Err(e) = tokio::fs::remove_file(part_path).await {
+        debug!("删除本地半成品 {part_path} 失败: {e}");
+    }
+}
+
 /// 单文件同会话流式复制：固定 64KB read→write，两端句柄用完即关，
 /// 不落地本地磁盘、不占整文件内存。
 async fn copy_file_stream(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(), SshError> {
@@ -1253,35 +1525,178 @@ async fn copy_recursive(sftp: &RawSftpSession, src: &str, dst: &str) -> Result<(
 }
 
 /// 单任务令牌桶限速：按 `rate_kb`（KB/s）节流，0 表示不限速。
-/// 1 秒固定窗口：窗口内累计字节达到上限即睡眠到窗口结束，实现粗略速率控制
-/// （进度上报的瞬时速率会自然反映节流后的速率）。
+/// 采用按块匀速节流：每块按"应有耗时"累加虚拟发送时刻，超前则睡眠补足。
+/// 相比固定 1 秒窗口（攒满一秒量后长睡一次），不会产生"全速→长睡"的锯齿，
+/// 进度上报的瞬时速率因此保持平稳，也更接近设定的平均速率。
 struct RateLimiter {
     rate_bps: u64,
-    window_start: Instant,
-    window_bytes: u64,
+    /// 下一块最早可发送的时刻；落后于当前时刻时从当前时刻重新起算（允许追赶）
+    next_free: Option<Instant>,
 }
 impl RateLimiter {
     fn new(rate_kb: u64) -> Self {
         Self {
             rate_bps: rate_kb.saturating_mul(1024),
-            window_start: Instant::now(),
-            window_bytes: 0,
+            next_free: None,
         }
     }
     async fn allow(&mut self, bytes: u64) {
-        if self.rate_bps == 0 {
+        if self.rate_bps == 0 || bytes == 0 {
             return;
         }
-        self.window_bytes += bytes;
-        if self.window_bytes >= self.rate_bps {
-            let elapsed = self.window_start.elapsed();
-            if elapsed < Duration::from_secs(1) {
-                sleep(Duration::from_secs(1) - elapsed).await;
-            }
-            self.window_start = Instant::now();
-            self.window_bytes = 0;
+        // 该块按目标速率应占用的时长（纳秒）；bytes 上限 1MB，乘法不会溢出
+        let cost = Duration::from_nanos(bytes.saturating_mul(1_000_000_000) / self.rate_bps);
+        let now = Instant::now();
+        let start = match self.next_free {
+            Some(t) if t > now => t,
+            _ => now,
+        };
+        self.next_free = Some(start + cost);
+        if start > now {
+            sleep(start - now).await;
         }
     }
+}
+
+/// 断点续传补算：把本地文件前 `len` 字节增量喂入 hasher（不整文件读入内存）。
+async fn feed_local_prefix(hasher: &mut Sha256, path: &str, len: u64) -> Result<(), SshError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut f = File::open(path)
+        .await
+        .map_err(|e| SshError::Channel(format!("补算前缀哈希时打开本地文件 {path} 失败: {e}")))?;
+    let mut remaining = len;
+    let mut buf = vec![0u8; DEFAULT_CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = f
+            .read(&mut buf[..want])
+            .await
+            .map_err(|e| SshError::Channel(format!("补算前缀哈希时读取本地文件失败: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// 断点续传补算：把远端文件前 `len` 字节增量喂入 hasher（SFTP 分块读取）。
+async fn feed_remote_prefix(
+    sftp: &RawSftpSession,
+    path: &str,
+    len: u64,
+    hasher: &mut Sha256,
+) -> Result<(), SshError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let rhandle = sftp
+        .open(path, OpenFlags::READ, FileAttributes::default())
+        .await
+        .map_err(|e| SshError::Channel(format!("补算前缀哈希时打开远端文件 {path} 失败: {e}")))?
+        .handle;
+    let mut off = 0u64;
+    while off < len {
+        let want = (len - off).min(DEFAULT_CHUNK as u64) as u32;
+        match sftp.read(rhandle.as_str(), off, want).await {
+            Ok(d) => {
+                if d.data.is_empty() {
+                    break;
+                }
+                hasher.update(&d.data);
+                off += d.data.len() as u64;
+            }
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break,
+            Err(e) => {
+                let _ = sftp.close(rhandle.as_str()).await;
+                return Err(SshError::Channel(format!(
+                    "补算前缀哈希时读取远端文件失败: {e}"
+                )));
+            }
+        }
+    }
+    let _ = sftp.close(rhandle.as_str()).await;
+    Ok(())
+}
+
+/// 严格校验：确认本地源文件在传输期间未被修改（大小 + 秒级 mtime）。
+async fn check_local_unchanged(path: &str, size: u64, mtime: u64) -> Result<(), SshError> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| SshError::Channel(format!("校验源文件状态失败: {e}")))?;
+    let now_size = meta.len();
+    let now_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now_size != size || now_mtime != mtime {
+        log::warn!(
+            "源文件在传输期间已修改（size {size} → {now_size}, mtime {mtime} → {now_mtime}），按完整性校验失败处理"
+        );
+        return Err(SshError::TransferRejected(
+            "文件完整性校验失败".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 严格校验：确认远端源文件在传输期间未被修改（大小 + 秒级 mtime）。
+async fn check_remote_unchanged(
+    sftp: &RawSftpSession,
+    path: &str,
+    size: u64,
+    mtime: u64,
+) -> Result<(), SshError> {
+    let attrs = sftp
+        .lstat(path)
+        .await
+        .map_err(|e| SshError::Channel(format!("校验远端源文件状态失败: {e}")))?
+        .attrs;
+    let now_size = attrs.size.unwrap_or(0);
+    let now_mtime = attrs.mtime.unwrap_or(0) as u64;
+    if now_size != size || now_mtime != mtime {
+        log::warn!(
+            "远端源文件在传输期间已修改（size {size} → {now_size}, mtime {mtime} → {now_mtime}），按完整性校验失败处理"
+        );
+        return Err(SshError::TransferRejected(
+            "文件完整性校验失败".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 计算远端完整文件 SHA256（小写十六进制），用于传输完成后的完整性校验。
+async fn remote_file_sha256(sftp: &RawSftpSession, path: &str) -> Result<String, SshError> {
+    let rhandle = sftp
+        .open(path, OpenFlags::READ, FileAttributes::default())
+        .await
+        .map_err(|e| SshError::Channel(format!("校验时打开远端文件 {path} 失败: {e}")))?
+        .handle;
+    let mut hasher = Sha256::new();
+    let mut off = 0u64;
+    loop {
+        match sftp.read(rhandle.as_str(), off, DEFAULT_CHUNK as u32).await {
+            Ok(d) => {
+                if d.data.is_empty() {
+                    break;
+                }
+                hasher.update(&d.data);
+                off += d.data.len() as u64;
+            }
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break,
+            Err(e) => {
+                let _ = sftp.close(rhandle.as_str()).await;
+                return Err(SshError::Channel(format!("校验时读取远端文件失败: {e}")));
+            }
+        }
+    }
+    let _ = sftp.close(rhandle.as_str()).await;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// 断点续传 sha256 校验：比对远端前 `len` 字节与本地文件前 `len` 字节的哈希，
@@ -1402,6 +1817,59 @@ fn emit_progress(
     total: u64,
     speed: u64,
     done: bool,
+    sha256: Option<&str>,
+) {
+    send_progress(
+        channel,
+        task_id,
+        transferred,
+        total,
+        speed,
+        done,
+        sha256,
+        false,
+        false,
+    );
+}
+
+/// 校验过渡包：字节已传完、进入 SHA256 比对阶段（前端据此把状态切到"校验中"）
+fn emit_verifying(channel: &Channel<TransferProgress>, task_id: u64, total: u64) {
+    send_progress(channel, task_id, total, total, 0, false, None, false, true);
+}
+
+/// 收尾包：除常规字段外附带"按覆盖策略跳过"标记，前端据此展示"已跳过"
+fn emit_final_progress(
+    channel: &Channel<TransferProgress>,
+    task_id: u64,
+    transferred: u64,
+    total: u64,
+    sha256: Option<&str>,
+    skipped: bool,
+) {
+    send_progress(
+        channel,
+        task_id,
+        transferred,
+        total,
+        0,
+        true,
+        sha256,
+        skipped,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_progress(
+    channel: &Channel<TransferProgress>,
+    task_id: u64,
+    transferred: u64,
+    total: u64,
+    speed: u64,
+    done: bool,
+    sha256: Option<&str>,
+    skipped: bool,
+    verifying: bool,
 ) {
     let payload = TransferProgress {
         task_id,
@@ -1409,6 +1877,9 @@ fn emit_progress(
         total,
         speed,
         done,
+        skipped,
+        verifying,
+        sha256: sha256.map(str::to_string),
     };
     if let Err(e) = channel.send(payload) {
         debug!("发送 SFTP 进度（Channel 已关闭）: {e}");

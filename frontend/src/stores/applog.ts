@@ -185,15 +185,39 @@ function trim() {
   if (logs.value.length > max) logs.value.splice(0, logs.value.length - max)
 }
 
+/** 日志落表攒批窗口：后端逐条推送（debug 级别下 SFTP 传输每秒数百条），
+ *  合并到一次写入，避免响应式更新与列表渲染把主线程打满 */
+const PENDING_FLUSH_MS = 100
+let pendingRows: PanelLogEntry[] = []
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+function flushPending() {
+  flushTimer = null
+  if (!pendingRows.length) return
+  const rows = pendingRows
+  pendingRows = []
+  logs.value.push(...rows)
+  trim()
+}
+
+function enqueueRows(rows: PanelLogEntry[]) {
+  if (!rows.length) return
+  pendingRows.push(...rows)
+  if (flushTimer === null) flushTimer = setTimeout(flushPending, PENDING_FLUSH_MS)
+}
+
 /** 订阅后端日志流（Workbench 挂载时调用一次，幂等） */
 export function subscribe() {
   if (!isTauri || subscribed) return
   subscribed = true
   const channel = new Channel<LogBatch>()
   channel.onmessage = (batch) => {
+    // 先攒到本地数组再入队：debug 级别下传输会刷出成批日志，
+    // 逐条 push 会让响应式系统每条触发一次通知，是界面卡死的放大点之一
+    const rows: PanelLogEntry[] = []
     if (batch.lost_because) {
       // 客户端游标已被逐出缓冲：提示部分更早日志丢失
-      logs.value.push({
+      rows.push({
         id: (batch.from_seq ?? lastSeq) - 1,
         time: '',
         level: 'WARN',
@@ -201,10 +225,10 @@ export function subscribe() {
       })
     }
     for (const e of batch.entries) {
-      logs.value.push(toPanelEntry(e))
+      rows.push(toPanelEntry(e))
       lastSeq = Math.max(lastSeq, e.seq)
     }
-    trim()
+    enqueueRows(rows)
   }
   invoke('subscribe_app_logs', { channel, sinceId: lastSeq > 0 ? lastSeq : null })
     .catch((e) => console.warn('subscribe_app_logs 失败:', e))
@@ -212,6 +236,12 @@ export function subscribe() {
 
 /** 清空日志（面板「清空日志」按钮）：后端清内存缓冲 + 前端清显示 */
 export async function clear() {
+  // 丢弃尚未落表的攒批，避免清空后旧日志被 flush 回来
+  pendingRows = []
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
   logs.value = []
   if (!isTauri) return
   try {

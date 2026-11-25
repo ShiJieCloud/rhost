@@ -120,12 +120,12 @@ export interface AppSettings {
   sftpChunkKb: number
   /** 断点续传：同名文件未传完时从已有偏移续传；关闭后一律全量重传 */
   sftpResume: boolean
-  /** 断点校验方式：size 文件大小 / sizeMtime 大小+mtime / sha256 哈希（逻辑待实现） */
+  /** 断点校验方式：size 文件大小 / sizeMtime 大小+mtime / sha256 哈希
+   *  （半成品为同目录 .filepart，其 mtime 是写入时间，sizeMtime 实际退化为 size） */
   sftpResumeCheck: string
-  /** 文件覆盖策略：skip 跳过 / overwrite 直接覆盖 / newer 仅源文件更新时覆盖 / ask 每次询问（逻辑待实现） */
+  /** 目标同名文件已存在时的处理：overwrite 直接覆盖 / skip 跳过 /
+   *  newer 仅当源文件更新时覆盖 / ask 每次询问 */
   sftpOverwritePolicy: string
-  /** 上传临时文件机制：先写临时文件、完成后原子重命名（逻辑待实现） */
-  sftpUploadTemp: boolean
   /** 保留文件元数据：传输时同步修改时间与权限属性（逻辑待实现） */
   sftpPreserveMeta: boolean
   /** 全局最大并发传输任务数（跨所有主机） */
@@ -254,8 +254,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sftpChunkKb: 64,
   sftpResume: true,
   sftpResumeCheck: 'size',
-  sftpOverwritePolicy: 'newer',
-  sftpUploadTemp: false,
+  sftpOverwritePolicy: 'overwrite',
   sftpPreserveMeta: false,
   sftpGlobalConcurrency: 3,
   sftpHostConcurrency: 1,

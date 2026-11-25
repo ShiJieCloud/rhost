@@ -1238,6 +1238,14 @@ async function runSftpTransfer(p: AiToolProposal) {
       resume: false,
       // 体积上限由后端在打开目标文件写入前预检拒绝：既避免残留文件，也保证错误文案准确
       maxBytes: SFTP_AI_MAX_BYTES,
+      // AI 传输是用户明确授权的单文件写入：固定覆盖目标，不套用面板的覆盖策略
+      options: {
+        overwritePolicy: 'overwrite',
+        preserveMeta: false,
+        resumeCheck: 'size',
+        taskRateKb: 0,
+        verifyHash: false,
+      },
       channel,
     })
     p.state = 'accepted'

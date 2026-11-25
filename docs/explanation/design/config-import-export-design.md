@@ -157,8 +157,6 @@
       "sftpChunkKb": 64,
       "sftpResume": true,
       "sftpResumeCheck": "size",
-      "sftpOverwritePolicy": "newer",
-      "sftpUploadTemp": true,
       "sftpPreserveMeta": false,
       "sftpGlobalConcurrency": 3,
       "sftpHostConcurrency": 1,

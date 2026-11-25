@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::frame::{FrameType, encode_frame};
-use super::sftp::SftpState;
+use super::sftp::{SftpState, spawn_sftp_idle_watch};
 use super::tunnel::{REMOTE_CONNECT_TIMEOUT, RemoteRegistry, TunnelManager, run_relay_conn};
 use super::{AuthMethod, HostKeyCheck, SessionConfig, SshError};
 use crate::applog;
@@ -805,8 +805,9 @@ pub struct SshSession {
     /// 动态指标采集任务句柄（启动后存在）。同步锁仅做瞬时取放，
     /// 不在持锁期间 await；stop 只取消令牌，任务异步退出
     metrics: StdMutex<Option<crate::metrics::collector::CollectorHandle>>,
-    /// SFTP 子系统长驻会话（懒加载；远端文件面板列目录使用）
-    pub(super) sftp: SftpState,
+    /// SFTP 子系统长驻会话（懒加载；远端文件面板列目录使用）。
+    /// 以 Arc 持有，便于空闲监控任务通过 Weak 观察其生命周期
+    pub(super) sftp: Arc<SftpState>,
     /// Shell 当前工作目录：由 merge_task 解析 PTY 中的 OSC 6667 序列更新，
     /// sftp_list_dir 无参数时以此为默认目录，保持 Shell 与 SFTP CWD 一致。
     pub(super) cwd: Arc<Mutex<Option<String>>>,
@@ -1377,6 +1378,10 @@ impl SshSession {
             remote,
             global_conns,
         );
+        // 空闲监控：SFTP 通道长时间无操作且无传输时自动关闭（配置由前端下发，
+        // 默认 0 表示不关闭）；随会话 cancel 退出，Weak 保证不延长会话生命周期
+        let sftp = Arc::new(SftpState::new(sid));
+        spawn_sftp_idle_watch(Arc::downgrade(&sftp), cancel.clone());
         Ok((
             Self {
                 cancel,
@@ -1384,7 +1389,7 @@ impl SshSession {
                 handle,
                 frame_tx: metrics_frame_tx,
                 metrics: StdMutex::new(None),
-                sftp: SftpState::new(sid),
+                sftp,
                 cwd,
                 tunnel,
                 dc_state,

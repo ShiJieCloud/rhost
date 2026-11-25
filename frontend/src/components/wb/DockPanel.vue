@@ -5,9 +5,10 @@ import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCol
 import { savedSettings } from '../../stores/settings'
 import { appLocked } from '../../stores/appLock'
 import { toast } from '../../composables/useToast'
+import { confirmDialog } from '../../composables/useConfirm'
 import TunnelPane from './TunnelPane.vue'
 import { isTauri } from '../../lib/tauri'
-import { ask } from '@tauri-apps/plugin-dialog'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { getSnapshot, onConfigLoad, patchUiState } from '../../stores/appConfig'
 import ContextMenu from './ContextMenu.vue'
 import type { MenuItem } from './ContextMenu.vue'
@@ -190,6 +191,15 @@ async function loadRemote(path?: string) {
   }
 }
 
+/** 下发会话级 SFTP 空闲超时：仅控制 SFTP 子通道回收，不影响 SSH 终端会话。
+ *  设置变更/切换会话时同步，后端据此在长时间无操作且无传输时关闭缓存通道。 */
+function applySftpIdleTimeout() {
+  const backendId = activeSession.value?.backendId
+  if (!isTauri || !backendId) return
+  const secs = Math.max(0, savedSettings.sftpIdleTimeoutSec | 0)
+  void invoke('sftp_set_idle_timeout', { sessionId: backendId, secs }).catch(() => {})
+}
+
 /** 后端目录项 → 前端通用 FsEntry（本地/远程共用） */
 function toFsEntry(e: DirListing['entries'][number]): FsEntry {
   return {
@@ -286,15 +296,7 @@ function fmtSize(bytes: number) {
   if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB'
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB'
 }
-/* 两个字节数按同一单位成对格式化（已传输 / 总大小），单位取两者中较大者对应量级，
-   避免浮点长小数与 "470 B / 1.0 KB" 这类单位错位：→ "0.5 KB / 1.0 KB" */
-function fmtSizePair(a: number, b: number) {
-  const max = Math.max(0, a, b)
-  if (max < 1024) return `${Math.round(a)} B / ${Math.round(b)} B`
-  if (max < 1024 * 1024) return `${(a / 1024).toFixed(1)} KB / ${(b / 1024).toFixed(1)} KB`
-  if (max < 1024 * 1024 * 1024) return `${(a / 1048576).toFixed(1)} MB / ${(b / 1048576).toFixed(1)} MB`
-  return `${(a / 1073741824).toFixed(2)} GB / ${(b / 1073741824).toFixed(2)} GB`
-}
+/* 状态文案 */
 function crumbs(path: string) {
   const parts = path.split('/').filter(Boolean)
   const out: { label: string; path: string }[] = [{ label: '/', path: '/' }]
@@ -324,9 +326,9 @@ function isBlacklisted(name: string): boolean {
   return list.some(p => globMatch(name, p))
 }
 
-/* ---- 传输队列：pending → running → success，同一时刻仅一个 running（串行）
-   状态色规范：pending #606266 · running #409EFF · paused #E6A23C · error #F56C6C · success 项目绿 ---- */
-type TransferStatus = 'pending' | 'running' | 'paused' | 'success' | 'error'
+/* ---- 传输队列：pending → running → success/error/cancelled，按并发配额调度
+   状态色规范：pending #606266 · running #409EFF · paused #E6A23C · error #F56C6C · success 项目绿 · cancelled 灰 ---- */
+type TransferStatus = 'pending' | 'running' | 'paused' | 'success' | 'error' | 'cancelled'
 interface Transfer {
   id: number; name: string; dir: 'up' | 'down'
   size: number; pct: number; status: TransferStatus
@@ -338,14 +340,22 @@ interface Transfer {
   remotePath?: string  // 远端绝对路径
   /** 跨侧剪切粘贴：传输成功后要删除的源文件绝对路径 */
   cutSrc?: string
-  /** ask 覆盖策略下用户确认覆盖后，强制以 overwrite 重试本次任务 */
-  forceOverwrite?: boolean
   /** 任务所属会话 backendId：用于按主机并发计数与断线后归属判断 */
   backendId?: string
   /** 已自动重试次数（手动重试会清零） */
   retryCount?: number
   /** 自动重试等待定时器句柄（用于取消/手动重试时清理） */
   retryTimer?: number
+  /** 源文件 SHA256（开启完整性校验且已算出时由收尾进度包下发，队列展示用） */
+  hash?: string
+  /** 按覆盖策略跳过（目标已存在且无需覆盖），未发生实际传输 */
+  skipped?: boolean
+  /** 字节已传完、正在做 SHA256 比对（收尾前的过渡态） */
+  verifying?: boolean
+  /** ask 策略下用户已确认覆盖：重试/重跑该任务时固定按 overwrite 执行 */
+  forceOverwrite?: boolean
+  /** 哈希复制按钮的短暂成功反馈 */
+  copied?: boolean
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
@@ -357,12 +367,19 @@ interface TransferProgress {
   total: number
   speed: number
   done: boolean
+  /** 收尾包专用：按覆盖策略跳过（目标已存在） */
+  skipped: boolean
+  /** 字节已传完、正在做 SHA256 比对 */
+  verifying: boolean
+  /** 源文件 SHA256：仅开启完整性校验且已算出时随收尾包下发 */
+  sha256?: string
 }
 
 const runningCount = computed(() => transfers.value.filter(t => t.status === 'running').length)
 const pendingCount = computed(() => transfers.value.filter(t => t.status === 'pending').length)
 const pausedCount = computed(() => transfers.value.filter(t => t.status === 'paused').length)
 const successCount = computed(() => transfers.value.filter(t => t.status === 'success').length)
+const cancelledCount = computed(() => transfers.value.filter(t => t.status === 'cancelled').length)
 
 /* 筛选：全部 / 上传 / 下载 / 已完成 */
 const queueFilter = ref<'all' | 'up' | 'down' | 'done'>('all')
@@ -408,50 +425,92 @@ const queueSummary = computed(() => {
   const failed = list.filter(t => t.status === 'error').length
   if (failed) return `${failed} 项失败`
   const done = list.filter(t => t.status === 'success').length
-  return done ? `已完成 ${done} 项` : ''
+  if (done) return `已完成 ${done} 项`
+  const cancelled = list.filter(t => t.status === 'cancelled').length
+  return cancelled ? `已取消 ${cancelled} 项` : ''
 })
 
 function fmtSpeed(bps: number) {
   if (!bps || bps <= 0) return '0 B/s'
   return fmtSize(bps) + '/s'
 }
-/* 状态文案 */
-function statusText(t: Transfer) {
-  return ({ pending: '等待中', running: '传输中', paused: '已暂停', success: '已完成', error: '失败' } as const)[t.status]
-}
 /* 队列内展示名 */
 function taskName(t: Transfer) {
   return t.name
+}
+/* 队列展示用短哈希：前 8 + 后 8，完整值见 title */
+function shortHash(h: string) {
+  return h.length > 20 ? h.slice(0, 8) + '…' + h.slice(-8) : h
 }
 /* 已传输字节数 */
 function doneBytes(t: Transfer) {
   return Math.min(t.size, Math.max(0, t.size * Math.min(100, Math.max(0, t.pct)) / 100))
 }
-/* 字节信息：已传 / 总大小 */
-function bytesText(t: Transfer) {
-  return fmtSizePair(doneBytes(t), t.size)
+/* 任务目标路径：上传=远端目标，下载=本地目标 */
+function targetPath(t: Transfer) {
+  return (t.dir === 'up' ? t.remotePath : t.localPath) || ''
 }
-/* 速率：仅传输中 */
-function rateText(t: Transfer) {
+/* 进度百分比文案：按覆盖策略跳过时未传输任何字节，不显示 100% */
+function pctText(t: Transfer) {
+  if (t.skipped) return '—'
+  return Math.floor(Math.min(100, Math.max(0, t.pct))) + '%'
+}
+/* 瞬时速率：仅运行中 */
+function speedText(t: Transfer) {
   return t.status === 'running' && t.speed > 0 ? fmtSpeed(t.speed) : ''
 }
-/* 备注：传输中显剩余时间，完成显校验通过，失败显错误，其余留空 */
+/* 进度备注：剩余时间 / 校验中 / 状态 / 错误 */
 function noteText(t: Transfer) {
-  if (t.status === 'running' && t.speed > 0 && t.pct < 100) {
-    const sec = (t.size - doneBytes(t)) / t.speed
-    if (isFinite(sec) && sec >= 1) {
-      if (sec < 60) return '剩 ' + Math.ceil(sec) + ' 秒'
-      if (sec < 3600) return '剩 ' + Math.ceil(sec / 60) + ' 分'
-      return '剩 ' + (sec / 3600).toFixed(1) + ' 时'
+  // 跳过状态已由任务名后的标签表达，备注区留空避免重复
+  if (t.skipped) return ''
+  if (t.status === 'running') {
+    if (t.pct >= 99.9) return savedSettings.sftpVerifyHash ? '校验中' : ''
+    if (t.speed > 0) {
+      const sec = (t.size - doneBytes(t)) / t.speed
+      if (isFinite(sec) && sec >= 1) {
+        if (sec < 60) return '剩 ' + Math.ceil(sec) + ' 秒'
+        if (sec < 3600) return '剩 ' + Math.ceil(sec / 60) + ' 分'
+        return '剩 ' + (sec / 3600).toFixed(1) + ' 时'
+      }
     }
+    return ''
   }
-  if (t.status === 'success') return '校验通过'
+  if (t.status === 'success') return '完成'
+  if (t.status === 'paused') return '已暂停'
+  if (t.status === 'pending') return '等待中'
   if (t.status === 'error') return t.error || '传输失败'
   return ''
 }
-/* 右侧状态文案 */
-function stateText(t: Transfer) {
-  return statusText(t)
+/* SHA-256 校验状态：未启用 / 待校验 / 校验中 / 通过 / 失败 */
+function hashState(t: Transfer): { cls: string; text: string } {
+  // 覆盖策略跳过：没有传输也没有比对，不能显示"校验通过"
+  if (t.skipped) return { cls: 'off', text: '—' }
+  if (!savedSettings.sftpVerifyHash) return { cls: 'off', text: '未启用' }
+  if (t.status === 'success') return { cls: 'ok', text: '✓ 校验通过' }
+  if (t.status === 'error') {
+    return (t.error || '').includes('文件完整性校验失败')
+      ? { cls: 'bad', text: '✕ 校验失败' }
+      : { cls: 'off', text: '—' }
+  }
+  if (t.status === 'running' && t.pct >= 99.9) return { cls: 'verifying', text: '校验中' }
+  if (t.status === 'cancelled') return { cls: 'off', text: '—' }
+  return { cls: '', text: '待校验' }
+}
+/** SHA-256 信息仅在传输结束后展示（避免与速率/剩余时间同排冲突）：
+ *  成功；或失败原因正是完整性校验不通过 */
+function showHash(t: Transfer): boolean {
+  if (!savedSettings.sftpVerifyHash || t.skipped) return false
+  if (t.status === 'success') return true
+  return t.status === 'error' && (t.error || '').includes('完整性校验失败')
+}
+/* 复制完整源文件 SHA256（成功后图标短暂变对勾） */
+async function copyHash(t: Transfer) {
+  if (!t.hash) return
+  try {
+    await writeText(t.hash)
+    t.copied = true
+    window.setTimeout(() => { t.copied = false }, 1200)
+  } catch { /* 剪贴板不可用时静默失败 */ }
 }
 
 function startQueueDrag(e: MouseEvent) {
@@ -571,6 +630,7 @@ async function runTask(t: Transfer) {
   const runningBefore = transfers.value.filter(x => x.status === 'running').length
   const taskRateKb = computeTaskRateKb(runningBefore)
   t.status = 'running'
+  t.verifying = false // 新一轮传输/重试从传输阶段重新开始
   if (t.startAt === 0) t.startAt = Date.now() // 仅首次开始计时；暂停后续传不重置
   // pct > 0 为暂停/重试后的恢复，不再重复"开始"提示
   if (t.pct > 0) {
@@ -590,7 +650,7 @@ async function runTask(t: Transfer) {
     const dirText = t.dir === 'up' ? '上传' : '下载'
     const maxRetry = Math.max(0, savedSettings.sftpRetryCount | 0)
     const attempt = t.retryCount || 0
-    // 达到重试上限（或配置为 0）时标记失败；取消与 NEED_CONFIRM 不经过此处
+    // 达到重试上限（或配置为 0）时标记失败；取消不经过此处
     if (attempt < maxRetry) {
       t.status = 'error'
       t.retryCount = attempt + 1
@@ -624,15 +684,28 @@ async function runTask(t: Transfer) {
     schedulePump()
   }
   const finishTask = () => {
-    t.pct = 100
     t.status = 'success'
+    // 覆盖策略跳过：目标已存在且无需覆盖。未发生实际传输，进度保持 0、不做校验；
+    // 同时不得删除剪切源文件，也不刷新对侧目录
+    if (t.skipped) {
+      t.pct = 0
+      t.speed = 0
+      const dirText = t.dir === 'up' ? '上传' : '下载'
+      reportLog('info', SFTP_TRANSFER_COMPLETE, `${dirText}已跳过（目标已存在）`, {
+        name: t.name, size: t.size, skipped: true,
+      })
+      toast(`已跳过：${taskName(t)}`, 'info', 1800)
+      schedulePump()
+      return
+    }
+    t.pct = 100
     // 清零前捕获最后一帧速率（后端按滑动窗口计算的瞬时速率）
     const finalSpeedBps = t.speed
     t.speed = 0
     reportLog('info', SFTP_TRANSFER_COMPLETE, `${t.dir === 'up' ? '上传' : '下载'}完成`, {
       name: t.name, size: t.size,
       elapsed_ms: t.startAt ? Date.now() - t.startAt : 0,
-      speed_bps: finalSpeedBps, verify: 'pass',
+      speed_bps: finalSpeedBps, verify: savedSettings.sftpVerifyHash ? 'pass' : 'none',
     })
     toast(`${t.dir === 'up' ? '上传' : '下载'}完成：${taskName(t)}`, 'ok', 2000)
     // 跨侧剪切粘贴：传输成功后删除源文件（失败仅记日志，目标已完整）
@@ -658,15 +731,22 @@ async function runTask(t: Transfer) {
   const channel = new Channel<TransferProgress>()
   channel.onmessage = (p) => {
     if (p.total > 0) t.size = p.total
-    t.pct = p.total > 0 ? (p.transferred / p.total) * 100 : (p.done ? 100 : t.pct)
-    t.speed = p.speed
+    // 跳过包不带实际传输字节：保持 finishTask 置的 100%，避免迟到包把进度拉回 0
+    if (p.skipped) t.skipped = true
+    else t.pct = p.total > 0 ? (p.transferred / p.total) * 100 : (p.done ? 100 : t.pct)
+    // 字节已传完、正在比对哈希：清空速率并让状态标签切到"校验中"
+    if (p.verifying) {
+      t.verifying = true
+      t.speed = 0
+    } else {
+      t.speed = p.speed
+    }
+    if (p.sha256) t.hash = p.sha256
   }
   // 单次传输选项：从全局设置组装（camelCase 与后端 SftpTransferOptions 对齐）；
-  // ask 策略下用户确认覆盖后 forceOverwrite 强制走 overwrite；taskRateKb 按当前并发均分
-  const forceOverwrite = t.forceOverwrite === true
+  // ask 策略下用户确认覆盖后，该任务后续重跑固定按 overwrite 执行
   const options = {
-    overwritePolicy: forceOverwrite ? 'overwrite' : savedSettings.sftpOverwritePolicy,
-    uploadTemp: savedSettings.sftpUploadTemp,
+    overwritePolicy: t.forceOverwrite ? 'overwrite' : savedSettings.sftpOverwritePolicy,
     preserveMeta: savedSettings.sftpPreserveMeta,
     resumeCheck: savedSettings.sftpResumeCheck,
     taskRateKb,
@@ -680,63 +760,81 @@ async function runTask(t: Transfer) {
     finishTask()
   } catch (e) {
     const msg = String(e)
-    // 用户主动取消：静默移除，不弹失败 toast
-    if (msg.includes('已取消') || msg.includes('Cancelled')) {
-      t.status = 'error'
-      t.speed = 0
-      t.error = '已取消'
-      transfers.value = transfers.value.filter(x => x.id !== t.id)
-      reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
-        name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
-      })
-      schedulePump()
-    } else if (msg.startsWith('NEED_CONFIRM:')) {
-      // ask 覆盖策略：目标已存在，弹原生确认框；确认→强制 overwrite 重试，取消→跳过
-      const path = msg.slice('NEED_CONFIRM:'.length)
-      const ok = await ask(`目标文件已存在，是否覆盖？\n${path}`, {
-        title: '覆盖确认',
-        kind: 'warning',
-        okLabel: '覆盖',
-        cancelLabel: '跳过',
-      })
+    if (msg.includes('NEED_CONFIRM')) {
+      // ask 策略：目标已存在，由用户决定覆盖或跳过（确认后该任务固定按覆盖重跑）
+      const dirText = t.dir === 'up' ? '上传' : '下载'
+      const ok = await confirmDialog(
+        `目标位置已存在同名文件，是否覆盖？\n${taskName(t)}`,
+        `${dirText}文件已存在`,
+        { confirmText: '覆盖', cancelText: '跳过' },
+      )
+      if (!transfers.value.some(x => x.id === t.id)) return
       if (ok) {
         t.forceOverwrite = true
-        t.status = 'pending'
-        t.error = undefined
-        reportLog('info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}用户确认覆盖，重试`, { name: t.name })
-        schedulePump()
+        t.pct = 0
+        t.skipped = false
+        void runTask(t)
       } else {
-        t.status = 'error'
+        t.skipped = true
+        finishTask()
+      }
+      return
+    }
+    // 用户主动取消：保留队列记录并标记"已取消"，不弹失败 toast
+    if (msg.includes('已取消') || msg.includes('Cancelled')) {
+      if (t.status !== 'cancelled') {
+        t.status = 'cancelled'
         t.speed = 0
-        t.error = '已跳过（目标已存在）'
-        reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已跳过（目标已存在）`, {
+        t.error = undefined
+        reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
           name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
         })
-        toast(`已跳过：${taskName(t)}`, 'warn', 1800)
-        schedulePump()
       }
+      schedulePump()
     } else {
       failTask(msg)
     }
   }
 }
 
-/** 取消/移除任务：进行中的任务先通知后端取消，再出队启动下一个 */
+/** 取消传输：运行中/已暂停通知后端取消（状态由 runTask 的 catch 统一落为"已取消"），
+ *  尚未启动的直接标记；队列保留记录，可查看进度位置后再移除 */
+function cancelTask(t: Transfer) {
+  if (sftpLocked.value) return
+  if (t.status === 'running' || t.status === 'paused') {
+    const backendId = t.backendId || activeSession.value?.backendId
+    if (backendId) {
+      void invoke('sftp_transfer_cancel', { sessionId: backendId, taskId: t.id }).catch(() => {})
+    }
+    return
+  }
+  if (t.status !== 'pending') return
+  t.status = 'cancelled'
+  t.speed = 0
+  reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
+    name: t.name, pct: Math.floor(t.pct),
+  })
+  schedulePump()
+}
+
+/** 移除任务记录：进行中的任务先通知后端取消，再从队列删除并启动下一个 */
 function removeTask(t: Transfer) {
   if (sftpLocked.value) return
   // 移除任务时清理待触发的自动重试定时器，避免对已出队任务重新入队
   if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
-  if (t.status === 'running') {
+  // 进行中或已暂停的任务都要通知后端取消：后端在取消路径关闭句柄并删除 part
+  const active = t.status === 'running' || t.status === 'paused'
+  if (active) {
     const backendId = activeSession.value?.backendId
     if (backendId) {
       void invoke('sftp_transfer_cancel', { sessionId: backendId, taskId: t.id }).catch(() => {})
     }
   }
   transfers.value = transfers.value.filter(x => x.id !== t.id)
-  reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}${t.status === 'success' ? '记录移除' : '已取消'}`, {
+  reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}${active ? '已取消' : '记录移除'}`, {
     name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
   })
-  if (t.status === 'running') schedulePump()
+  if (active) schedulePump()
 }
 
 /** 暂停任务：通知后端暂停开关，invoke 仍挂起；running→paused 释放一个并发槽位 */
@@ -775,9 +873,9 @@ function resumeTask(t: Transfer) {
     name: t.name, pct: Math.floor(t.pct),
   })
 }
-/** 失败任务重试：进度归零、清错误后重新入队 */
+/** 失败/已取消任务重试：进度归零、清错误后重新入队 */
 function retryTask(t: Transfer) {
-  if (t.status !== 'error') return
+  if (t.status !== 'error' && t.status !== 'cancelled') return
   if (sftpLocked.value) return
   // 手动重试：取消待触发的自动重试，并重置自动重试计数
   if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
@@ -813,9 +911,9 @@ function resumeAllTasks() {
   transfers.value.forEach(t => { if (t.status === 'paused') resumeTask(t) })
 }
 
-/** 清空已完成任务（进行中/排队中保留） */
+/** 清空终态记录（已完成/已取消；进行中、排队、暂停、失败保留） */
 function clearDoneTasks() {
-  transfers.value = transfers.value.filter(t => t.status !== 'success')
+  transfers.value = transfers.value.filter(t => t.status !== 'success' && t.status !== 'cancelled')
 }
 
 /** 当前侧选中的条目 */
@@ -828,6 +926,23 @@ function selectedEntries(side: 'local' | 'remote'): FsEntry[] {
 /** 各侧选中条目数（文件与目录），供 header 传输按钮状态/角标显示 */
 const localSel = computed(() => selectedEntries('local'))
 const remoteSel = computed(() => selectedEntries('remote'))
+
+/** 传输任务状态标签文案（队列任务名后展示） */
+const TASK_TAG_TEXT: Record<TransferStatus, string> = {
+  pending: '排队中',
+  running: '传输中',
+  paused: '已暂停',
+  error: '失败',
+  success: '已完成',
+  cancelled: '已取消',
+}
+
+/** 任务状态标签：覆盖策略跳过的任务虽为 success，但语义上应显示"已跳过"；
+ *  字节传完但还在比对哈希时显示"校验中" */
+function taskStatusText(t: Transfer): string {
+  if (t.status === 'running' && t.verifying) return '校验中'
+  return t.skipped ? '已跳过' : TASK_TAG_TEXT[t.status]
+}
 
 /** 将一个选中条目入队：仅支持单文件传输（目录递归传输暂未实现），
  *  拼出本地与远端绝对路径后入队。 */
@@ -1185,8 +1300,12 @@ watch(() => activeSession.value?.backendId, (id) => {
   remoteSelected.value = new Set()
   remoteLoading.value = false
   remoteReqSeq++ // 使在飞的旧会话请求全部过期
+  applySftpIdleTimeout() // 新会话继承当前空闲超时设置
   if (id) void loadRemote()
 })
+
+/* 设置页修改空闲超时后即时下发给当前会话（后端按新值判定下次回收） */
+watch(() => savedSettings.sftpIdleTimeoutSec, () => applySftpIdleTimeout())
 
 /* Shell → SFTP：终端执行 cd 后后端经 0x08 帧上报新 CWD，文件树同步跳转。
    仅当上报路径与当前远端目录不同时才刷新，避免 SFTP 导航触发的回环。 */
@@ -1569,6 +1688,8 @@ onMounted(() => {
   void loadLocal()
   // 组件重挂时活动会话可能早已在线（watch 不会补发），主动加载一次远端默认目录
   if (activeSession.value?.backendId) void loadRemote()
+  // 会话在线时同步一次空闲超时（设置可能在上次下发后已变更）
+  applySftpIdleTimeout()
 
   // 视口适配：上次保存的高度可能超出当前窗口（换显示器/全屏化），
   // 以 workspace / tabs 真实矩形夹取，上限即 Tab 下沿
@@ -1946,8 +2067,8 @@ onUnmounted(() => {
                 </svg>
               </button>
               <span class="queue-sep"></span>
-              <button class="queue-clear" title="清空已完成"
-                      :disabled="!successCount" @click="clearDoneTasks">
+              <button class="queue-clear" title="清空已完成/已取消记录"
+                      :disabled="!successCount && !cancelledCount" @click="clearDoneTasks">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                      stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 7h16M9 7V4h6v3M6.5 7l.8 13h9.4l.8-13M10 11v5M14 11v5"/>
@@ -1981,7 +2102,6 @@ onUnmounted(() => {
                    class="sftp-task"
                    :class="[t.dir === 'up' ? 'upload' : 'download', t.status]">
                 <div class="task-row">
-                  <span class="task-twist-space"></span>
                   <!-- 方向图标 -->
                   <span class="task-ico">
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"
@@ -1990,19 +2110,51 @@ onUnmounted(() => {
                       <path v-else d="M8 3.4v9.2M3.9 8.5L8 12.6l4.1-4.1"/>
                     </svg>
                   </span>
-                  <!-- 主体：名称 / 进度条 / 字节·速率·备注 -->
-                  <span class="task-body">
-                    <span class="task-name">{{ taskName(t) }}</span>
-                    <span class="track"><i class="fill" :style="{ width: Math.min(100, t.pct) + '%' }"></i></span>
+                  <!-- 文件名 / 方向 · 大小 · 目标路径 -->
+                  <span class="task-info">
+                    <span class="task-name" :title="t.name">
+                      <span class="task-name-text">{{ taskName(t) }}</span>
+                      <span class="file-tag"
+                            :class="[t.status, { verifying: t.status === 'running' && t.verifying }]">{{ taskStatusText(t) }}</span>
+                    </span>
                     <span class="task-sub">
-                      <span class="bytes">{{ bytesText(t) }}</span>
-                      <span v-if="rateText(t)" class="rate">{{ rateText(t) }}</span>
-                      <span v-if="noteText(t)" class="note">{{ noteText(t) }}</span>
+                      <span class="dir-tag" :class="t.dir">{{ t.dir === 'up' ? '↑ 上传' : '↓ 下载' }}</span>
+                      <span class="sep">·</span>
+                      <span class="size">{{ fmtSize(t.size) }}</span>
+                      <span class="sep">·</span>
+                      <span class="path" :title="targetPath(t)">{{ targetPath(t) }}</span>
                     </span>
                   </span>
-                  <!-- 状态 + 操作（图标保持不变，按状态显隐） -->
+                  <!-- 传输进度：进度条 + 百分比/速率/剩余 -->
+                  <span class="task-progress">
+                    <span class="track"><i class="fill" :style="{ width: Math.min(100, t.pct) + '%' }"></i></span>
+                    <span class="bar-meta">
+                      <span class="pct">{{ pctText(t) }}</span>
+                      <span v-if="speedText(t)" class="speed">{{ speedText(t) }}</span>
+                      <span v-if="noteText(t)" class="bar-note" :title="noteText(t)">{{ noteText(t) }}</span>
+                      <!-- SHA-256 校验：仅在传输结束后显示，避免与速率/剩余时间争同一行 -->
+                      <span v-if="showHash(t)" class="bar-hash">
+                        <span class="hash-status" :class="hashState(t).cls">{{ hashState(t).text }}</span>
+                        <template v-if="t.hash">
+                          <code :title="t.hash">{{ shortHash(t.hash) }}</code>
+                          <button class="hash-copy" :class="{ copied: t.copied }"
+                                  title="复制完整 SHA-256" @click="copyHash(t)">
+                            <svg v-if="t.copied" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                 stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M20 6L9 17l-5-5"/>
+                            </svg>
+                            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                              <rect x="9" y="9" width="12" height="12" rx="2.5"/>
+                              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                            </svg>
+                          </button>
+                        </template>
+                      </span>
+                    </span>
+                  </span>
+                  <!-- 操作（图标保持不变，按状态显隐） -->
                   <span class="acts">
-                    <span class="task-state">{{ stateText(t) }}</span>
                     <!-- 暂停：等待 / 传输中 -->
                     <button v-if="t.status === 'pending' || t.status === 'running'"
                             class="task-abtn" title="暂停" @click="pauseTask(t)">
@@ -2018,8 +2170,8 @@ onUnmounted(() => {
                         <path d="M5.6 3.4 12.1 8l-6.5 4.6z"/>
                       </svg>
                     </button>
-                    <!-- 重试：失败 -->
-                    <button v-if="t.status === 'error'" class="task-abtn" title="重试"
+                    <!-- 重试：失败/已取消 -->
+                    <button v-if="t.status === 'error' || t.status === 'cancelled'" class="task-abtn" title="重试"
                             @click="retryTask(t)">
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
                            stroke-linecap="round" stroke-linejoin="round">
@@ -2034,16 +2186,17 @@ onUnmounted(() => {
                         <path d="M2.3 4.6a1 1 0 0 1 1-1h2.5l1.3 1.6h5.6a1 1 0 0 1 1 1v5.8a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1z"/>
                       </svg>
                     </button>
-                    <!-- 取消：未完成任务 -->
-                    <button v-if="t.status !== 'success'" class="task-x" title="取消传输"
-                            @click="removeTask(t)">
+                    <!-- 取消：进行中/排队中/已暂停（保留"已取消"记录） -->
+                    <button v-if="t.status === 'pending' || t.status === 'running' || t.status === 'paused'"
+                            class="task-x" title="取消传输"
+                            @click="cancelTask(t)">
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
                            stroke-linecap="round">
                         <path d="M4.3 4.3l7.4 7.4M11.7 4.3l-7.4 7.4"/>
                       </svg>
                     </button>
-                    <!-- 清除：已完成记录 -->
-                    <button v-else class="task-x" title="清除记录" @click="removeTask(t)">
+                    <!-- 移除记录：已完成/已取消/失败 -->
+                    <button v-else class="task-x" title="移除记录" @click="removeTask(t)">
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
                            stroke-linecap="round" stroke-linejoin="round">
                         <path d="M3 4.4h10"/><path d="M6.4 4.4V3.2h3.2v1.2"/>
@@ -2166,6 +2319,9 @@ onUnmounted(() => {
         </div>
 
         <div ref="logListEl" class="log-list" :class="{ nowrap: !logWrap }" @scroll="onLogScroll">
+          <!-- 非活动 tab 卸载行 DOM：debug 级别下传输会持续刷日志，
+               常驻数千行每批全量 diff 会占满主线程，导致界面完全无响应 -->
+          <template v-if="activeTab === 'log'">
           <div v-if="!savedSettings.logCollect" class="log-empty">日志采集已关闭（设置 → 日志 → 日志采集）</div>
           <div v-else-if="!filteredLogs.length" class="log-empty">暂无日志</div>
           <template v-else>
@@ -2187,6 +2343,7 @@ onUnmounted(() => {
               </template>
             </span>
           </div>
+          </template>
           </template>
         </div>
       </div>

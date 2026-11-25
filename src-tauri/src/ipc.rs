@@ -367,6 +367,20 @@ pub async fn disconnect_session(
     Ok(())
 }
 
+/// 更新会话的 SFTP 通道空闲超时（秒，0 表示不自动关闭）。
+/// 仅控制缓存通道的回收，SSH 终端主连接不受影响；下次操作自动重建通道。
+#[tauri::command]
+pub async fn sftp_set_idle_timeout(
+    session_id: &str,
+    secs: u64,
+    manager: State<'_, SessionManager>,
+) -> Result<(), String> {
+    manager
+        .sftp_set_idle_timeout(session_id, secs)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// SFTP 列举远端目录。`path` 缺省时由后端 canonicalize(".") 解析为登录默认目录。
 /// SFTP 子系统通道在会话内懒加载并缓存，断流自动重建重试一次。
 #[tauri::command]

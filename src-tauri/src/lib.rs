@@ -226,6 +226,7 @@ pub fn run() {
             ipc::tunnel_stop,
             ipc::disconnect_session,
             ipc::sftp_list_dir,
+            ipc::sftp_set_idle_timeout,
             ipc::sftp_mkdir,
             ipc::sftp_sync_cwd,
             ipc::sftp_upload,
