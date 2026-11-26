@@ -726,17 +726,6 @@ async function onDisconnect() {
   box-sizing: border-box;
   flex-shrink: 0;
 }
-.ri-body::-webkit-scrollbar {
-  width: 8px;
-}
-.ri-body::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 4px;
-  border: 2px solid var(--panel);
-}
-.ri-body::-webkit-scrollbar-thumb:hover {
-  background: var(--border-strong);
-}
 
 /* ============ 连接状态卡片 ============ */
 .ri-conn {

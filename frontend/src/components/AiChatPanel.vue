@@ -4036,11 +4036,6 @@ const configHint = computed(() => {
   margin: 0 auto;
   box-sizing: border-box;
 }
-.chat-scroll::-webkit-scrollbar { width: 6px; }
-.chat-scroll::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 3px;
-}
 
 /* ---------- 会话大纲刻度导轨 ---------- */
 /* 导轨容器：置于消息区（760px 居中）左侧 margin 空隙，右缘距消息区左缘 12px；

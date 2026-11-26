@@ -4,7 +4,7 @@
 >
 > created: 2026-11-26 16:13:00
 >
-> updated: 2026-11-26 16:17:28
+> updated: 2026-11-26 16:53:28
 >
 > author:
 
@@ -25,7 +25,7 @@
 
 - 拖拽自动滚动依赖 `.pane-list` 作为滚动容器（命中 `closest('.pane-list')`），不能把滚动移到外层，否则落点判定与自动滚动失效。
 - 表头 `.list-header` 与行 `.row` 必须共享同一套列宽规则，最小总宽统一为 `580px`。
-- 滚动条轨道、角落与容器背景统一使用主题变量 `var(--panel)`，不引入新的硬编码颜色。
+- 滚动条样式必须走全局唯一来源（`frontend/src/style.css` 顶部的 `::-webkit-scrollbar*` 规则），组件内不得覆写尺寸、配色与描边；轨道与角落透明，随容器自身背景透出。
 - 滚动容器内仍受全局"默认不可选中"策略约束，同步逻辑不得改变该行为。
 
 ## 3. 现状盘点与差距
@@ -34,10 +34,10 @@
 |---|---|---|
 | `.pane-list` | `overflow: auto`，横纵均可滚动 | 未设置 `overscroll-behavior`，macOS 橡皮筋过冲导致滑块到头后仍可拖动内容 |
 | 表头 | 曾被放入滚动内容并设置 `position: sticky` | WebKit 会把 sticky 偏移计入可滚动范围，出现"到头仍可拖"与横向缝隙 |
-| 滚动条 | 只定义 `::-webkit-scrollbar-thumb` | `track` / `corner` 透明，横滚到边界露出深色底 |
+| 滚动条 | 各组件分别覆写尺寸与颜色，部分滑块用实色描边 | 样式不统一，实色描边在滑块四周形成深色黑边 |
 | 表头同步 | 无 | 表头移出滚动容器后，需要手动跟随横向偏移 |
 
-结论：需要"禁用回弹 + 表头不参与滚动 + 横向偏移同步 + 轨道同色"四条规则共同生效。
+结论：需要"禁用回弹 + 表头不参与滚动 + 横向偏移同步 + 滚动条全局统一"四条规则共同生效。
 
 ## 4. 目标与非目标
 
@@ -77,7 +77,7 @@
 | 表头不进入滚动区 | 表头置于 `.list-header-wrap`（`overflow: hidden`），不放在 `.pane-list` 内 | `sticky` 表头会撑大可滚动范围并产生横向缝隙 |
 | 横向偏移同步 | `scroll` 回调写 `translateX(-scrollLeft)px` | 不进响应式状态，避免每帧触发组件重渲染 |
 | 宽度一致 | 表头 `width: 100%; min-width: 580px`，行 `min-width: 580px` | 保证可滚动范围与列宽一致，边界无空白 |
-| 滚动条槽同色 | `::-webkit-scrollbar-track`、`::-webkit-scrollbar-corner` 设为 `var(--panel)` | 消除横滚到边界的深色条 |
+| 滚动条全局统一 | 定义在 `frontend/src/style.css` 顶部：尺寸 `var(--sb-size)`、滑块 `var(--scrollbar-thumb)` / hover `var(--scrollbar-thumb-hover)`、`border: 2px solid transparent` + `background-clip: content-box` 缩边、轨道与角落透明；组件内不再覆写 | 消除实色描边造成的黑边，所有容器视觉一致；轨道透出容器背景，边界不出现深色块 |
 | 表头区分底色 | 表头与 `.list-header-wrap` 使用 `var(--panel-2)`，比列表底色更亮 | 提供表头区域标识，同时覆盖滚动条占位让出的区域 |
 
 同步实现（`frontend/src/components/wb/DockPanel.vue`）：
@@ -99,10 +99,8 @@ function onListScroll(e: Event) {
   /* 禁用 macOS/iOS 的橡皮筋回弹 */
   overscroll-behavior: none;
   background: var(--panel);
-}
-.pane-list::-webkit-scrollbar-track,
-.pane-list::-webkit-scrollbar-corner {
-  background: var(--panel);
+  /* 滚动条尺寸/配色/描边全部继承全局规则，此处不覆写：
+     轨道透明后透出的就是上面的 var(--panel)，边界不会出现深色条 */
 }
 .list-header-wrap {
   flex-shrink: 0;
@@ -151,7 +149,8 @@ else if (list.scrollTop > maxY) list.scrollTop = maxY
   2. 任意横向滚动位置，表头「名称 / 大小 / 修改时间 / 权限 / 用户·组」与文件列对齐。
   3. 纵向滚动时表头固定，横向滚动时表头跟随。
   4. 横滚到左右边界不出现深色条或空白。
-  5. 筛选高亮、拖拽入队与边缘自动滚动、排序点击均正常。
+  5. SFTP 列表、传输队列、AI 会话、右侧 Inspector、终端自绘滚动条的粗细（8px）、颜色、圆角一致，滑块四周无描边黑边。
+  6. 筛选高亮、拖拽入队与边缘自动滚动、排序点击均正常。
 
 ## 9. 未决问题
 

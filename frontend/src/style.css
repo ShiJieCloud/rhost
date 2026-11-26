@@ -18,11 +18,16 @@ body {
 
   background: var(--bg-app);
 }
+/* ---------- 滚动条：全系统统一样式（唯一来源，组件内不再覆写） ----------
+   尺寸走 --sb-size，颜色走 --scrollbar-thumb(-hover)，两端主题自动切换。
+   滑块用 2px 透明边框 + content-box 裁切，视觉宽度 4px，避免出现深色描边。
+   例外：需要隐藏滚动条的功能区（标签栏、路径栏、大纲导轨等）仍各自 display:none。 */
 ::-webkit-scrollbar {
   width: var(--sb-size);
   height: var(--sb-size);
 }
-::-webkit-scrollbar-track {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
@@ -2033,8 +2038,6 @@ body {
   line-height: 1.65;
   color: var(--fg-muted);
   white-space: nowrap;
-
-  scrollbar-width: thin;
 }
 .tnl-copy {
   flex: none;
@@ -3025,22 +3028,26 @@ body {
   background-color: transparent !important;
 }
 /* xterm 6 使用 DOM 滑块自绘滚动条（非原生 ::-webkit-scrollbar，
-   全局滚动条规则管不到它） */
+   全局滚动条规则管不到它）：尺寸/颜色/缩边对齐全局统一样式 */
 .term-instance .xterm-scrollable-element > .scrollbar.vertical {
-  width: 6px !important;
+  width: var(--sb-size) !important;
 }
 .term-instance .xterm-scrollable-element > .scrollbar.vertical > .slider {
-  width: 6px !important;
+  width: var(--sb-size) !important;
 
   background-color: var(--scrollbar-thumb) !important;
-  border-radius: 4px;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 .term-instance .xterm-scrollable-element > .scrollbar.vertical:hover > .slider {
-  background-color: rgba(62, 83, 107, 0.95) !important;
+  background-color: var(--scrollbar-thumb-hover) !important;
+  background-clip: content-box;
 }
 /* 拖动中用品牌蓝给出明确反馈 */
 .term-instance .xterm-scrollable-element > .scrollbar.vertical.active > .slider {
   background-color: rgba(88, 166, 255, 0.7) !important;
+  background-clip: content-box;
 }
 /* 广播条展开时终端底部避让（.terminal.bcast-on 的 padding 对绝对定位子元素无效） */
 .terminal.bcast-on .term-instance {
@@ -4202,21 +4209,6 @@ body {
   font-size: 11.5px;
   background: var(--panel);
 }
-.pane-list::-webkit-scrollbar {
-  width: var(--sb-size);
-  height: var(--sb-size);
-}
-/* 轨道与角落同面板底色，避免横滚到边界时表头两侧露出深色条 */
-.pane-list::-webkit-scrollbar-track,
-.pane-list::-webkit-scrollbar-corner {
-  background: var(--panel);
-}
-.pane-list::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 4px;
-  border: 2px solid var(--bg);
-  background-clip: content-box;
-}
 .list-header-wrap {
   flex-shrink: 0;
   overflow: hidden;
@@ -4672,17 +4664,6 @@ body.row-dragging .row {
   overflow-y: scroll;
   scrollbar-gutter: stable;
   overscroll-behavior: contain;
-}
-.queue-list::-webkit-scrollbar {
-  /* 与 SFTP 文件列表（.pane-list）共用全局尺寸变量 */
-  width: var(--sb-size);
-  height: var(--sb-size);
-}
-.queue-list::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 4px;
-  border: 2px solid var(--panel);
-  background-clip: content-box;
 }
 /* 上滚查看历史时的新任务提示，贴在列表右下角 */
 .queue-latest {
