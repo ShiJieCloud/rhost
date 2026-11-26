@@ -2,13 +2,17 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Inspector from './wb/Inspector.vue'
 import AiChatPanel from './AiChatPanel.vue'
+import CommandHistoryPanel from './wb/CommandHistoryPanel.vue'
 import { activeSession, rightPanelMaximized, rightPanelTab, rightPanelVisible, rightPanelWidth } from '../stores/session'
 import { savedSettings } from '../stores/settings'
 
-/** 头部标题：AI 固定，monitor 页面固定「监控」 */
-const panelTitle = computed(() => (rightPanelTab.value === 'ai' ? 'AI 助手' : '监控'))
+/** 头部标题：AI / 历史固定，monitor 页面固定「监控」 */
+const panelTitle = computed(() => {
+  if (rightPanelTab.value === 'ai') return 'AI 助手'
+  return rightPanelTab.value === 'history' ? '历史命令' : '监控'
+})
 
-/** AI 对话 scope 标识：有活动会话显示当前主机名（别名优先回落 host.id），否则为全局 */
+/** 当前会话标识（AI / 历史页签头部显示）：有活动会话显示主机名，否则为全局 */
 const scopeLabel = computed(() => {
   if (activeSession.value) {
     return activeSession.value.alias || activeSession.value.host.id
@@ -97,7 +101,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
     <div class="panel-head">
       <div class="panel-title">
         <span class="title-text">{{ panelTitle }}</span>
-        <span v-if="rightPanelTab === 'ai'" class="scope-badge" :title="`对话归属：${scopeLabel}`">{{ scopeLabel }}</span>
+        <span v-if="rightPanelTab !== 'monitor'" class="scope-badge" :title="`当前会话：${scopeLabel}`">{{ scopeLabel }}</span>
       </div>
       <div id="rp-head-actions" class="panel-actions" />
       <button
@@ -133,6 +137,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
     <div class="panel-body">
       <Inspector v-show="rightPanelTab === 'monitor'" />
       <AiChatPanel v-show="rightPanelTab === 'ai'" />
+      <CommandHistoryPanel v-show="rightPanelTab === 'history'" />
     </div>
   </div>
 </template>

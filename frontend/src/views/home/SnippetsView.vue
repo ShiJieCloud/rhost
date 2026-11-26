@@ -95,7 +95,7 @@ onUnmounted(clearConfirm)
         <circle cx="11" cy="11" r="7"></circle>
         <line x1="21" y1="21" x2="16.7" y2="16.7"></line>
       </svg>
-      <input v-model="q" type="text" spellcheck="false" placeholder="搜索名称、命令或分组…" />
+      <input v-model="q" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="搜索名称、命令或分组…" />
     </div>
     <div class="toolbar-actions">
       <button type="button" class="btn primary" @click="startCreate">

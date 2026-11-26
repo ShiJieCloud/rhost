@@ -2857,7 +2857,7 @@ onUnmounted(() => {
                              @blur="confirmEdit" />
                       <span v-else class="row-text">
                         <template v-for="(seg, i) in nameSegments(e.name, 'local')" :key="i">
-                          <mark v-if="seg.hit" class="name-hit">{{ seg.text }}</mark>
+                          <mark v-if="seg.hit" class="text-hit">{{ seg.text }}</mark>
                           <template v-else>{{ seg.text }}</template>
                         </template>
                       </span>
@@ -3007,7 +3007,7 @@ onUnmounted(() => {
                              @blur="confirmEdit" />
                       <span v-else class="row-text">
                         <template v-for="(seg, i) in nameSegments(e.name, 'remote')" :key="i">
-                          <mark v-if="seg.hit" class="name-hit">{{ seg.text }}</mark>
+                          <mark v-if="seg.hit" class="text-hit">{{ seg.text }}</mark>
                           <template v-else>{{ seg.text }}</template>
                         </template>
                       </span>
@@ -3391,6 +3391,10 @@ onUnmounted(() => {
             :class="{ nomatch: searchActive && !matchIds.length }"
             type="text"
             placeholder="搜索日志内容…"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
             @keydown.enter.exact.prevent="gotoMatch(1)"
             @keydown.shift.enter.prevent="gotoMatch(-1)"
             @keydown.esc.prevent="closeSearch"

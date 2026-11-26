@@ -98,7 +98,7 @@ async function copyPubKey(k: SshKey) {
         <circle cx="11" cy="11" r="7"></circle>
         <line x1="21" y1="21" x2="16.7" y2="16.7"></line>
       </svg>
-      <input v-model="q" type="text" spellcheck="false"
+      <input v-model="q" type="text" spellcheck="false" autocapitalize="off" autocorrect="off"
              placeholder="搜索名称、备注、指纹、标签或关联主机…" />
     </div>
 

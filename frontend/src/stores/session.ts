@@ -10,6 +10,7 @@ import { promptPassword } from '../composables/usePasswordPrompt'
 import { confirmHostKey, parseHostKeyError } from '../composables/useHostKeyPrompt'
 import { toast } from '../composables/useToast'
 import { appLocked } from './appLock'
+import { recordTerminalInput, clearCommandHistory } from './commandHistory'
 
 export type SessionState = 'idle' | 'connecting' | 'online' | 'reconnecting' | 'offline'
 export type AppView = 'home' | 'workbench'
@@ -59,8 +60,8 @@ const bool = (v: unknown, dflt: boolean) => (typeof v === 'boolean' ? v : dflt)
 
 /** 右侧面板显隐（全局共享：首页折叠→工作台也折叠）；false 时仅常驻右侧图标栏 */
 export const rightPanelVisible = ref(false)
-/** 右侧面板当前页签 */
-export const rightPanelTab = ref<'monitor' | 'ai'>('monitor')
+/** 右侧面板当前页签（监控 / AI 助手 / 历史命令，均为当前会话 scope） */
+export const rightPanelTab = ref<'monitor' | 'ai' | 'history'>('monitor')
 /** 右侧面板宽度（px）；拖拽左缘调整，普通模式夹取 280~动态上限 */
 export const rightPanelWidth = ref(320)
 /** 右侧面板专注模式：占满主区（隐藏中央内容），用于沉浸式 AI 对话 */
@@ -89,7 +90,10 @@ onConfigLoad(snap => {
   // 旧字段 inspectorVisible 一次性映射为 rightPanelVisible（兼容老配置，下次落盘即清除）
   const rpVisible = ui.rightPanelVisible !== undefined ? ui.rightPanelVisible : ui.inspectorVisible
   rightPanelVisible.value = bool(rpVisible, false)
-  rightPanelTab.value = ui.rightPanelTab === 'ai' || ui.rightPanelTab === 'monitor' ? ui.rightPanelTab : 'monitor'
+  rightPanelTab.value =
+    ui.rightPanelTab === 'ai' || ui.rightPanelTab === 'monitor' || ui.rightPanelTab === 'history'
+      ? ui.rightPanelTab
+      : 'monitor'
   leftPanelTab.value = ui.leftPanelTab === 'snippets' || ui.leftPanelTab === 'hosts' ? ui.leftPanelTab : 'hosts'
   const savedRpWidth = num(ui.rightPanelWidth)
   rightPanelWidth.value = savedRpWidth !== null ? Math.min(800, Math.max(280, savedRpWidth)) : 320
@@ -792,6 +796,7 @@ export function sendInput(id: string, data: string | Uint8Array): Promise<void> 
   if (appLocked.value) return Promise.resolve()
   const s = sessions.value.find(x => x.id === id)
   if (!s?.backendId || !isTauri || s.state !== 'online') return Promise.resolve()
+  recordTerminalInput(id, data)
   const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
   // Tauri 序列化 Vec<u8> 需要普通数组（Uint8Array 会被 JSON 序列化成对象）
   return invoke('write_terminal', { sessionId: s.backendId, data: Array.from(bytes) })
@@ -826,6 +831,7 @@ export function sendInputAndCapture(
   if (!s?.backendId || !isTauri || s.state !== 'online') {
     return Promise.resolve({ output: '', timedOut: false })
   }
+  recordTerminalInput(id, data)
   const bytes = typeof data === 'string' ? textEncoder.encode(data) : data
 
   return new Promise((resolve) => {
@@ -1154,6 +1160,8 @@ export function closeSession(id: string) {
   hostInfoMap.delete(id)
   algoMap.delete(id)
   termSizeMap.delete(id)
+  // 历史命令为会话级内存态：会话关闭即丢弃该会话的历史与未提交行缓冲
+  clearCommandHistory(id)
   metricsMap.value.delete(id)
   netHistMap.value.delete(id)
   clearSessionTunnels(id)

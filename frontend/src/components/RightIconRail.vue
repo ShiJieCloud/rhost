@@ -14,7 +14,7 @@ watch(aiEnabled, on => {
 })
 
 /** 点击图标：面板折叠→展开并切到对应页签；当前页签激活中→折叠；否则仅切换页签 */
-function onIcon(tab: 'monitor' | 'ai') {
+function onIcon(tab: 'monitor' | 'ai' | 'history') {
   if (rightPanelVisible.value && rightPanelTab.value === tab) {
     rightPanelVisible.value = false
   } else {
@@ -35,6 +35,18 @@ function onIcon(tab: 'monitor' | 'ai') {
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+      </svg>
+    </button>
+    <button
+      class="rail-btn"
+      :class="{ on: rightPanelVisible && rightPanelTab === 'history' }"
+      title="历史命令"
+      @click="onIcon('history')"
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
       </svg>
     </button>
     <button

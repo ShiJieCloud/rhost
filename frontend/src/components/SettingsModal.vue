@@ -196,6 +196,7 @@ const PANELS: PanelDef[] = [
         rows: [
           { key: 'colorPrompt', title: '彩色提示符', desc: '登录后为无颜色的远端 shell 配置彩色 PS1 与 ls/grep 颜色；远端已有彩色配置（oh-my-zsh 等）时自动跳过，不覆盖用户设置', kind: 'switch', keywords: '彩色 提示符 颜色 prompt ps1 注入 高亮' },
           { key: 'scrollback', title: '回滚缓冲区', desc: '可向上滚动的历史行数', kind: 'range', min: 1000, max: 100000, step: 1000, unit: ' 行', keywords: '回滚 缓冲 历史 行数 scrollback' },
+          { key: 'commandHistoryLimit', title: '历史命令条数', desc: '右侧历史命令面板每个会话保留的最大条数，超出后丢弃最旧的记录；仅保存在内存中，关闭会话即清空。允许 10~500 条', kind: 'number', width: 100, min: 10, max: 500, step: 10, unit: ' 条', keywords: '命令历史 历史 条数 上限 记录 history command 面板' },
           { key: 'trimOnCopy', title: '复制时去除行尾空格', kind: 'switch', keywords: '复制 行尾空格 修剪 trim copy' },
           { key: 'pasteGuard', title: '粘贴保护', desc: '多行粘贴时弹窗确认，避免误执行', kind: 'switch', keywords: '粘贴 保护 确认 paste 安全' },
           { key: 'autoReconnect', title: '断线自动重连', desc: '网络异常导致连接中断时自动重连（等待 1s 起逐次翻倍，最长 30s）；远端主动 exit、手动断开不会触发，等待期间可随时取消', kind: 'switch', keywords: '断线 自动重连 重连 网络 中断 掉线 退避 reconnect 断开' },
@@ -1331,6 +1332,8 @@ function optionList(r: RowDef): Opt[] {
               type="text"
               placeholder="搜索设置…"
               autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
               spellcheck="false"
             >
             <button v-if="query" class="st-search-clear" title="清除" @click="query = ''">✕</button>

@@ -44,6 +44,8 @@ export interface AppSettings {
   /** 自定义 MOTD ASCII LOGO（多行文本）；仅 motdLogoOn 开启时生效 */
   motdLogo: string
   scrollback: number
+  /** 历史命令面板每会话保留的最大条数（10~500，消费侧夹取）；内存态，关闭会话即清空 */
+  commandHistoryLimit: number
   trimOnCopy: boolean
   pasteGuard: boolean
   rightClick: string
@@ -199,6 +201,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   motdLogoOn: false,
   motdLogo: '',
   scrollback: 10000,
+  commandHistoryLimit: 50,
   trimOnCopy: true,
   pasteGuard: false,
   rightClick: 'menu',

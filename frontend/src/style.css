@@ -4403,9 +4403,9 @@ body.row-dragging .row {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 筛选命中的文件名片段：仅文字着色，不加背景块 */
-.row-text .name-hit {
-  color: var(--accent, var(--green));
+/* 搜索/筛选命中的文本片段：仅文字着色，不加背景块（SFTP 文件列表与历史命令共用） */
+.text-hit {
+  color: var(--accent);
   background: transparent;
 }
 /* 文件名后的传输状态标签（排队中/传输中/已暂停/失败/已完成） */

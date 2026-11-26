@@ -70,7 +70,8 @@ const hasVars = (s: Snippet) => effectiveVars(s).length > 0
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
            stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle>
         <line x1="21" y1="21" x2="16.7" y2="16.7"></line></svg>
-      <input v-model="q" type="text" placeholder="搜索名称、命令或标签…" autocomplete="off">
+      <input v-model="q" type="text" placeholder="搜索名称、命令或标签…" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false">
       <kbd>⌘K</kbd>
     </div>
 

@@ -94,7 +94,7 @@ function accent(s: GroupStat) {
         <circle cx="11" cy="11" r="7"></circle>
         <line x1="21" y1="21" x2="16.7" y2="16.7"></line>
       </svg>
-      <input v-model="q" type="text" spellcheck="false" placeholder="搜索分组或主机名…" />
+      <input v-model="q" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="搜索分组或主机名…" />
     </div>
     <div class="toolbar-actions">
       <button type="button" class="btn primary" @click="startCreate">
