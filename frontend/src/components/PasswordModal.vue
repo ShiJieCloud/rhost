@@ -148,7 +148,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   border: none;
   background: transparent;
   color: var(--text-3);
-  cursor: pointer;
+  cursor: default;
   display: grid;
   place-items: center;
   border-radius: 6px;

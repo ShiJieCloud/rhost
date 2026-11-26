@@ -248,7 +248,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   font-size: 11px;
   padding: 2px 9px;
   border-radius: 6px;
-  cursor: pointer;
+  cursor: default;
   color: var(--muted);
   background: var(--hover);
   border: 1px solid var(--border);
@@ -272,7 +272,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   font-size: 12px;
   padding: 3px 8px;
   border-radius: 6px;
-  cursor: pointer;
+  cursor: default;
   color: var(--muted);
   background: transparent;
   border: 1px solid transparent;

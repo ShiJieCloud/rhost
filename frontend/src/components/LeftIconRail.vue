@@ -64,7 +64,7 @@ function onIcon(tab: 'hosts' | 'snippets') {
   background: transparent;
   border: 1px solid transparent;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .rail-btn:hover {

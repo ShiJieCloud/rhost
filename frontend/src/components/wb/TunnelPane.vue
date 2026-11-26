@@ -197,7 +197,7 @@ function gotoRuleEditor() {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: transparent;
   color: var(--fg);
-  cursor: pointer;
+  cursor: default;
 }
 .tnl-bar-btn:hover { background: rgba(255, 255, 255, 0.07); }
 
@@ -291,7 +291,7 @@ function gotoRuleEditor() {
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: transparent;
   color: var(--fg);
-  cursor: pointer;
+  cursor: default;
 }
 .tnl-empty-btn:hover { background: rgba(255, 255, 255, 0.07); }
 </style>

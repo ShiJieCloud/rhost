@@ -110,11 +110,12 @@ pub fn run() {
             .resizable(true)
             .decorations(cfg!(target_os = "macos"))
             .transparent(cfg!(target_os = "macos"))
-            // 关闭 Tauri 的拖放处理器：Tauri 默认拦截 OS 文件拖放并改发自身事件，
-            // 使 webview 收不到携带 File 的 HTML5 drop 事件。AI 输入区依赖 HTML5 拖放
-            // 采集图片附件，故放开由 webview 原生处理（前端无 Tauri 拖放事件消费方）
-            .disable_drag_drop_handler()
             .initialization_script(&boot_script);
+
+            // 外部文件拖放策略：三端统一启用 Tauri 原生拖放处理器，
+            // 外部文件拖入转成前端 onDragDropEvent（SFTP 上传、AI 附件）。
+            // 应用内拖拽已改为指针事件自绘，不再依赖 HTML5 拖放，
+            // 因此无需在 Windows/Linux 上关闭原生处理器。
 
             #[cfg(target_os = "macos")]
             {
@@ -263,6 +264,8 @@ pub fn run() {
             ipc::reset_settings_config,
             fonts::check_fonts,
             localfs::list_local_dir,
+            localfs::local_stat,
+            localfs::local_read_file,
             localfs::mkdir,
             localfs::local_remove,
             localfs::local_rename,

@@ -10,6 +10,8 @@ import { matchHighRisk } from '../lib/aiRisk'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { isTauri } from '../lib/tauri'
 import { Channel, invoke } from '@tauri-apps/api/core'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
+import type { DragDropEvent } from '@tauri-apps/api/webview'
 import AppLogo from './AppLogo.vue'
 import AiMarkdown from './AiMarkdown.vue'
 import {
@@ -3118,6 +3120,79 @@ function onDrop(e: DragEvent) {
   if (files.length) void addFiles(files)
 }
 
+/* ---------- 原生拖放：外部文件拖入 composer（三端统一） ----------
+   启用原生拖放处理器后 webview 收不到携带 File 的 HTML5 drop，
+   改由窗口事件拿到本地绝对路径，读回内容后复用既有附件链路。 */
+const composerEl = ref<HTMLElement | null>(null)
+let unlistenNativeDrop: UnlistenFn | null = null
+
+function positionInComposer(pos: { x: number; y: number }): boolean {
+  const el = composerEl.value
+  if (!el) return false
+  const r = el.getBoundingClientRect()
+  const inRect = (x: number, y: number) =>
+    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+  // macOS WKWebView 给的是逻辑点，Windows 为物理像素：先按逻辑点，再按 DPR 兜底
+  if (inRect(pos.x, pos.y)) return true
+  const dpr = window.devicePixelRatio || 1
+  return dpr !== 1 && inRect(pos.x / dpr, pos.y / dpr)
+}
+
+/** 扩展名 → 图片 MIME（原生拖放只给路径，需自行还原类型） */
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+}
+
+/** 由本地绝对路径读取内容并复用 File 附件链路（图片压缩 / 文本校验逻辑不变） */
+async function addFilesFromPaths(paths: string[]) {
+  for (const p of paths) {
+    const name = p.split(/[\\/]/).filter(Boolean).pop() || p
+    const ext = fileExt(name)
+    const mime = IMAGE_MIME_BY_EXT[ext]
+    const isText = FILE_ALLOWED_NAMES.includes(name.toLowerCase())
+      || FILE_ALLOWED_EXTS.includes(ext)
+    if (!mime && !isText) continue // 只收图片与白名单文本/代码文件，其余静默忽略
+    try {
+      const buf = await invoke<ArrayBuffer>('local_read_file', {
+        path: p,
+        maxBytes: mime ? IMAGE_MAX_RAW_BYTES : FILE_MAX_RAW_BYTES,
+      })
+      const file = new File([buf], name, { type: mime || 'text/plain' })
+      if (mime) await addImageFile(file, name)
+      else await addTextFile(file)
+    } catch (e) {
+      toast(`文件读取失败：${name}（${String(e)}）`, 'warn', 3000)
+    }
+  }
+}
+
+function onNativeDragDrop(ev: DragDropEvent) {
+  if (ev.type === 'leave') {
+    dragDepth = 0
+    dragActive.value = false
+    return
+  }
+  if (ev.type === 'enter' || ev.type === 'over') {
+    dragActive.value = positionInComposer(ev.position)
+    return
+  }
+  dragActive.value = false
+  dragDepth = 0
+  if (positionInComposer(ev.position)) void addFilesFromPaths(ev.paths)
+}
+
+onMounted(() => {
+  if (!isTauri) return
+  void getCurrentWebview().onDragDropEvent((event) => onNativeDragDrop(event.payload)).then((fn) => {
+    unlistenNativeDrop = fn
+  })
+})
+onUnmounted(() => unlistenNativeDrop?.())
+
 /** 多行文本域自增高（1~6 行，超出内部滚动） */
 function autoGrow() {
   const el = inputRef.value
@@ -3305,8 +3380,8 @@ const configHint = computed(() => {
                         </span>
                       </div>
                       <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
-                      <pre class="proposal-cmd">{{ proposalCommand(p) }}</pre>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
+                      <pre data-selectable class="proposal-cmd">{{ proposalCommand(p) }}</pre>
                     </template>
                     <template v-else-if="p.name === 'edit_file' || p.name === 'write_file'">
                       <div class="proposal-head">
@@ -3328,10 +3403,10 @@ const configHint = computed(() => {
                           </template>
                         </span>
                       </div>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
                       <details v-if="p.execOutput" class="readonly-output">
                         <summary>输出（{{ p.execOutput.length }} 字符）</summary>
-                        <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+                        <pre data-selectable class="proposal-cmd">{{ p.execOutput }}</pre>
                       </details>
                     </template>
                     <!-- 计划提案：步骤编号列表（决策由计划面板承载，此处只读留痕） -->
@@ -3344,10 +3419,10 @@ const configHint = computed(() => {
                             : p.state === 'accepted' ? '已确认' : p.state === 'rejected' ? '未采用' : '已失效' }}
                         </span>
                       </div>
-                      <ol class="plan-proposal-steps">
+                      <ol class="plan-proposal-steps" data-selectable>
                         <li v-for="(s, si) in planProposalSteps(p)" :key="si">{{ s.title }}</li>
                       </ol>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
                     </template>
                     <!-- 提前收敛提案：剩余步骤已无必要，本步收尾并直接进入结果归纳 -->
                     <template v-else-if="p.name === 'conclude_plan'">
@@ -3362,7 +3437,7 @@ const configHint = computed(() => {
                         </span>
                       </div>
                       <div v-if="p.reason" class="proposal-reason">{{ p.reason }}</div>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
                     </template>
                     <template v-else-if="p.name === 'sftp_upload_file' || p.name === 'sftp_download_file'">
                       <div class="proposal-head">
@@ -3393,7 +3468,7 @@ const configHint = computed(() => {
                           <template v-if="p.progress.speed"> · {{ humanBytes(p.progress.speed) }}/s</template>
                         </span>
                       </div>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
                     </template>
                     <template v-else>
                       <div class="proposal-head">
@@ -3403,10 +3478,10 @@ const configHint = computed(() => {
                           {{ p.error ? '执行失败' : p.execOutput ? '已观察' : '执行中…' }}
                         </span>
                       </div>
-                      <div v-if="p.error" class="proposal-error">{{ p.error }}</div>
+                      <div v-if="p.error" data-selectable class="proposal-error">{{ p.error }}</div>
                       <details v-if="p.execOutput" class="readonly-output">
                         <summary>输出（{{ p.execOutput.length }} 字符）</summary>
-                        <pre class="proposal-cmd">{{ p.execOutput }}</pre>
+                        <pre data-selectable class="proposal-cmd">{{ p.execOutput }}</pre>
                       </details>
                     </template>
                   </div>
@@ -3534,7 +3609,7 @@ const configHint = computed(() => {
                 />
               </template>
               <template v-else>
-                <span class="plan-step-title">{{ si + 1 }}. {{ s.title }}</span>
+                <span class="plan-step-title" data-selectable>{{ si + 1 }}. {{ s.title }}</span>
               </template>
             </div>
           </li>
@@ -3721,6 +3796,7 @@ const configHint = computed(() => {
     <!-- 输入区（composer）：大圆角容器；顶部上下文 chip 行 + 多行文本域 + 底部工具行。
          粘贴 / 拖拽附件在此容器内捕获 -->
     <div
+      ref="composerEl"
       class="composer"
       :class="{ focus: composerFocused, dragging: dragActive }"
       @paste="onPaste"
@@ -4017,7 +4093,7 @@ const configHint = computed(() => {
   border: none;
   background: transparent;
   padding: 0;
-  cursor: pointer;
+  cursor: default;
   display: flex;
   align-items: center;
 }
@@ -4144,7 +4220,7 @@ const configHint = computed(() => {
   font-size: 11.5px;
   color: var(--muted);
   background: transparent;
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 .hint-pill:hover {
@@ -4291,7 +4367,7 @@ const configHint = computed(() => {
   font-size: 12px;
   color: var(--text);
   text-align: left;
-  cursor: pointer;
+  cursor: default;
 }
 .auth-choice:hover {
   background: var(--hover);
@@ -4411,7 +4487,7 @@ const configHint = computed(() => {
   font-size: 11.5px;
 }
 .readonly-output summary {
-  cursor: pointer;
+  cursor: default;
   color: var(--muted);
   user-select: none;
 }
@@ -4606,7 +4682,7 @@ const configHint = computed(() => {
   background: var(--panel);
   color: var(--text);
   font-size: 11.5px;
-  cursor: pointer;
+  cursor: default;
   transition: opacity 0.15s;
 }
 .plan-btn:hover:not(:disabled) {
@@ -4647,7 +4723,7 @@ const configHint = computed(() => {
   gap: 8px;
   padding: 8px 12px;
   font-size: 11px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 }
 .plan-panel-head .plan-badge {
@@ -4773,7 +4849,7 @@ const configHint = computed(() => {
   background: transparent;
   border: none;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s;
 }
 .foot-btn:hover {
@@ -4866,7 +4942,7 @@ const configHint = computed(() => {
   border: none;
   background: transparent;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   font-size: 11px;
   padding: 1px 4px;
   border-radius: 4px;
@@ -4921,7 +4997,7 @@ const configHint = computed(() => {
   user-select: none;
 }
 .task-meta.clickable {
-  cursor: pointer;
+  cursor: default;
 }
 .task-meta.clickable:hover {
   color: var(--text);
@@ -4996,7 +5072,7 @@ const configHint = computed(() => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 }
 .reasoning-toggle:hover {
@@ -5038,7 +5114,7 @@ const configHint = computed(() => {
   background: transparent;
   border: none;
   color: var(--muted);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s;
 }
 .icon-btn:hover:not(:disabled) {
@@ -5082,7 +5158,7 @@ const configHint = computed(() => {
   background: transparent;
   color: var(--text);
   font-size: 12px;
-  cursor: pointer;
+  cursor: default;
   text-align: left;
   white-space: nowrap;
 }
@@ -5131,7 +5207,7 @@ const configHint = computed(() => {
   font-size: 11px;
   color: inherit;
   outline: none;
-  cursor: pointer;
+  cursor: default;
 }
 .perm-wrap.elevated .perm-trigger {
   border-color: var(--yellow);
@@ -5165,7 +5241,7 @@ const configHint = computed(() => {
   border-radius: 8px;
   background: transparent;
   color: var(--text);
-  cursor: pointer;
+  cursor: default;
   text-align: left;
 }
 .perm-item:hover {
@@ -5202,7 +5278,7 @@ const configHint = computed(() => {
   background: var(--green);
   border: none;
   color: var(--bg-input);
-  cursor: pointer;
+  cursor: default;
   transition: opacity 0.15s;
   flex-shrink: 0;
 }
@@ -5229,7 +5305,7 @@ const configHint = computed(() => {
   place-items: center;
   background: rgba(229, 90, 90, 0.15);
   border: 1px solid rgba(229, 90, 90, 0.5);
-  cursor: pointer;
+  cursor: default;
   flex-shrink: 0;
 }
 .stop-square {
@@ -5249,7 +5325,7 @@ const configHint = computed(() => {
   background: transparent;
   border: none;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s;
 }
 .ai-action-btn:hover:not(:disabled) {
@@ -5321,7 +5397,7 @@ const configHint = computed(() => {
   border-radius: 6px;
   padding: 4px 12px;
   font-size: 11.5px;
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s;
 }
 .exec-btn:hover {

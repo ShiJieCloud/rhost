@@ -161,7 +161,7 @@ onUnmounted(() => {
   color: var(--on-accent);
   font-size: 13px;
   font-weight: 600;
-  cursor: pointer;
+  cursor: default;
   display: inline-flex;
   align-items: center;
   justify-content: center;

@@ -209,7 +209,7 @@ onUnmounted(clearConfirm)
   background: transparent;
   border: none;
   border-radius: var(--radius-control);
-  cursor: pointer;
+  cursor: default;
   transition:
     background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);

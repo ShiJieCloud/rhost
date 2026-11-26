@@ -166,6 +166,52 @@ pub async fn list_local_dir(path: Option<String>) -> Result<LocalDirListing, Str
     .map_err(|e| format!("目录列举任务失败：{e}"))?
 }
 
+/// 本地单路径元信息（外部文件拖入上传：据此判断文件夹 / 文件并填充任务大小）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalPathInfo {
+    pub is_dir: bool,
+    /// 文件字节数；目录恒为 0
+    pub size: u64,
+}
+
+/// 读取单个本地路径的类型与大小（跟随符号链接，与目录列举口径一致）。
+#[tauri::command]
+pub async fn local_stat(path: String) -> Result<LocalPathInfo, String> {
+    crate::slow_span!("local_stat");
+    let md = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("获取 {path} 属性失败：{e}"))?;
+    let is_dir = md.is_dir();
+    Ok(LocalPathInfo {
+        is_dir,
+        size: if is_dir { 0 } else { md.len() },
+    })
+}
+
+/// 读取本地文件原始字节，供 AI 附件拖入复用既有 File 处理链路
+/// （macOS 原生拖放只提供路径，不携带 File 内容）。超过 `max_bytes` 直接拒绝。
+#[tauri::command]
+pub async fn local_read_file(
+    path: String,
+    max_bytes: u64,
+) -> Result<tauri::ipc::Response, String> {
+    crate::slow_span!("local_read_file");
+    let md = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("获取 {path} 属性失败：{e}"))?;
+    if !md.is_file() {
+        return Err(format!("{path} 不是文件"));
+    }
+    if md.len() > max_bytes {
+        return Err(format!("文件过大（{} 字节，上限 {max_bytes}）", md.len()));
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("读取 {path} 失败：{e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// 本地创建目录（单层，不递归）。
 #[tauri::command]
 pub async fn mkdir(path: String) -> Result<(), String> {

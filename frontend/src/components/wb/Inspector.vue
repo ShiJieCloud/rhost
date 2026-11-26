@@ -387,22 +387,22 @@ async function onDisconnect() {
         <div class="ri-conn-grid">
           <div class="ri-cell">
             <div class="ri-label">状态</div>
-            <div class="ri-value" :class="`st-${stateCls}`">
+            <div data-selectable class="ri-value" :class="`st-${stateCls}`">
               <span class="ri-pulse" :style="{ background: stateDotVar }" />
               {{ stateLabel }}
             </div>
           </div>
           <div class="ri-cell">
             <div class="ri-label">时长</div>
-            <div class="ri-value mono">{{ uptime }}</div>
+            <div data-selectable class="ri-value mono">{{ uptime }}</div>
           </div>
           <div class="ri-cell full">
             <div class="ri-label">主机</div>
-            <div class="ri-value ri-host">{{ hostLabel }}</div>
+            <div data-selectable class="ri-value ri-host">{{ hostLabel }}</div>
           </div>
           <div class="ri-cell full">
             <div class="ri-label">地址</div>
-            <div class="ri-value addr">
+            <div data-selectable class="ri-value addr">
               <span class="addr-text">{{ hostIpPort || '—' }}</span>
               <button v-if="hostIpPort" class="ri-copy" title="复制地址" @click="copyAddr">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -415,15 +415,15 @@ async function onDisconnect() {
           </div>
           <div class="ri-cell">
             <div class="ri-label">用户</div>
-            <div class="ri-value mono">{{ currentUser }}</div>
+            <div data-selectable class="ri-value mono">{{ currentUser }}</div>
           </div>
           <div class="ri-cell">
             <div class="ri-label">认证</div>
-            <div class="ri-value mono">{{ authMethod }}</div>
+            <div data-selectable class="ri-value mono">{{ authMethod }}</div>
           </div>
           <div class="ri-cell">
             <div class="ri-label">RTT</div>
-            <div class="ri-value mono">{{ latencyText }}</div>
+            <div data-selectable class="ri-value mono">{{ latencyText }}</div>
           </div>
         </div>
       </div>
@@ -439,14 +439,14 @@ async function onDisconnect() {
           </svg>
         </button>
         <div class="ri-sec-body">
-          <div class="ri-kv"><span class="k">发行版</span><span class="v" :title="sysinfo.distro">{{ sysinfo.distro }}</span></div>
-          <div class="ri-kv"><span class="k">内核</span><span class="v mono" :title="sysinfo.kernel">{{ sysinfo.kernel }}</span></div>
-          <div class="ri-kv"><span class="k">架构</span><span class="v mono">{{ sysinfo.arch }}</span></div>
-          <div class="ri-kv"><span class="k">CPU 型号</span><span class="v mono" :title="sysinfo.cpuModel">{{ sysinfo.cpuModel }}</span></div>
-          <div class="ri-kv"><span class="k">运行时长</span><span class="v mono">{{ sysinfo.uptime }}</span></div>
-          <div class="ri-kv"><span class="k">时区</span><span class="v mono">{{ sysinfo.timezone }}</span></div>
-          <div class="ri-kv"><span class="k">服务器 IP</span><span class="v mono" :title="sysinfo.ip">{{ sysinfo.ip }}</span></div>
-          <div class="ri-kv"><span class="k">登录时间</span><span class="v mono">{{ loginTime }}</span></div>
+          <div class="ri-kv"><span class="k">发行版</span><span data-selectable class="v" :title="sysinfo.distro">{{ sysinfo.distro }}</span></div>
+          <div class="ri-kv"><span class="k">内核</span><span data-selectable class="v mono" :title="sysinfo.kernel">{{ sysinfo.kernel }}</span></div>
+          <div class="ri-kv"><span class="k">架构</span><span data-selectable class="v mono">{{ sysinfo.arch }}</span></div>
+          <div class="ri-kv"><span class="k">CPU 型号</span><span data-selectable class="v mono" :title="sysinfo.cpuModel">{{ sysinfo.cpuModel }}</span></div>
+          <div class="ri-kv"><span class="k">运行时长</span><span data-selectable class="v mono">{{ sysinfo.uptime }}</span></div>
+          <div class="ri-kv"><span class="k">时区</span><span data-selectable class="v mono">{{ sysinfo.timezone }}</span></div>
+          <div class="ri-kv"><span class="k">服务器 IP</span><span data-selectable class="v mono" :title="sysinfo.ip">{{ sysinfo.ip }}</span></div>
+          <div class="ri-kv"><span class="k">登录时间</span><span data-selectable class="v mono">{{ loginTime }}</span></div>
         </div>
       </section>
 
@@ -464,7 +464,7 @@ async function onDisconnect() {
           <div class="ri-res">
             <div class="ri-res-top">
               <span class="name">CPU</span>
-              <span class="val mono">
+              <span data-selectable class="val mono">
                 <b>{{ cpuPct.toFixed(0) }}%</b> · {{ cpuCoresText }}
               </span>
             </div>
@@ -475,7 +475,7 @@ async function onDisconnect() {
           <div class="ri-res">
             <div class="ri-res-top">
               <span class="name">内存</span>
-              <span class="val mono">
+              <span data-selectable class="val mono">
                 <b>{{ memSummary }}</b>
               </span>
             </div>
@@ -486,7 +486,7 @@ async function onDisconnect() {
           <div v-if="swapVisible" class="ri-res">
             <div class="ri-res-top">
               <span class="name">Swap</span>
-              <span class="val mono">{{ swapSummary }}</span>
+              <span data-selectable class="val mono">{{ swapSummary }}</span>
             </div>
             <div class="ri-meter"><i class="swap" :style="{ width: swapPct + '%' }" /></div>
           </div>
@@ -513,7 +513,7 @@ async function onDisconnect() {
             <div class="ri-res">
               <div class="ri-res-top">
                 <span class="name">利用率</span>
-                <span class="val">
+                <span data-selectable class="val">
                   <b>{{ Math.round(g.util) }}%</b>
                   <span class="ri-gpu-aux">
                     · <span :class="gpuTempClass(g.temp)">{{ Math.round(g.temp) }}°C</span>
@@ -529,7 +529,7 @@ async function onDisconnect() {
             <div class="ri-res">
               <div class="ri-res-top">
                 <span class="name">显存</span>
-                <span class="val">
+                <span data-selectable class="val">
                   {{ fmtBytes(g.mem_used) }} / {{ fmtBytes(g.mem_total) }} · {{ gpuMemPct(g).toFixed(0) }}%
                 </span>
               </div>
@@ -554,7 +554,7 @@ async function onDisconnect() {
             <div class="ri-net-label">
               <span class="arrow up">▲</span><span>上传</span>
             </div>
-            <span class="ri-net-val">{{ fmtRate(txRate) }}</span>
+            <span data-selectable class="ri-net-val">{{ fmtRate(txRate) }}</span>
             <svg class="ri-spark" viewBox="0 0 100 24" preserveAspectRatio="none">
               <polyline :points="sparkPoints(activeNetHist.up)" stroke="var(--purple)" />
             </svg>
@@ -563,7 +563,7 @@ async function onDisconnect() {
             <div class="ri-net-label">
               <span class="arrow down">▼</span><span>下载</span>
             </div>
-            <span class="ri-net-val">{{ fmtRate(rxRate) }}</span>
+            <span data-selectable class="ri-net-val">{{ fmtRate(rxRate) }}</span>
             <svg class="ri-spark" viewBox="0 0 100 24" preserveAspectRatio="none">
               <polyline :points="sparkPoints(activeNetHist.down)" stroke="var(--cyan)" />
             </svg>
@@ -583,7 +583,7 @@ async function onDisconnect() {
         </button>
         <div class="ri-sec-body">
           <div v-if="liveDisks.length === 0" class="ri-disk-empty">等待采集…</div>
-          <div v-for="d in liveDisks" :key="d.mount" class="ri-disk">
+          <div v-for="d in liveDisks" :key="d.mount" class="ri-disk" data-selectable>
             <div class="ri-disk-top">
               <span class="mount mono">{{ d.mount }}</span>
               <span class="size mono">{{ fmtBytes(d.used) }} / {{ fmtBytes(d.total) }} · {{ d.pct }}%</span>
@@ -610,7 +610,7 @@ async function onDisconnect() {
             <span>进程</span><span>CPU</span><span>内存</span>
           </div>
           <div v-if="!liveProcs || liveProcs.top.length === 0" class="ri-disk-empty">等待采集…</div>
-          <div v-for="p in liveProcs?.top ?? []" :key="p.pid" class="ri-proc-row">
+          <div v-for="p in liveProcs?.top ?? []" :key="p.pid" class="ri-proc-row" data-selectable>
             <span class="pname mono">
               {{ p.name }}<em>#{{ p.pid }}</em>
             </span>
@@ -678,7 +678,7 @@ async function onDisconnect() {
   background: transparent;
   border: 1px solid transparent;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .ri-icon-btn:hover {
@@ -849,7 +849,7 @@ async function onDisconnect() {
   background: none;
   border: 0;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   padding: 2px 5px;
   font-size: 11px;
   line-height: 1;
@@ -879,7 +879,7 @@ async function onDisconnect() {
   padding: 11px 2px 9px;
   background: none;
   border: 0;
-  cursor: pointer;
+  cursor: default;
   color: var(--muted-2);
   font-family: var(--sans, inherit);
   font-size: 10.5px;

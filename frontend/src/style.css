@@ -19,8 +19,8 @@ body {
   background: var(--bg-app);
 }
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: var(--sb-size);
+  height: var(--sb-size);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -96,7 +96,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--text);
 
@@ -236,7 +236,7 @@ body {
   width: 100%;
   height: 28px;
   padding: 0 8px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
   font-size: 11.5px;
@@ -290,7 +290,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--fg-secondary);
 
@@ -377,7 +377,7 @@ body {
   height: 30px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -510,7 +510,7 @@ body {
 .btn {
   height: var(--h-button);
   padding: 0 12px;
-  cursor: pointer;
+  cursor: default;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -606,7 +606,7 @@ body {
   gap: 12px;
   padding: 8px 10px;
   margin: 0 -10px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: var(--radius-tab);
 
@@ -720,7 +720,7 @@ body {
   display: grid;
   place-items: center;
   padding: 0;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -864,6 +864,7 @@ body {
 .toast-msg {
   flex: 1;
   min-width: 0;
+  -webkit-user-select: text;
   user-select: text;
 
   overflow-wrap: anywhere;
@@ -878,7 +879,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--fg-muted);
 
@@ -1003,7 +1004,7 @@ body {
   height: 28px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
   flex-shrink: 0;
 
   color: var(--muted);
@@ -1051,7 +1052,7 @@ body {
   align-items: center;
   gap: 7px;
   padding: 6px 12px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 
   font-size: 11.5px;
@@ -1107,7 +1108,7 @@ body {
   align-items: center;
   gap: 9px;
   padding: 8px 9px;
-  cursor: pointer;
+  cursor: default;
   margin-bottom: 2px;
   user-select: none;
 
@@ -1262,7 +1263,7 @@ body {
   height: 24px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -1371,7 +1372,7 @@ body {
 }
 .field select {
   padding-right: 30px;
-  cursor: pointer;
+  cursor: default;
 
   appearance: none;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2366748a' stroke-width='2.4' stroke-linecap='round'><polyline points='6 9 12 15 18 9' /></svg>");
@@ -1402,7 +1403,7 @@ body {
 .segmented button {
   flex: 1;
   height: 30px;
-  cursor: pointer;
+  cursor: default;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1490,7 +1491,7 @@ body {
   display: grid;
   place-items: center;
   padding: 0;
-  cursor: pointer;
+  cursor: default;
 
   color: inherit;
 
@@ -1708,7 +1709,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -1959,7 +1960,7 @@ body {
   display: grid;
   place-items: center;
   padding: 0;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--green);
 
@@ -2044,7 +2045,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -2309,7 +2310,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--fg-muted);
 
@@ -2340,7 +2341,7 @@ body {
   gap: 8px;
   flex-shrink: 0;
   padding: 0 10px 0 2px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 
   color: var(--green);
@@ -2385,7 +2386,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-family: inherit;
@@ -2478,7 +2479,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -2517,7 +2518,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  cursor: pointer;
+  cursor: default;
   min-width: 170px;
 
   color: var(--muted);
@@ -2628,7 +2629,7 @@ body {
   align-items: center;
   gap: 9px;
   padding: 7px 9px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: var(--radius-tab);
 
@@ -2784,7 +2785,7 @@ body {
   overflow-y: hidden;
 }
 /* 仅溢出（可滚动）时显示 grab 光标；无溢出时光标为默认值，标签区域由
-   .tab{cursor:pointer} 接管为 pointer，空白区为默认箭头。 */
+   .tab{cursor: default} 接管为 pointer，空白区为默认箭头。 */
 .tabs-scroll.scrollable {
   cursor: grab;
 }
@@ -2811,7 +2812,7 @@ body {
   overflow: hidden;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
   pointer-events: none;
 
   color: var(--muted);
@@ -2865,7 +2866,7 @@ body {
   border-right: 1px solid var(--border);
   color: var(--fg-muted);
   font-size: var(--fs-small);
-  cursor: pointer;
+  cursor: default;
   /* width 不参与过渡：激活/失活时宽度即时变化（90↔190）。
      若给 width 加过渡，宽度插值动画会与 ensureVisible 的 smooth
      滚动并行，动画期间 scrollWidth/几何逐帧漂移，滚动目标被干扰、
@@ -2914,6 +2915,7 @@ body {
   width: 90px;
   flex: 1 1 auto;
   box-sizing: border-box;
+  -webkit-user-select: text;
   user-select: text;
 
   color: var(--text);
@@ -2936,7 +2938,7 @@ body {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   font-size: 11px;
   line-height: 1;
@@ -3137,7 +3139,7 @@ body {
   height: 26px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -3225,7 +3227,7 @@ body {
   flex-shrink: 0;
   height: 28px;
   padding: 0 10px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--fg);
   font-family: inherit;
@@ -3291,7 +3293,7 @@ body {
   font-family: inherit;
   font-size: 11.5px;
   font-weight: 500;
-  cursor: pointer;
+  cursor: default;
   transition:
     background 0.15s,
     box-shadow 0.15s;
@@ -3367,7 +3369,7 @@ body {
   gap: 9px;
   width: 100%;
   padding: 7px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--text);
   font-family: inherit;
@@ -3447,7 +3449,7 @@ body {
 .bp-foot button {
   flex: 1;
   padding: 9px 0;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-family: inherit;
@@ -3616,7 +3618,7 @@ body {
   gap: 10px;
   width: 100%;
   padding: 9px 12px;
-  cursor: pointer;
+  cursor: default;
 
   font-family: inherit;
   font-size: 12.5px;
@@ -3803,7 +3805,7 @@ body {
 .dock-tab {
   height: 25px;
   padding: 0 11px;
-  cursor: pointer;
+  cursor: default;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3857,7 +3859,7 @@ body {
   height: 25px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -3969,7 +3971,7 @@ body {
 }
 .sftp-btn:disabled,
 .pane-btn:disabled {
-  cursor: not-allowed;
+  cursor: default;
 
   opacity: 0.4;
 }
@@ -4001,7 +4003,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-family: inherit;
@@ -4034,6 +4036,8 @@ body {
   overflow: hidden;
 }
 .pane {
+  position: relative;
+
   flex: 1;
   min-width: 0;
   display: flex;
@@ -4101,9 +4105,38 @@ body {
 .pane-path::-webkit-scrollbar {
   display: none;
 }
+/* 路径栏编辑态：单击进入，回车跳转，Esc 取消 */
+.pane-path.editing {
+  border-color: rgba(var(--accent-rgb), 0.55);
+}
+.pane-path-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 2px;
+
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text);
+
+  background: transparent;
+  border: none;
+  outline: none;
+}
+/* 非编辑态保持显示筛选词 */
+.path-filter-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+
+  font-size: 10.5px;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .pane-path .crumb {
   padding: 0 4px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--text);
   white-space: nowrap;
@@ -4128,7 +4161,7 @@ body {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
 
@@ -4147,15 +4180,6 @@ body {
   width: 12px;
   height: 12px;
 }
-/* pane-header 内导航区 | 传输区分隔线 */
-.pane-header .sep {
-  width: 1px;
-  height: 14px;
-  flex-shrink: 0;
-  margin: 0 2px;
-
-  background: var(--border);
-}
 /* 传输按钮：有选中文件时高亮 */
 .transfer-btn.ready {
   color: var(--green);
@@ -4172,12 +4196,20 @@ body {
   flex: 1;
   overflow: auto;
   min-height: 0;
+  /* 禁用 macOS/iOS 的橡皮筋回弹：滚动条到头后不再能继续拉动内容 */
+  overscroll-behavior: none;
 
   font-size: 11.5px;
+  background: var(--panel);
 }
 .pane-list::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: var(--sb-size);
+  height: var(--sb-size);
+}
+/* 轨道与角落同面板底色，避免横滚到边界时表头两侧露出深色条 */
+.pane-list::-webkit-scrollbar-track,
+.pane-list::-webkit-scrollbar-corner {
+  background: var(--panel);
 }
 .pane-list::-webkit-scrollbar-thumb {
   background: var(--border-strong);
@@ -4185,11 +4217,20 @@ body {
   border: 2px solid var(--bg);
   background-clip: content-box;
 }
+.list-header-wrap {
+  flex-shrink: 0;
+  overflow: hidden;
+
+  /* 与表头同色：纵向滚动条占位使表头可视宽略小于 wrap，露出底色会形成深色条 */
+  background: var(--panel-2);
+}
 .list-header {
   display: flex;
   align-items: center;
   user-select: none;
   flex-shrink: 0;
+  width: 100%;
+  min-width: 580px;
 
   font-size: 9.5px;
   font-weight: 600;
@@ -4197,12 +4238,12 @@ body {
   text-transform: uppercase;
   color: var(--muted-2);
 
-  background: var(--panel);
+  background: var(--panel-2);
   border-bottom: 1px solid var(--border);
 }
 .list-header > div {
   padding: 6px 8px;
-  cursor: pointer;
+  cursor: default;
 
   transition: 0.12s;
 }
@@ -4249,7 +4290,7 @@ body {
 .row {
   display: flex;
   align-items: center;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 
   border-bottom: 1px solid var(--border-soft);
@@ -4264,6 +4305,68 @@ body {
 }
 .row.selected .row-text {
   color: var(--fg-strong);
+}
+/* 跨侧拖拽：落点不做描边/高亮，仅保留跟手信息条与源行弱化 */
+.pane-list-wrap {
+  position: relative;
+
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+.pane-list-wrap > .pane-list {
+  flex: 1;
+}
+/* 自绘拖拽：源行弱化、全局抓取光标、跟随光标的信息条 */
+.row.dragging {
+  opacity: 0.45;
+}
+body.row-dragging,
+body.row-dragging * {
+  /* 拖拽期间连可选中白名单一起禁用，避免自动滚动时误选内容 */
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+body.row-dragging {
+  cursor: grabbing;
+}
+body.row-dragging .row {
+  cursor: grabbing;
+}
+.row-drag-ghost {
+  position: fixed;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+  padding: 5px 9px;
+  pointer-events: none;
+
+  font-size: 11.5px;
+  color: var(--fg-strong);
+
+  background: var(--bg-popup);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+  border-radius: 6px;
+  box-shadow: var(--shadow-balloon);
+}
+.row-drag-ghost svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+
+  stroke: var(--accent);
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.row-drag-ghost span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .row > div {
   padding: 4px 8px;
@@ -4308,6 +4411,11 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 筛选命中的文件名片段：仅文字着色，不加背景块 */
+.row-text .name-hit {
+  color: var(--accent, var(--green));
+  background: transparent;
+}
 /* 文件名后的传输状态标签（排队中/传输中/已暂停/失败/已完成） */
 .file-tag {
   flex-shrink: 0;
@@ -4337,6 +4445,7 @@ body {
 .file-tag.verifying {
   color: var(--purple);
   border-color: rgba(187, 154, 247, 0.45);
+  background: rgba(187, 154, 247, 0.1);
 }
 .file-tag.success {
   color: var(--muted-2);
@@ -4534,16 +4643,21 @@ body {
 /* ============================================================
    传输队列面板
    head(28) + tabs(28) + 列头(26) + list(弹性)；折叠仅留 head
-   任务行与列头共用 --task-cols 四列网格：图标 | 文件信息 | 进度 | 操作
+   任务行与列头共用四列结构：图标 | 文件信息 | 进度 | 操作
+   操作列 sticky 吸右，横向滚动时始终可见
    ============================================================ */
 .sftp-tasks {
-  --task-cols: 26px minmax(96px, 1.5fr) minmax(160px, 3fr) 58px;
-
   position: relative;
+
+  /* 队列作为容器查询容器：窄模式按面板实际宽度降级，而非窗口宽度 */
+  container-type: inline-size;
 
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  /* 硬性上限：无论拖拽或恢复的高度值多大，都为顶栏与文件列表保留空间，
+     避免队列把上方内容挤没后向下溢出、被底部状态栏裁掉 */
+  max-height: calc(100% - 120px);
   overflow: hidden;
 
   border-top: 1px solid var(--border);
@@ -4553,17 +4667,58 @@ body {
 .queue-list {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow-x: auto;
+  /* 纵向滚动条常驻占位：任务增减时内容宽度不变，避免「暂无传输任务」左右跳动 */
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   overscroll-behavior: contain;
 }
 .queue-list::-webkit-scrollbar {
-  width: 8px;
+  /* 与 SFTP 文件列表（.pane-list）共用全局尺寸变量 */
+  width: var(--sb-size);
+  height: var(--sb-size);
 }
 .queue-list::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 4px;
   border: 2px solid var(--panel);
   background-clip: content-box;
+}
+/* 上滚查看历史时的新任务提示，贴在列表右下角 */
+.queue-latest {
+  position: sticky;
+  bottom: 8px;
+  z-index: 10;
+
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  margin: 0 8px 8px auto;
+  padding: 3px 8px;
+  cursor: default;
+
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--fg-strong);
+  white-space: nowrap;
+
+  border: 1px solid var(--border-popup);
+  border-radius: var(--radius-popup);
+  background: var(--bg-popup);
+  box-shadow: var(--shadow-popup);
+
+  transition: background-color 0.13s, border-color 0.13s, color 0.13s;
+}
+.queue-latest:hover {
+  /* 浮层需保持不透明：hover 叠加层覆盖在浮层底色上，避免透出下层组件文字 */
+  background: linear-gradient(var(--hover), var(--hover)), var(--bg-popup);
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+.queue-latest svg {
+  width: 10px;
+  height: 10px;
 }
 /* ---- 头部：指示灯 + 标题 + 总数；右侧批量操作 ---- */
 .queue-head {
@@ -4634,7 +4789,7 @@ body {
 }
 /* 折叠态头部进度摘要：超长省略，hover 看全名；整行可点击切换折叠 */
 .queue-head {
-  cursor: pointer;
+  cursor: default;
 }
 .queue-summary {
   flex: 0 1 auto;
@@ -4657,7 +4812,7 @@ body {
   height: 20px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -4699,7 +4854,7 @@ body {
   height: 20px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -4734,7 +4889,7 @@ body {
 }
 .q-tab {
   padding: 3px 10px;
-  cursor: pointer;
+  cursor: default;
 
   font-size: 10.5px;
   font-family: inherit;
@@ -4776,6 +4931,10 @@ body {
   --fill: var(--border-strong);
   position: relative;
 
+  /* 队列最小宽度：窗口更窄时整行等宽，由列表出现横向滚动条承接
+     取值需覆盖子文件行网格的最小内容宽度，避免子行撑宽滚动区导致目录行右侧留白 */
+  min-width: 620px;
+
   border-bottom: 1px solid var(--border-soft);
   animation: task-in 0.18s ease both;
 }
@@ -4801,18 +4960,31 @@ body {
     transform: translateY(-3px);
   }
 }
-/* 任务行：五列网格（图标 | 文件信息 | 进度 | 校验 | 操作） */
+/* 任务行：左侧网格承载信息，右侧操作列 sticky 常驻 */
 .task-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+}
+.task-main {
+  flex: 1;
+  min-width: 0;
   display: grid;
-  grid-template-columns: var(--task-cols);
+  grid-template-columns: 26px minmax(120px, 1.5fr) minmax(160px, 3fr);
   align-items: center;
   column-gap: 12px;
-  padding: 8px 12px;
-
-  transition: background 0.15s;
 }
-.sftp-task:hover .task-row {
+/* 悬停高亮统一由覆盖层绘制，操作列与行内其余区域颜色完全一致 */
+.sftp-task:hover .task-row::after {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  content: "";
+
   background: var(--hover-overlay);
+  pointer-events: none;
 }
 /* 目录展开箭头：右指 → 展开时旋转 90° 朝下 */
 .task-twist {
@@ -4822,7 +4994,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -4847,6 +5019,11 @@ body {
   flex: 0 0 16px;
   width: 16px;
 }
+/* 任务名内的展开箭头：与 11px 文字行高对齐 */
+.task-name .task-twist {
+  height: 16px;
+  margin-left: -4px;
+}
 /* 方向图标：带浅色底座，颜色随任务状态 */
 .task-ico {
   position: relative;
@@ -4856,31 +5033,13 @@ body {
   display: grid;
   place-items: center;
 
-  border-radius: var(--radius-small);
-  background: var(--hover-overlay);
+  color: var(--muted-2);
 
   transition: color 0.2s;
 }
 .task-ico svg {
-  width: 13px;
-  height: 13px;
-}
-.sftp-task.running .task-ico {
-  color: var(--blue);
-}
-.sftp-task.success .task-ico {
-  color: var(--green);
-}
-.sftp-task.pending .task-ico {
-  color: var(--rhost-status-idle);
-
-  opacity: 0.7;
-}
-.sftp-task.paused .task-ico {
-  color: var(--yellow);
-}
-.sftp-task.error .task-ico {
-  color: var(--red);
+  width: 15px;
+  height: 15px;
 }
 /* 文件信息列 */
 .task-info,
@@ -4908,6 +5067,10 @@ body {
 }
 .sftp-task.error .task-name {
   color: var(--red);
+}
+/* 悬停整行时文件名/目录名高亮（与子项文件名一致）；错误态保留红色语义 */
+.sftp-task:hover:not(.error) .task-name {
+  color: var(--text);
 }
 /* 进度条：4px，传输中斜纹流动 */
 .track {
@@ -4980,6 +5143,13 @@ body {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+/* 文件夹任务的完成计数（已完成/总数）：与百分比同组，不参与结果区靠右 */
+.bar-meta .bar-count {
+  flex: none;
+
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+}
 .bar-meta .speed {
   flex: none;
 
@@ -4988,42 +5158,19 @@ body {
 .bar-meta .bar-note {
   overflow: hidden;
 
+  font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
 }
-/* SHA-256（进度元信息行内，仅终态显示）：状态 · 短哈希 · 复制 */
-.bar-hash {
-  flex: 0 1 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  margin-left: 2px;
+/* 校验中与状态标签同色，避免绿色 running 样式残留造成颜色不一致 */
+.bar-meta .bar-note.verifying {
+  color: var(--purple);
 }
-.bar-hash code {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  padding: 0 4px;
-
-  font-size: 9.5px;
-  line-height: 14px;
-  color: var(--muted);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-small);
+/* 目录任务信息行：百分比 / 速率 / 文件计数之间留出更从容的间距 */
+.sftp-task.folder .bar-meta {
+  gap: 10px;
 }
-.sftp-task.success .bar-hash code {
-  color: var(--green);
-
-  border-color: rgba(var(--accent-rgb), 0.28);
-}
-.sftp-task.error .bar-hash code {
-  color: var(--red);
-
-  border-color: rgba(247, 118, 142, 0.3);
-}
+/* 结果信息（剩余时间 / 状态 / 错误）随进度信息左起依次排列，
+   间距统一由 .bar-meta 的 gap 控制 */
 .sftp-task.success .bar-note {
   color: var(--green);
 }
@@ -5032,75 +5179,6 @@ body {
 }
 .sftp-task.error .bar-note {
   color: var(--red);
-}
-/* SHA-256 状态（进度元信息行内） */
-.hash-status {
-  font-size: 9.5px;
-  color: var(--muted-2);
-  white-space: nowrap;
-}
-.hash-status.ok {
-  color: var(--green);
-}
-.hash-status.bad {
-  color: var(--red);
-}
-.hash-status.verifying {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-
-  color: var(--purple);
-}
-.hash-status.verifying::before {
-  width: 9px;
-  height: 9px;
-  content: "";
-
-  border: 1.5px solid rgba(187, 154, 247, 0.3);
-  border-top-color: var(--purple);
-  border-radius: 50%;
-
-  animation: hash-spin 0.7s linear infinite;
-}
-@keyframes hash-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.hash-copy {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-
-  color: var(--muted-2);
-
-  border: none;
-  border-radius: var(--radius-small);
-  background: transparent;
-  opacity: 0;
-
-  transition: 0.13s;
-}
-.sftp-task:hover .hash-copy {
-  opacity: 0.75;
-}
-.hash-copy:hover {
-  color: var(--text);
-
-  background: var(--hover);
-  opacity: 1;
-}
-.hash-copy.copied {
-  color: var(--green);
-  opacity: 1;
-}
-.hash-copy svg {
-  width: 11px;
-  height: 11px;
 }
 /* 文件名下的副信息：方向 tag · 大小 · 目标路径 */
 .task-sub {
@@ -5148,13 +5226,22 @@ body {
   font-family: var(--mono);
   text-overflow: ellipsis;
 }
-/* 状态 + 操作（图标不变，按状态显隐） */
+/* 状态 + 操作（图标不变，按状态显隐）；sticky 吸右，窄窗口横滚时始终可见 */
 .acts {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  align-self: stretch;
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 2px;
+  padding-left: 8px;
+
+  background: var(--panel);
 }
+/* hover 高亮由行级覆盖层统一绘制，此处保持与面板同色即可 */
 .task-abtn,
 .task-x {
   width: 20px;
@@ -5162,7 +5249,7 @@ body {
   padding: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -5193,43 +5280,62 @@ body {
 /* ---- 目录子文件列表 ---- */
 .task-children {
   display: none;
-  padding: 0 10px 7px 62px;
+  padding: 1px 12px 8px 48px;
 }
 .sftp-task.expanded .task-children {
   display: block;
 }
+/* 子项行：左侧网格承载文件信息，右侧操作列 sticky 常驻 */
 .tc-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 3px 0;
+  padding: 4px 0;
 
+  border-bottom: 1px solid var(--border-soft);
   animation: task-in 0.18s ease both;
 }
-.tc-dot {
-  width: 5px;
-  height: 5px;
-  flex-shrink: 0;
+.tc-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  /* 列序：图标 | 文件名+大小（吸收多余宽度） | 进度条（弹性，上限 400） | 百分比 | 结果（SHA-256 / 校验中 / 错误信息） */
+  grid-template-columns: 12px minmax(100px, 1fr) clamp(100px, 30%, 400px) 32px 140px;
+  align-items: center;
+  column-gap: 8px;
+}
+.tc-item:last-child {
+  border-bottom: none;
+}
+/* 悬停整行时只高亮文件名/目录名，大小保持常态；
+   提升一级选择器权重以覆盖 .tc-item.success 的常态色 */
+.sftp-task .tc-item:not(.error):hover .tc-name {
+  color: var(--text);
+}
+.tc-ico {
+  display: grid;
+  place-items: center;
+  width: 12px;
+  height: 12px;
+  justify-self: center;
 
-  border-radius: 50%;
-  background: var(--border-strong);
+  color: var(--muted-2);
 
   transition: 0.2s;
 }
-.tc-item.running .tc-dot {
-  background: var(--blue);
+.tc-ico svg {
+  width: 11px;
+  height: 11px;
 }
-.tc-item.success .tc-dot {
-  background: var(--green);
-}
-.tc-item.paused .tc-dot {
-  background: var(--yellow);
-}
-.tc-item.error .tc-dot {
-  background: var(--red);
+/* 文件名与大小同处一列：大小紧跟文件名，间距 8px，文件名超长时省略 */
+.tc-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 .tc-name {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
 
@@ -5238,14 +5344,47 @@ body {
   color: var(--muted);
   white-space: nowrap;
   text-overflow: ellipsis;
+
+  transition: color 0.15s;
 }
 .tc-item.success .tc-name {
   color: var(--muted-2);
 }
+/* 子项失败：文件名与进度、结果一起标红，便于在多文件列表中定位 */
+.tc-item.error .tc-name {
+  color: var(--red);
+}
+.tc-size {
+  flex: 0 0 auto;
+}
+.tc-size,
+.tc-pct {
+  overflow: hidden;
+
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--muted-2);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+
+  transition: color 0.15s;
+}
+.tc-pct {
+  color: var(--muted);
+  font-weight: 600;
+}
+.tc-item.pending .tc-pct {
+  color: var(--muted-2);
+  font-weight: 400;
+}
+/* 进度条：宽度随可用空间变化，上限 240px；左侧留白与文件名/大小拉开距离 */
 .tc-bar {
-  flex: 0 0 80px;
-  width: 80px;
+  width: 100%;
+  min-width: 0;
   height: 3px;
+  margin-left: 12px;
   overflow: hidden;
 
   border-radius: 2px;
@@ -5273,22 +5412,206 @@ body {
 .tc-item.error .tc-bar i {
   background: var(--red);
 }
-.tc-meta {
-  flex: 0 0 108px;
-  width: 108px;
+/* 结果列：展示传输状态 / 错误信息 */
+.tc-result {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 2px;
+  min-width: 0;
   overflow: hidden;
 
-  text-align: right;
-  font-family: var(--mono);
-  font-size: 9.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+/* 结果列内的状态文案：超长省略，完成态不展示文案 */
+.tc-state {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+
+  text-align: left;
+  font-size: 10px;
+  font-weight: 500;
   color: var(--muted-2);
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* 状态颜色随行状态变化 */
+.tc-item.running .tc-state {
+  color: var(--blue);
+}
+.tc-item.verifying .tc-state {
+  color: var(--purple);
+}
+.tc-item.success .tc-state {
+  color: var(--green);
+}
+.tc-item.paused .tc-state {
+  color: var(--yellow);
+}
+.tc-item.error .tc-state {
+  color: var(--red);
+}
+/* 覆盖策略跳过：未发生实际传输，用中性灰而非成功绿，避免误读为已传输 */
+.tc-item.skipped .tc-state {
+  color: var(--muted-2);
+}
+/* 子项单文件操作：独立占位于行尾，常态显示，不遮挡结果信息 */
+/* 子项操作列：sticky 吸右，横向滚动时始终可见 */
+.tc-acts {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  align-self: stretch;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 1px;
+  padding-left: 6px;
+
+  background: var(--panel);
+}
+.tc-act {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  cursor: default;
+
+  color: var(--muted-2);
+
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+
+  transition: 0.13s;
+}
+.tc-act svg {
+  width: 9px;
+  height: 9px;
+}
+.tc-act:hover {
+  color: var(--fg-strong);
+  background: var(--hover);
+}
+.tc-act-x:hover {
+  color: var(--red);
 }
 /* 折叠：只留 head */
 .sftp-tasks.collapsed .queue-tabs,
 .sftp-tasks.collapsed .queue-list {
   display: none;
+}
+/* ---- 窄模式（容器 ≤ 620px）----
+   单行网格的固有最小宽度约 620px，容器更窄时只能靠横向滚动，
+   故在此处降级为「图标 + 纵向信息流」：
+   名称/元信息 → 进度条 → 进度元信息；操作列随整行高度垂直居中。
+   目录子项同为三行：文件/大小 → 进度条 → 百分比 + 结果。 */
+@container (max-width: 620px) {
+  /* 不再横向滚动，避免整行被拖出可视区 */
+  .queue-list {
+    overflow-x: hidden;
+  }
+  /* 解除 620px 下限，否则父行与子行仍会横向溢出 */
+  .sftp-task {
+    min-width: 0;
+  }
+  /* 名称行：文件名（含状态标签）与方向/大小同排；
+     进度条另起一行并从名称列起，不再占据图标下方；
+     图标跨两行，在整条任务行内上下居中 */
+  .task-main {
+    grid-template-columns: 26px minmax(0, auto) minmax(0, 1fr);
+    grid-template-areas:
+      "ico name sub"
+      "ico prog prog";
+    column-gap: 8px;
+    row-gap: 6px;
+  }
+  .task-ico {
+    grid-area: ico;
+    /* 高度交给网格拉伸，svg 由 place-items 在两个行高内居中，
+       避免固定 26px 参与轨道计算把名称行撑高 */
+    align-self: stretch;
+    height: auto;
+  }
+  /* 拆开信息列，让名称与方向/大小参与同一行网格 */
+  .task-info {
+    display: contents;
+  }
+  .task-name {
+    grid-area: name;
+  }
+  .task-sub {
+    grid-area: sub;
+    margin-top: 0;
+  }
+  .task-progress {
+    grid-area: prog;
+  }
+  /* 操作列不再吸右，改为随整行高度垂直居中；
+     左间距与宽模式保持一致，避免结果信息贴到按钮上 */
+  .acts {
+    position: static;
+    align-self: stretch;
+    padding-left: 8px;
+  }
+  /* 目标路径最占宽，窄模式收起；完整值仍可由文件名 title 查看；
+     路径前的分隔符随之隐藏，避免行尾残留「·」 */
+  .task-sub .path,
+  .task-sub .sep {
+    display: none;
+  }
+  /* 子项：缩进压缩，单行五列改为三行；
+     缩进 44px 与父行拉开层级，右端仍由 padding-right 12px 决定，不影响右对齐 */
+  .task-children {
+    padding-left: 44px;
+  }
+  .tc-main {
+    /* 第三列与宽模式保持一致：百分比固定 32px，结果信息紧随其后左对齐 */
+    grid-template-columns: 12px 32px minmax(0, 1fr);
+    grid-template-areas:
+      "ico file   file"
+      "ico bar    bar"
+      "ico pct    result";
+    row-gap: 3px;
+  }
+  .tc-ico {
+    grid-area: ico;
+  }
+  .tc-file {
+    grid-area: file;
+  }
+  .tc-bar {
+    grid-area: bar;
+    /* 单行时用于与文件名拉开，纵向排列后改为左对齐 */
+    margin-left: 0;
+  }
+  .tc-pct {
+    grid-area: pct;
+    text-align: left;
+  }
+  .tc-result {
+    grid-area: result;
+  }
+  .tc-acts {
+    position: static;
+    /* 父行与操作列的间隙为 flex gap 12 + padding 8 = 20px，子行为 gap 8 + padding 12，
+       两者相等后进度条/结果信息的右端才能对齐；右侧外边距仍由 .task-children 的 12px 提供 */
+    padding-left: 12px;
+    gap: 2px;
+  }
+  /* 子项按钮与父行同尺寸：按钮列等宽后，两行进度条左右端点才能对齐 */
+  .tc-act {
+    width: 20px;
+    height: 20px;
+  }
+  .tc-act svg {
+    width: 10px;
+    height: 10px;
+  }
 }
 
 /* ---- SSH 运行日志 ---- */
@@ -5308,7 +5631,7 @@ body {
   display: flex;
   align-items: center;
   gap: 5px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-family: inherit;
@@ -5348,7 +5671,7 @@ body {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -5529,7 +5852,7 @@ body {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -5754,7 +6077,7 @@ body {
   align-items: center;
   gap: 9px;
   padding: 8px 10px;
-  cursor: pointer;
+  cursor: default;
   width: 100%;
 
   color: var(--muted);
@@ -6095,7 +6418,7 @@ body {
   height: 15px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-size: 9px;
@@ -6130,7 +6453,7 @@ body {
   gap: 9px;
   width: 100%;
   padding: 7px 9px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 
   font-family: inherit;
@@ -6390,7 +6713,7 @@ body {
   height: 17px;
   display: none;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--yellow);
   font-size: 10px;
@@ -6444,7 +6767,7 @@ body {
   flex: none;
   width: 36px;
   height: 20px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: 99px;
   background: var(--border-strong);
@@ -6456,7 +6779,7 @@ body {
   inset: 0;
 
   margin: 0;
-  cursor: pointer;
+  cursor: default;
 
   opacity: 0;
 }
@@ -6489,7 +6812,7 @@ body {
 .st-row-ctl input[type="range"] {
   width: 140px;
   height: 20px;
-  cursor: pointer;
+  cursor: default;
 
   -webkit-appearance: none;
   appearance: none;
@@ -6552,7 +6875,7 @@ body {
     box-shadow 0.13s;
 }
 .st-select {
-  cursor: pointer;
+  cursor: default;
   padding-right: 28px;
 
   appearance: none;
@@ -6640,7 +6963,7 @@ body {
   width: 30px;
   height: 30px;
   flex: none;
-  cursor: pointer;
+  cursor: default;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6703,7 +7026,7 @@ body {
   width: 30px;
   height: 30px;
   flex: none;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-size: 12px;
@@ -6731,7 +7054,7 @@ body {
 }
 .st-list-add {
   padding: 5px 14px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-size: 11px;
@@ -6879,7 +7202,7 @@ body {
 .st-color-dot {
   width: 19px;
   height: 19px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: 50%;
   border: 2px solid transparent;
@@ -6918,7 +7241,7 @@ body {
   height: 30px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted);
   font-size: 12px;
@@ -6943,7 +7266,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  cursor: pointer;
+  cursor: default;
 
   font-family: inherit;
   font-size: 11.5px;
@@ -7027,7 +7350,7 @@ body {
   align-items: center;
   gap: 4px;
   padding: 3px 6px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: var(--radius-control);
 
@@ -7402,7 +7725,7 @@ body {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--on-accent);
 
@@ -7513,7 +7836,7 @@ body {
 }
 .qc-history-clear {
   padding: 3px 7px;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
   font-family: inherit;
@@ -7547,7 +7870,7 @@ body {
   align-items: center;
   gap: 10px;
   padding: 7px 7px 7px 11px;
-  cursor: pointer;
+  cursor: default;
   min-width: 0;
 
   border-radius: var(--radius-control);
@@ -7613,7 +7936,7 @@ body {
   height: 24px;
   display: grid;
   place-items: center;
-  cursor: pointer;
+  cursor: default;
 
   color: var(--muted-2);
 
@@ -7761,7 +8084,7 @@ body {
   align-items: center;
   gap: 7px;
   padding: 6px 12px;
-  cursor: pointer;
+  cursor: default;
   max-width: 100%;
 
   color: var(--muted);
@@ -7850,7 +8173,7 @@ body {
   gap: 14px;
   padding: 8px 10px;
   margin: 0 -10px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: var(--radius-tab);
 
@@ -7938,7 +8261,7 @@ body {
 
   width: 24px;
   height: 24px;
-  cursor: pointer;
+  cursor: default;
 
   border-radius: 50%;
   border: none;
@@ -8093,7 +8416,7 @@ body {
 .km-select {
   height: 32px;
   padding: 0 30px 0 11px;
-  cursor: pointer;
+  cursor: default;
   max-width: 150px;
 
   color: var(--muted);
@@ -8179,7 +8502,7 @@ body {
   border-bottom: none;
 }
 .km-row {
-  cursor: pointer;
+  cursor: default;
 
   transition: background 0.12s;
 }
@@ -8380,7 +8703,7 @@ body {
 }
 .km-type-opt {
   padding: 10px;
-  cursor: pointer;
+  cursor: default;
 
   text-align: left;
   color: var(--text);
@@ -8421,7 +8744,7 @@ body {
   display: flex;
   align-items: center;
   gap: 9px;
-  cursor: pointer;
+  cursor: default;
   user-select: none;
 
   font-size: 11.5px;
@@ -8431,7 +8754,7 @@ body {
 .km-check input {
   width: 14px;
   height: 14px;
-  cursor: pointer;
+  cursor: default;
   margin: 0;
 
   accent-color: var(--green);
@@ -8444,7 +8767,7 @@ body {
 }
 /* 选择本地文件链接 */
 .km-link {
-  cursor: pointer;
+  cursor: default;
 
   color: var(--green);
 
@@ -8766,4 +9089,40 @@ body {
   .km-row {
     transition: none;
   }
+}
+
+/* ============================================================
+   文本选中策略
+   ------------------------------------------------------------
+   默认：全部不可选（含 -webkit- 前缀，WKWebView 必须）
+   可选：仅以下区域
+     · 输入/编辑控件（input/textarea/select/contenteditable）
+     · 终端输出（xterm 自行实现选择，不受 CSS 影响）
+     · 显式标注 [data-selectable] 的数据/输出文本
+   白名单内部：button/summary/label/kbd 等交互控件仍不可选
+   拖拽态：body.row-dragging 下连白名单一起禁用
+   ============================================================ */
+html,
+body,
+body * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+select,
+[contenteditable="true"],
+[data-selectable],
+[data-selectable] * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+button,
+summary,
+label,
+kbd,
+[role="button"],
+[data-selectable] :is(button, summary, label, kbd, .btn) {
+  -webkit-user-select: none;
+  user-select: none;
 }

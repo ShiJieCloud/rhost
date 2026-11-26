@@ -41,7 +41,7 @@ function onClick() {
   background: transparent;
   border: none;
   padding: 0 4px;
-  cursor: pointer;
+  cursor: default;
   color: var(--text);
   font-size: 13px;
   line-height: 1;

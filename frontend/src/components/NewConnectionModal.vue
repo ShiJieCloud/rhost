@@ -1428,7 +1428,7 @@ async function save() {
                 >
 
                 <span v-if="f.hint" class="desc">{{ f.hint }}</span>
-                <span class="error-text">{{ errorText(f) }}</span>
+                <span class="error-text" data-selectable>{{ errorText(f) }}</span>
               </div>
 
               <!-- 命令预览：从转发规则实时派生，跟随转发规则渲染，无需字段定义 -->

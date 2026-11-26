@@ -135,6 +135,8 @@
   --shadow-dialog: 0 0 0 .5px rgba(0, 0, 0, .6), 0 10px 24px rgba(0, 0, 0, .35), 0 24px 72px rgba(0, 0, 0, .45);
   --shadow-tooltip: 0 4px 12px rgba(0, 0, 0, .4);
   --scrollbar-thumb: rgba(255, 255, 255, .2);
+  /* 滚动条统一尺寸：全局与各滚动容器共用 */
+  --sb-size: 8px;
   --scrollbar-thumb-hover: rgba(255, 255, 255, .35);
   --focus-ring: var(--accent);
   --bg-editor-selection: rgba(var(--accent-rgb), .22);
@@ -207,5 +209,6 @@
   --shadow-dialog: 0 0 0 .5px rgba(0, 0, 0, .1), 0 10px 24px rgba(0, 0, 0, .1), 0 24px 72px rgba(0, 0, 0, .2);
   --shadow-tooltip: 0 4px 12px rgba(0, 0, 0, .12);
   --scrollbar-thumb: rgba(0, 0, 0, .2);
+  --sb-size: 8px;
   --scrollbar-thumb-hover: rgba(0, 0, 0, .35);
 }

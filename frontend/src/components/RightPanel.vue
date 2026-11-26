@@ -244,7 +244,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
   background: transparent;
   border: none;
   color: var(--muted-2);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.15s, color 0.15s;
   flex-shrink: 0;
   margin-left: 4px;

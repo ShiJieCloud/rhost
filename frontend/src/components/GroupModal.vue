@@ -132,7 +132,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
             autocorrect="off"
             @input="onInput"
           />
-          <span class="error-text">{{ dupError || '请输入分组名称' }}</span>
+          <span class="error-text" data-selectable>{{ dupError || '请输入分组名称' }}</span>
         </div>
 
         <div class="field">

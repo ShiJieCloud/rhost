@@ -1,14 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { invoke, Channel } from '@tauri-apps/api/core'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
+import type { DragDropEvent } from '@tauri-apps/api/webview'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import { activeHost, activeSession, activeSftpCwd, closeDock, connected, dockCollapsed, dockHeight, DOCK_DEFAULT_HEIGHT, dockTab, dockVisible, searchTick, sftpLocalRatio, sftpQueueCollapsed, sftpQueueHeight } from '../../stores/session'
-import { savedSettings } from '../../stores/settings'
+import { persistSettings, savedSettings } from '../../stores/settings'
 import { appLocked } from '../../stores/appLock'
 import { toast } from '../../composables/useToast'
 import { confirmDialog } from '../../composables/useConfirm'
 import TunnelPane from './TunnelPane.vue'
 import { isTauri } from '../../lib/tauri'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { getSnapshot, onConfigLoad, patchUiState } from '../../stores/appConfig'
 import ContextMenu from './ContextMenu.vue'
 import type { MenuItem } from './ContextMenu.vue'
@@ -132,7 +134,7 @@ const clipboard = ref<{
 } | null>(null)
 
 /* ---- 右键菜单状态：事件入口一次性写全坐标与目标，菜单项由 computed 生成 ---- */
-const menu = ref<{ x: number; y: number; side: Side; targets: FsEntry[] } | null>(null)
+const menu = ref<{ x: number; y: number; side: Side; targets: FsEntry[]; pane?: boolean } | null>(null)
 
 /* 最后交互的一侧：快捷键作用域（点击/右键/导航时更新） */
 const lastSide = ref<Side>('local')
@@ -142,20 +144,66 @@ const remoteSelected = ref<Set<string>>(new Set())
 const localSort = ref<SortState>({ key: 'name', dir: 1 })
 const remoteSort = ref<SortState>({ key: 'name', dir: 1 })
 
+/* ---- 目录导航历史：返回 / 前进 ---- */
+interface NavHistory { stack: string[]; idx: number }
+const localHist = ref<NavHistory>({ stack: [], idx: -1 })
+const remoteHist = ref<NavHistory>({ stack: [], idx: -1 })
+function histOf(side: Side) {
+  return side === 'local' ? localHist : remoteHist
+}
+/** 记录一次成功加载；重复路径（刷新）不产生新历史 */
+function navRecord(side: Side, path: string) {
+  const h = histOf(side).value
+  if (h.stack[h.idx] === path) return
+  h.stack = [...h.stack.slice(0, h.idx + 1), path]
+  h.idx = h.stack.length - 1
+}
+function canGoBack(side: Side) {
+  return histOf(side).value.idx > 0
+}
+function canGoForward(side: Side) {
+  const h = histOf(side).value
+  return h.idx >= 0 && h.idx < h.stack.length - 1
+}
+async function goBack(side: Side) {
+  const h = histOf(side).value
+  if (h.idx <= 0) return
+  if (side === 'remote' && sftpLocked.value) return
+  const target = h.stack[h.idx - 1]!
+  const ok = side === 'local' ? await loadLocal(target, false, false) : await loadRemote(target, false, false)
+  if (!ok) return
+  h.idx -= 1
+  if (side === 'remote') syncShellCwd(target)
+}
+async function goForward(side: Side) {
+  const h = histOf(side).value
+  if (h.idx >= h.stack.length - 1) return
+  if (side === 'remote' && sftpLocked.value) return
+  const target = h.stack[h.idx + 1]!
+  const ok = side === 'local' ? await loadLocal(target, false, false) : await loadRemote(target, false, false)
+  if (!ok) return
+  h.idx += 1
+  if (side === 'remote') syncShellCwd(target)
+}
+
 /* 本地目录真实数据：由后端 list_local_dir 加载；localPath 始终对应已加载成功的目录 */
 const localRaw = ref<FsEntry[]>([])
 const localLoading = ref(false)
 
-async function loadLocal(path?: string) {
-  if (!isTauri) return // 浏览器 dev 模式无本地 FS，保持空列表
+async function loadLocal(path?: string, quiet = false, recordHistory = true): Promise<boolean> {
+  if (!isTauri) return true // 浏览器 dev 模式无本地 FS，保持空列表
   localLoading.value = true
   try {
     const res = await invoke<DirListing>('list_local_dir', { path: path ?? null })
     localRaw.value = res.entries.map(toFsEntry)
     localPath.value = res.path
     localSelected.value = new Set()
+    localFilter.value = ''
+    if (recordHistory) navRecord('local', res.path)
+    return true
   } catch (e) {
-    toast(String(e), 'warn', 2200)
+    if (!quiet) toast(String(e), 'warn', 2200)
+    return false
   } finally {
     localLoading.value = false
   }
@@ -167,10 +215,10 @@ const remoteRaw = ref<FsEntry[]>([])
 const remoteLoading = ref(false)
 let remoteReqSeq = 0 // 竞态守卫：快速切目录/切会话时丢弃过期响应
 
-async function loadRemote(path?: string) {
+async function loadRemote(path?: string, quiet = false, recordHistory = true): Promise<boolean> {
   const backendId = activeSession.value?.backendId
-  if (!isTauri || !backendId) return // 浏览器 dev 模式 / 未连接：保持空列表
-  if (sftpLocked.value) return // 锁定期间不发起远端浏览，保留锁定前列表
+  if (!isTauri || !backendId) return false // 浏览器 dev 模式 / 未连接：保持空列表
+  if (sftpLocked.value) return false // 锁定期间不发起远端浏览，保留锁定前列表
   const req = ++remoteReqSeq
   remoteLoading.value = true
   try {
@@ -179,21 +227,90 @@ async function loadRemote(path?: string) {
       path: path ?? null,
     })
     // 过期响应（用户已继续导航或切换/断开会话）直接丢弃，避免覆盖新视图
-    if (req !== remoteReqSeq || activeSession.value?.backendId !== backendId) return
+    if (req !== remoteReqSeq || activeSession.value?.backendId !== backendId) return true
     remoteRaw.value = res.entries.map(toFsEntry)
     remotePath.value = res.path
     remoteSelected.value = new Set()
+    remoteFilter.value = ''
+    if (recordHistory) navRecord('remote', res.path)
+    return true
   } catch (e) {
-    if (req !== remoteReqSeq) return
-    toast(String(e), 'warn', 2600)
+    if (req !== remoteReqSeq) return true
+    if (!quiet) toast(String(e), 'warn', 2600)
+    return false
   } finally {
     if (req === remoteReqSeq) remoteLoading.value = false
   }
 }
 
+/* ---- 路径栏编辑：单击进入输入态，回车跳转，Esc 取消 ---- */
+const pathEditing = ref<Side | null>(null)
+const pathDraft = ref('')
+
+function focusPathInput(side: Side, select: boolean) {
+  void nextTick(() => {
+    const el = document.querySelector<HTMLInputElement>(`.pane.${side} .pane-path-input`)
+    el?.focus()
+    if (select) el?.select()
+  })
+}
+
+/** 绝对路径校验：Unix 以 / 开头；Windows 本地允许盘符路径 */
+function isAbsolutePath(p: string, side: Side) {
+  if (p.startsWith('/')) return true
+  return side === 'local' && /^[A-Za-z]:[\\/]/.test(p)
+}
+
+function startPathEdit(side: Side) {
+  if (side === 'remote' && (!connected.value || sftpLocked.value)) return
+  pathEditing.value = side
+  // 有筛选时保持筛选词，否则预填当前路径；进入编辑即全选便于替换
+  const filter = side === 'local' ? localFilter.value : remoteFilter.value
+  pathDraft.value = filter || (side === 'local' ? localPath.value : remotePath.value)
+  focusPathInput(side, true)
+}
+
+/** 路径栏空白处单击进入编辑；面包屑与输入框自身的点击不触发 */
+function onPathClick(side: Side, e: MouseEvent) {
+  if (pathEditing.value) return
+  const el = e.target as HTMLElement
+  if (el.closest('.crumb') || el.closest('.pane-path-input')) return
+  startPathEdit(side)
+}
+
+async function commitPathEdit(side: Side) {
+  // Esc / Enter 会先清空编辑态，届时 blur 回调直接忽略
+  if (pathEditing.value !== side) return
+  const target = pathDraft.value.trim()
+  // 空值、相对路径与后端拒绝统一提示，不暴露后端原始措辞
+  if (!target || !isAbsolutePath(target, side)) {
+    toast(`无法打开目录：${target || '（空）'}`, 'warn', 2200)
+    return
+  }
+  pathEditing.value = null
+  const ok = side === 'local' ? await loadLocal(target, true) : await loadRemote(target, true)
+  if (!ok) {
+    toast(`无法打开目录：${target}`, 'warn', 2400)
+    // 保留输入并回到编辑态，便于修改后重试
+    pathEditing.value = side
+    focusPathInput(side, false)
+  }
+}
+
+function onPathKey(e: KeyboardEvent, side: Side) {
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    // 含 "/" 视为目录路径并跳转；否则按筛选处理（关闭编辑但保留筛选）
+    if (pathDraft.value.includes('/')) void commitPathEdit(side)
+    else pathEditing.value = null
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    pathEditing.value = null
+  }
+}
+
 /** 下发会话级 SFTP 空闲超时：仅控制 SFTP 子通道回收，不影响 SSH 终端会话。
- *  设置变更/切换会话时同步，后端据此在长时间无操作且无传输时关闭缓存通道。 */
-function applySftpIdleTimeout() {
+ *  设置变更/切换会话时同步，后端据此在长时间无操作且无传输时关闭缓存通道。 */function applySftpIdleTimeout() {
   const backendId = activeSession.value?.backendId
   if (!isTauri || !backendId) return
   const secs = Math.max(0, savedSettings.sftpIdleTimeoutSec | 0)
@@ -299,7 +416,10 @@ function fmtSize(bytes: number) {
 /* 状态文案 */
 function crumbs(path: string) {
   const parts = path.split('/').filter(Boolean)
-  const out: { label: string; path: string }[] = [{ label: '/', path: '/' }]
+  // 根目录整体显示为一个可点击的 “/”
+  if (!parts.length) return [{ label: '/', path: '/' }]
+  // 根节点只用于分隔：不显示文字，避免出现开头的 “//home”
+  const out: { label: string; path: string }[] = [{ label: '', path: '/' }]
   let acc = ''
   parts.forEach(p => { acc += '/' + p; out.push({ label: p, path: acc }) })
   return out
@@ -309,8 +429,42 @@ function crumbs(path: string) {
 function visibleEntries(list: FsEntry[]): FsEntry[] {
   return savedSettings.sftpShowHidden ? list : list.filter(e => !e.name.startsWith('.'))
 }
-const localEntries = computed(() => sortEntries(visibleEntries(localRaw.value), localSort.value))
-const remoteEntries = computed(() => sortEntries(visibleEntries(remoteRaw.value), remoteSort.value))
+/* ---- 目录内筛选：路径栏输入不含 "/" 时按名称实时过滤 ---- */
+const localFilter = ref('')
+const remoteFilter = ref('')
+
+/** 仅在用户实际输入时更新筛选，进入编辑时预填路径不触发清空 */
+function onPathInput(side: Side) {
+  const f = pathDraft.value.includes('/') ? '' : pathDraft.value
+  if (side === 'local') localFilter.value = f
+  else remoteFilter.value = f
+}
+function filterEntries(list: FsEntry[], q: string) {
+  const s = q.trim().toLowerCase()
+  return s ? list.filter(e => e.name.toLowerCase().includes(s)) : list
+}
+/** 把文件名按当前筛选词切段，命中段用于高亮 */
+function nameSegments(name: string, side: Side) {
+  const q = (side === 'local' ? localFilter.value : remoteFilter.value).trim()
+  if (!q) return [{ text: name, hit: false }]
+  const lower = name.toLowerCase()
+  const needle = q.toLowerCase()
+  const out: { text: string; hit: boolean }[] = []
+  let i = 0
+  while (i < name.length) {
+    const j = lower.indexOf(needle, i)
+    if (j < 0) {
+      out.push({ text: name.slice(i), hit: false })
+      break
+    }
+    if (j > i) out.push({ text: name.slice(i, j), hit: false })
+    out.push({ text: name.slice(j, j + needle.length), hit: true })
+    i = j + needle.length
+  }
+  return out
+}
+const localEntries = computed(() => filterEntries(sortEntries(visibleEntries(localRaw.value), localSort.value), localFilter.value))
+const remoteEntries = computed(() => filterEntries(sortEntries(visibleEntries(remoteRaw.value), remoteSort.value), remoteFilter.value))
 
 /** 轻量 glob 匹配：支持 `*`（任意字符）与 `?`（单字符），其余正则元字符转义。
  *  用于上传黑名单过滤，不引入 minimatch 依赖。 */
@@ -338,27 +492,43 @@ interface Transfer {
   error?: string // 失败详情（查看错误弹窗展示）
   localPath?: string   // 本地绝对路径
   remotePath?: string  // 远端绝对路径
-  /** 跨侧剪切粘贴：传输成功后要删除的源文件绝对路径 */
+  /** 跨侧剪切粘贴：传输成功后要删除的源文件绝对路径（文件夹任务为源目录） */
   cutSrc?: string
   /** 任务所属会话 backendId：用于按主机并发计数与断线后归属判断 */
   backendId?: string
-  /** 已自动重试次数（手动重试会清零） */
-  retryCount?: number
-  /** 自动重试等待定时器句柄（用于取消/手动重试时清理） */
-  retryTimer?: number
-  /** 源文件 SHA256（开启完整性校验且已算出时由收尾进度包下发，队列展示用） */
-  hash?: string
   /** 按覆盖策略跳过（目标已存在且无需覆盖），未发生实际传输 */
   skipped?: boolean
   /** 字节已传完、正在做 SHA256 比对（收尾前的过渡态） */
   verifying?: boolean
   /** ask 策略下用户已确认覆盖：重试/重跑该任务时固定按 overwrite 执行 */
   forceOverwrite?: boolean
-  /** 哈希复制按钮的短暂成功反馈 */
-  copied?: boolean
+  /** 任务类型：缺省为文件；dir 表示文件夹任务的汇总行（本身不参与传输） */
+  kind?: 'dir'
+  /** 文件夹任务包含的文件数（扫描完成后填充） */
+  fileCount?: number
+  /** 文件夹任务是否展开子文件列表 */
+  expanded?: boolean
+  /** 文件夹任务正在递归扫描源目录 */
+  scanning?: boolean
+  /** 子文件任务所属的文件夹任务 id；有值时不在队列顶层展示 */
+  groupId?: number
 }
 const transfers = ref<Transfer[]>([])
 let seq = 0
+
+/** 队列顶层项（文件夹任务与其子文件任务只展示汇总行） */
+const queueItems = computed(() => transfers.value.filter(t => t.groupId === undefined))
+/** 子文件任务按所属文件夹任务归档（缓存，避免每次渲染重复扫描全队列） */
+const membersByGroup = computed(() => {
+  const map = new Map<number, Transfer[]>()
+  for (const t of transfers.value) {
+    if (t.groupId === undefined) continue
+    const arr = map.get(t.groupId)
+    if (arr) arr.push(t)
+    else map.set(t.groupId, [t])
+  }
+  return map
+})
 
 /** 后端 SFTP 进度事件载荷 */
 interface TransferProgress {
@@ -371,25 +541,56 @@ interface TransferProgress {
   skipped: boolean
   /** 字节已传完、正在做 SHA256 比对 */
   verifying: boolean
-  /** 源文件 SHA256：仅开启完整性校验且已算出时随收尾包下发 */
-  sha256?: string
 }
 
-const runningCount = computed(() => transfers.value.filter(t => t.status === 'running').length)
-const pendingCount = computed(() => transfers.value.filter(t => t.status === 'pending').length)
-const pausedCount = computed(() => transfers.value.filter(t => t.status === 'paused').length)
-const successCount = computed(() => transfers.value.filter(t => t.status === 'success').length)
-const cancelledCount = computed(() => transfers.value.filter(t => t.status === 'cancelled').length)
+const runningCount = computed(() => queueItems.value.filter(t => t.status === 'running').length)
+const pendingCount = computed(() => queueItems.value.filter(t => t.status === 'pending').length)
+const pausedCount = computed(() => queueItems.value.filter(t => t.status === 'paused').length)
+const successCount = computed(() => queueItems.value.filter(t => t.status === 'success').length)
+const cancelledCount = computed(() => queueItems.value.filter(t => t.status === 'cancelled').length)
 
-/* 筛选：全部 / 上传 / 下载 / 已完成 */
+/* 筛选：全部 / 上传 / 下载 / 已完成（仅顶层任务，文件夹子文件归组展示） */
 const queueFilter = ref<'all' | 'up' | 'down' | 'done'>('all')
 const filteredTransfers = computed(() => {
   const f = queueFilter.value
-  return transfers.value.filter(t =>
+  return queueItems.value.filter(t =>
     f === 'all' ? true
     : f === 'done' ? t.status === 'success'
     : t.dir === f,
   )
+})
+
+/* 队列跟随：默认贴底展示最新任务；用户上滚查看历史时暂停跟随，
+   新任务改为在右下角提示，避免打断阅读 */
+const queueListEl = ref<HTMLElement | null>(null)
+const queueFollow = ref(true)
+const queueNewCount = ref(0)
+const QUEUE_STICK_GAP = 24
+function queueAtBottom() {
+  const el = queueListEl.value
+  return !!el && el.scrollHeight - el.scrollTop - el.clientHeight < QUEUE_STICK_GAP
+}
+function scrollQueueToLatest() {
+  const el = queueListEl.value
+  if (el) el.scrollTop = el.scrollHeight
+  queueFollow.value = true
+  queueNewCount.value = 0
+}
+function onQueueScroll() {
+  queueFollow.value = queueAtBottom()
+  if (queueFollow.value) queueNewCount.value = 0
+}
+watch(() => queueItems.value.length, (n, o) => {
+  if (n > o) {
+    if (queueFollow.value) nextTick(scrollQueueToLatest)
+    else queueNewCount.value += n - o
+  } else if (n < o && queueNewCount.value) {
+    queueNewCount.value = Math.min(queueNewCount.value, n)
+  }
+})
+/* 展开队列时若处于跟随状态，回到最新位置 */
+watch(sftpQueueCollapsed, collapsed => {
+  if (!collapsed && queueFollow.value) nextTick(scrollQueueToLatest)
 })
 
 /* 队列面板：head 28 + tabs 28；折叠/高度状态存 ui_state（session store），
@@ -408,9 +609,10 @@ function onQueueHeadClick(e: MouseEvent) {
 }
 
 /** 折叠态头部摘要：优先进行中任务（方向/名称/百分比/速率），
- *  否则按 等待 → 暂停 → 失败 → 完成 汇总；空闲留空 */
+ *  否则按 等待 → 暂停 → 失败 → 完成 汇总；空闲留空。
+ *  子文件任务运行中时，以所属文件夹任务的名称聚合展示 */
 const queueSummary = computed(() => {
-  const list = transfers.value
+  const list = queueItems.value
   if (!list.length) return ''
   const r = list.find(t => t.status === 'running')
   if (r) {
@@ -438,9 +640,97 @@ function fmtSpeed(bps: number) {
 function taskName(t: Transfer) {
   return t.name
 }
-/* 队列展示用短哈希：前 8 + 后 8，完整值见 title */
-function shortHash(h: string) {
-  return h.length > 20 ? h.slice(0, 8) + '…' + h.slice(-8) : h
+/* 文件夹任务的子文件任务（按 groupId 归组，保持入队顺序） */
+function groupMembers(g: Transfer) {
+  return membersByGroup.value.get(g.id) || []
+}
+/* 文件夹任务已完成文件数 */
+function doneChildren(t: Transfer) {
+  return groupMembers(t).filter(c => c.status === 'success').length
+}
+/* 子项清单：与顶层任务共用 Transfer 结构 */
+function visibleChildren(t: Transfer) {
+  return groupMembers(t)
+}
+/* 子项状态文案：进度/速率/SHA-256 各自成列，此处只表达结果；
+   完成态由进度 100% 与绿色校验结果表达，不再重复文案 */
+function childStateText(c: Transfer) {
+  // 覆盖策略跳过：未发生实际传输，先于 success 判断，否则会落到空文案
+  if (c.skipped) return '已跳过'
+  if (c.status === 'success') return ''
+  if (c.status === 'running') return c.verifying ? '校验中' : '传输中'
+  if (c.status === 'paused') return '已暂停'
+  if (c.status === 'pending') return '等待中'
+  if (c.status === 'error') return c.error || '失败'
+  return '已取消'
+}
+/* 子项进度百分比 */
+function childPctText(c: Transfer) {
+  // 跳过子项未传任何字节，不显示 0% 以免误读为未开始
+  if (c.skipped) return '—'
+  return Math.floor(Math.min(100, Math.max(0, c.pct))) + '%'
+}
+/* 依据子文件任务汇总文件夹任务的进度 / 速度 / 状态；
+   状态跃迁时触发一次完成/失败提示与收尾动作 */
+function syncGroup(g: Transfer) {
+  const members = groupMembers(g)
+  if (!members.length) return
+  const prev = g.status
+  const total = members.reduce((s, c) => s + (c.size || 0), 0)
+  const done = members.reduce((s, c) => s + (c.size || 0) * Math.min(100, Math.max(0, c.pct)) / 100, 0)
+  const avgPct = members.reduce((s, c) => s + Math.min(100, Math.max(0, c.pct)), 0) / members.length
+  g.size = total
+  g.pct = total > 0 ? (done / total) * 100 : avgPct
+  g.speed = members.reduce((s, c) => s + (c.status === 'running' ? (c.speed || 0) : 0), 0)
+  if (members.some(c => c.status === 'running')) g.status = 'running'
+  else if (members.some(c => c.status === 'paused')) g.status = 'paused'
+  else if (members.some(c => c.status === 'pending')) g.status = 'pending'
+  else if (members.some(c => c.status === 'error')) g.status = 'error'
+  else if (members.every(c => c.status === 'cancelled')) g.status = 'cancelled'
+  else g.status = 'success'
+  if (g.status === 'success') g.pct = 100
+  if (prev === g.status) return
+  if (g.status === 'success') onFolderDone(g)
+  else if (g.status === 'error') {
+    const failed = members.filter(c => c.status === 'error').length
+    toast(`文件夹${g.dir === 'up' ? '上传' : '下载'}有 ${failed} 个文件失败：${g.name}`, 'warn', 2600)
+  }
+}
+/* 子任务状态变化后回写所属文件夹任务 */
+function touchGroup(t: Transfer) {
+  if (!t.groupId) return
+  const g = transfers.value.find(x => x.id === t.groupId)
+  if (g) syncGroup(g)
+}
+/* 文件夹传输完成：提示、剪切源删除、对侧目录刷新 */
+function onFolderDone(g: Transfer) {
+  const dirText = g.dir === 'up' ? '上传' : '下载'
+  toast(`文件夹${dirText}完成：${g.name}`, 'ok', 2200)
+  reportLog('info', SFTP_TRANSFER_COMPLETE, `文件夹${dirText}完成`, {
+    name: g.name, size: g.size, files: g.fileCount ?? 0,
+  })
+  if (g.cutSrc) {
+    // 安全兜底：仅当扫描到的全部文件都成功才删除剪切源，
+    // 避免用户移除队列子项后误删未传输的源文件
+    const okCount = groupMembers(g).filter(c => c.status === 'success').length
+    if (okCount !== (g.fileCount ?? 0)) {
+      reportLog('warn', SFTP_MANAGE_REMOVE, '剪切源未删除：存在未成功传输的文件', {
+        name: g.name, ok: okCount, total: g.fileCount ?? 0,
+      })
+    } else if (g.dir === 'up') {
+      void invoke('local_remove', { path: g.cutSrc })
+        .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: g.cutSrc, err: String(e) }))
+    } else {
+      void invoke('sftp_remove', { sessionId: g.backendId || '', path: g.cutSrc })
+        .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: g.cutSrc, err: String(e) }))
+    }
+  }
+  if (g.dir === 'up') void loadRemote(remotePath.value)
+  else void loadLocal(localPath.value)
+}
+/* 展开 / 收起文件夹任务的子文件列表 */
+function toggleTaskExpand(t: Transfer) {
+  t.expanded = !t.expanded
 }
 /* 已传输字节数 */
 function doneBytes(t: Transfer) {
@@ -459,66 +749,54 @@ function pctText(t: Transfer) {
 function speedText(t: Transfer) {
   return t.status === 'running' && t.speed > 0 ? fmtSpeed(t.speed) : ''
 }
+/* 文件夹任务的已完成/总数：属于进度信息，紧跟百分比展示，不参与结果区靠右 */
+function folderCountText(t: Transfer) {
+  if (t.kind !== 'dir' || t.scanning) return ''
+  return `${doneChildren(t)}/${t.fileCount ?? 0}`
+}
+/* 剩余时间文案：按剩余字节与当前速度估算；无法估算或不足 1 秒时返回空 */
+function etaText(remainBytes: number, speed: number) {
+  if (!(speed > 0)) return ''
+  const sec = remainBytes / speed
+  if (!isFinite(sec) || sec < 1) return ''
+  if (sec < 60) return '剩 ' + Math.ceil(sec) + ' 秒'
+  if (sec < 3600) return '剩 ' + Math.ceil(sec / 60) + ' 分'
+  return '剩 ' + (sec / 3600).toFixed(1) + ' 时'
+}
 /* 进度备注：剩余时间 / 校验中 / 状态 / 错误 */
 function noteText(t: Transfer) {
   // 跳过状态已由任务名后的标签表达，备注区留空避免重复
   if (t.skipped) return ''
-  if (t.status === 'running') {
-    if (t.pct >= 99.9) return savedSettings.sftpVerifyHash ? '校验中' : ''
-    if (t.speed > 0) {
-      const sec = (t.size - doneBytes(t)) / t.speed
-      if (isFinite(sec) && sec >= 1) {
-        if (sec < 60) return '剩 ' + Math.ceil(sec) + ' 秒'
-        if (sec < 3600) return '剩 ' + Math.ceil(sec / 60) + ' 分'
-        return '剩 ' + (sec / 3600).toFixed(1) + ' 时'
-      }
+  // 文件夹任务：完成计数已独立展示；剩余时间按整组剩余字节/聚合速度估算
+  if (t.kind === 'dir') {
+    if (t.scanning) return '正在扫描文件夹…'
+    if (t.status === 'error') {
+      const members = groupMembers(t)
+      const failed = members.filter(c => c.status === 'error').length
+      return failed ? `失败 ${failed}/${t.fileCount ?? members.length}` : (t.error || '传输失败')
     }
+    if (t.status === 'running') return etaText(t.size - doneBytes(t), t.speed)
     return ''
   }
-  if (t.status === 'success') return '完成'
+  if (t.status === 'running') {
+    if (t.verifying || (t.pct >= 99.9 && savedSettings.sftpVerifyHash)) return '校验中'
+    return etaText(t.size - doneBytes(t), t.speed)
+  }
+  if (t.status === 'success') return ''
   if (t.status === 'paused') return '已暂停'
   if (t.status === 'pending') return '等待中'
   if (t.status === 'error') return t.error || '传输失败'
   return ''
 }
-/* SHA-256 校验状态：未启用 / 待校验 / 校验中 / 通过 / 失败 */
-function hashState(t: Transfer): { cls: string; text: string } {
-  // 覆盖策略跳过：没有传输也没有比对，不能显示"校验通过"
-  if (t.skipped) return { cls: 'off', text: '—' }
-  if (!savedSettings.sftpVerifyHash) return { cls: 'off', text: '未启用' }
-  if (t.status === 'success') return { cls: 'ok', text: '✓ 校验通过' }
-  if (t.status === 'error') {
-    return (t.error || '').includes('文件完整性校验失败')
-      ? { cls: 'bad', text: '✕ 校验失败' }
-      : { cls: 'off', text: '—' }
-  }
-  if (t.status === 'running' && t.pct >= 99.9) return { cls: 'verifying', text: '校验中' }
-  if (t.status === 'cancelled') return { cls: 'off', text: '—' }
-  return { cls: '', text: '待校验' }
-}
-/** SHA-256 信息仅在传输结束后展示（避免与速率/剩余时间同排冲突）：
- *  成功；或失败原因正是完整性校验不通过 */
-function showHash(t: Transfer): boolean {
-  if (!savedSettings.sftpVerifyHash || t.skipped) return false
-  if (t.status === 'success') return true
-  return t.status === 'error' && (t.error || '').includes('完整性校验失败')
-}
-/* 复制完整源文件 SHA256（成功后图标短暂变对勾） */
-async function copyHash(t: Transfer) {
-  if (!t.hash) return
-  try {
-    await writeText(t.hash)
-    t.copied = true
-    window.setTimeout(() => { t.copied = false }, 1200)
-  } catch { /* 剪贴板不可用时静默失败 */ }
-}
-
 function startQueueDrag(e: MouseEvent) {
   e.preventDefault()
   const startY = e.clientY
   const startH = sftpQueueHeight.value
   const sftpEl = (e.target as HTMLElement).closest('.sftp') as HTMLElement | null
-  const maxH = sftpEl ? sftpEl.offsetHeight - 1 : 500
+  /* 最大高度需为顶栏、路径栏与文件列表保留可视空间：
+     直接用整块高度会让队列拖到顶部后继续增高，内容下溢被底部状态栏裁掉 */
+  const MIN_ABOVE = 160
+  const maxH = sftpEl ? Math.max(120, sftpEl.offsetHeight - MIN_ABOVE) : 500
   document.body.style.userSelect = 'none'
   document.body.style.cursor = 'ns-resize'
 
@@ -594,12 +872,13 @@ function pumpQueue() {
   const hostLimit = Math.max(1, savedSettings.sftpHostConcurrency | 0)
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const running = transfers.value.filter(t => t.status === 'running')
+    // 文件夹汇总行不参与传输；子文件任务按普通文件任务占用并发配额
+    const running = transfers.value.filter(t => t.status === 'running' && t.kind !== 'dir')
     if (running.length >= globalLimit) break
     const hostCount = new Map<string, number>()
     for (const r of running) hostCount.set(r.backendId || '', (hostCount.get(r.backendId || '') || 0) + 1)
     const next = transfers.value.find(
-      x => x.status === 'pending' && (hostCount.get(x.backendId || '') || 0) < hostLimit,
+      x => x.status === 'pending' && x.kind !== 'dir' && (hostCount.get(x.backendId || '') || 0) < hostLimit,
     )
     if (!next) break
     void runTask(next)
@@ -619,7 +898,7 @@ function computeTaskRateKb(runningBefore: number): number {
 function hasCapacity(backendId: string): boolean {
   const globalLimit = Math.max(1, savedSettings.sftpGlobalConcurrency | 0)
   const hostLimit = Math.max(1, savedSettings.sftpHostConcurrency | 0)
-  const running = transfers.value.filter(t => t.status === 'running')
+  const running = transfers.value.filter(t => t.status === 'running' && t.kind !== 'dir')
   if (running.length >= globalLimit) return false
   return running.filter(t => (t.backendId || '') === backendId).length < hostLimit
 }
@@ -632,55 +911,30 @@ async function runTask(t: Transfer) {
   t.status = 'running'
   t.verifying = false // 新一轮传输/重试从传输阶段重新开始
   if (t.startAt === 0) t.startAt = Date.now() // 仅首次开始计时；暂停后续传不重置
+  touchGroup(t)
   // pct > 0 为暂停/重试后的恢复，不再重复"开始"提示
   if (t.pct > 0) {
     reportLog('debug', SFTP_TRANSFER_RESUME, `${t.dir === 'up' ? '上传' : '下载'}继续`, {
       name: t.name, pct: Math.floor(t.pct),
     })
   } else {
-    reportLog('info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}开始`, {
+    reportLog(t.groupId ? 'debug' : 'info', SFTP_TRANSFER_START, `${t.dir === 'up' ? '上传' : '下载'}开始`, {
       name: t.name, size: t.size, resume_from: 0,
     })
-    toast(`开始${t.dir === 'up' ? '上传' : '下载'}：${taskName(t)}`, 'info', 1700)
+    // 文件夹子文件不逐条弹开始提示，避免大量文件刷屏
+    if (!t.groupId) toast(`开始${t.dir === 'up' ? '上传' : '下载'}：${taskName(t)}`, 'info', 1700)
   }
 
   const failTask = (msg: string) => {
     t.speed = 0
     t.error = msg
     const dirText = t.dir === 'up' ? '上传' : '下载'
-    const maxRetry = Math.max(0, savedSettings.sftpRetryCount | 0)
-    const attempt = t.retryCount || 0
-    // 达到重试上限（或配置为 0）时标记失败；取消不经过此处
-    if (attempt < maxRetry) {
-      t.status = 'error'
-      t.retryCount = attempt + 1
-      const interval = Math.max(0, savedSettings.sftpRetryIntervalMs | 0)
-      reportLog('warn', SFTP_TRANSFER_FAILED, `${dirText}失败，准备自动重试`, {
-        name: t.name, err: msg, attempt: attempt + 1, max: maxRetry, interval_ms: interval,
-        transferred: Math.round(t.size * t.pct / 100), total: t.size,
-      })
-      toast(`${dirText}失败，${interval}ms 后自动重试（${attempt + 1}/${maxRetry}）`, 'warn', 2200)
-      if (t.retryTimer) clearTimeout(t.retryTimer)
-      // 延迟后置回 pending 重新排队；期间任务保持 error 状态可被手动重试/移除
-      t.retryTimer = window.setTimeout(() => {
-        t.retryTimer = undefined
-        if (!transfers.value.some(x => x.id === t.id)) return
-        if (t.status !== 'error') return
-        t.status = 'pending'
-        t.error = undefined
-        reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dirText}自动重试重新入队`, {
-          name: t.name, size: t.size, dir: t.dir, from: t.localPath, to: t.remotePath,
-        })
-        schedulePump()
-      }, interval)
-      schedulePump()
-      return
-    }
     t.status = 'error'
     reportLog('error', SFTP_TRANSFER_FAILED, `${dirText}失败`, {
       name: t.name, err: msg, transferred: Math.round(t.size * t.pct / 100), total: t.size,
     })
-    toast(`${dirText}失败：${taskName(t)}`, 'warn', 2200)
+    if (!t.groupId) toast(`${dirText}失败：${taskName(t)}`, 'warn', 2200)
+    touchGroup(t)
     schedulePump()
   }
   const finishTask = () => {
@@ -694,7 +948,8 @@ async function runTask(t: Transfer) {
       reportLog('info', SFTP_TRANSFER_COMPLETE, `${dirText}已跳过（目标已存在）`, {
         name: t.name, size: t.size, skipped: true,
       })
-      toast(`已跳过：${taskName(t)}`, 'info', 1800)
+      if (!t.groupId) toast(`已跳过：${taskName(t)}`, 'info', 1800)
+      touchGroup(t)
       schedulePump()
       return
     }
@@ -702,12 +957,12 @@ async function runTask(t: Transfer) {
     // 清零前捕获最后一帧速率（后端按滑动窗口计算的瞬时速率）
     const finalSpeedBps = t.speed
     t.speed = 0
-    reportLog('info', SFTP_TRANSFER_COMPLETE, `${t.dir === 'up' ? '上传' : '下载'}完成`, {
+    reportLog(t.groupId ? 'debug' : 'info', SFTP_TRANSFER_COMPLETE, `${t.dir === 'up' ? '上传' : '下载'}完成`, {
       name: t.name, size: t.size,
       elapsed_ms: t.startAt ? Date.now() - t.startAt : 0,
       speed_bps: finalSpeedBps, verify: savedSettings.sftpVerifyHash ? 'pass' : 'none',
     })
-    toast(`${t.dir === 'up' ? '上传' : '下载'}完成：${taskName(t)}`, 'ok', 2000)
+    if (!t.groupId) toast(`${t.dir === 'up' ? '上传' : '下载'}完成：${taskName(t)}`, 'ok', 2000)
     // 跨侧剪切粘贴：传输成功后删除源文件（失败仅记日志，目标已完整）
     if (t.cutSrc) {
       if (t.dir === 'up') {
@@ -718,9 +973,13 @@ async function runTask(t: Transfer) {
           .catch(e => reportLog('error', SFTP_MANAGE_REMOVE, '剪切源删除失败', { path: t.cutSrc, err: String(e) }))
       }
     }
-    // 传输完成自动刷新对侧目录，免去手动点刷新：上传→远端，下载→本地
-    if (t.dir === 'up') void loadRemote(remotePath.value)
-    else void loadLocal(localPath.value)
+    // 传输完成自动刷新对侧目录，免去手动点刷新：上传→远端，下载→本地。
+    // 文件夹子文件由汇总行在整组完成时统一刷新，避免每个文件都刷新一次。
+    if (!t.groupId) {
+      if (t.dir === 'up') void loadRemote(remotePath.value)
+      else void loadLocal(localPath.value)
+    }
+    touchGroup(t)
     schedulePump()
   }
 
@@ -741,7 +1000,7 @@ async function runTask(t: Transfer) {
     } else {
       t.speed = p.speed
     }
-    if (p.sha256) t.hash = p.sha256
+    touchGroup(t)
   }
   // 单次传输选项：从全局设置组装（camelCase 与后端 SftpTransferOptions 对齐）；
   // ask 策略下用户确认覆盖后，该任务后续重跑固定按 overwrite 执行
@@ -782,7 +1041,7 @@ async function runTask(t: Transfer) {
     }
     // 用户主动取消：保留队列记录并标记"已取消"，不弹失败 toast
     if (msg.includes('已取消') || msg.includes('Cancelled')) {
-      if (t.status !== 'cancelled') {
+      if ((t.status as TransferStatus) !== 'cancelled') {
         t.status = 'cancelled'
         t.speed = 0
         t.error = undefined
@@ -790,6 +1049,7 @@ async function runTask(t: Transfer) {
           name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
         })
       }
+      touchGroup(t)
       schedulePump()
     } else {
       failTask(msg)
@@ -798,9 +1058,30 @@ async function runTask(t: Transfer) {
 }
 
 /** 取消传输：运行中/已暂停通知后端取消（状态由 runTask 的 catch 统一落为"已取消"），
- *  尚未启动的直接标记；队列保留记录，可查看进度位置后再移除 */
+ *  尚未启动的直接标记；队列保留记录，可查看进度位置后再移除。
+ *  文件夹任务级联取消全部子文件；扫描阶段取消则中止扫描。 */
 function cancelTask(t: Transfer) {
   if (sftpLocked.value) return
+  if (t.kind === 'dir') {
+    const members = groupMembers(t)
+    members.forEach(m => cancelTask(m))
+    if (!members.length) {
+      t.status = 'cancelled'
+      t.scanning = false
+      t.speed = 0
+    } else {
+      syncGroup(t)
+    }
+    return
+  }
+  // 已失败的任务取消时直接落为已取消
+  if (t.status === 'error') {
+    t.status = 'cancelled'
+    t.speed = 0
+    touchGroup(t)
+    schedulePump()
+    return
+  }
   if (t.status === 'running' || t.status === 'paused') {
     const backendId = t.backendId || activeSession.value?.backendId
     if (backendId) {
@@ -814,18 +1095,23 @@ function cancelTask(t: Transfer) {
   reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}已取消`, {
     name: t.name, pct: Math.floor(t.pct),
   })
+  touchGroup(t)
   schedulePump()
 }
 
 /** 移除任务记录：进行中的任务先通知后端取消，再从队列删除并启动下一个 */
 function removeTask(t: Transfer) {
   if (sftpLocked.value) return
-  // 移除任务时清理待触发的自动重试定时器，避免对已出队任务重新入队
-  if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
+  // 文件夹任务：级联移除全部子文件任务后删除汇总行（扫描中则中止扫描）
+  if (t.kind === 'dir') {
+    groupMembers(t).forEach(m => removeTask(m))
+    transfers.value = transfers.value.filter(x => x.id !== t.id)
+    return
+  }
   // 进行中或已暂停的任务都要通知后端取消：后端在取消路径关闭句柄并删除 part
   const active = t.status === 'running' || t.status === 'paused'
   if (active) {
-    const backendId = activeSession.value?.backendId
+    const backendId = t.backendId || activeSession.value?.backendId
     if (backendId) {
       void invoke('sftp_transfer_cancel', { sessionId: backendId, taskId: t.id }).catch(() => {})
     }
@@ -834,12 +1120,25 @@ function removeTask(t: Transfer) {
   reportLog('warn', SFTP_TRANSFER_CANCEL, `${t.dir === 'up' ? '上传' : '下载'}${active ? '已取消' : '记录移除'}`, {
     name: t.name, transferred: Math.round(t.size * t.pct / 100), total: t.size,
   })
+  touchGroup(t)
   if (active) schedulePump()
 }
 
-/** 暂停任务：通知后端暂停开关，invoke 仍挂起；running→paused 释放一个并发槽位 */
+/** 暂停任务：通知后端暂停开关，invoke 仍挂起；running→paused 释放一个并发槽位。
+ *  文件夹任务级联暂停全部子文件。 */
 function pauseTask(t: Transfer) {
   if (sftpLocked.value) return
+  if (t.kind === 'dir') {
+    const members = groupMembers(t)
+    // 扫描 / 建目录阶段尚无子任务：直接挂起汇总行，扫描完成后子任务以暂停态入队
+    if (!members.length) {
+      if (t.scanning && (t.status === 'pending' || t.status === 'running')) t.status = 'paused'
+      return
+    }
+    members.forEach(m => pauseTask(m))
+    syncGroup(t)
+    return
+  }
   const backendId = activeSession.value?.backendId
   if (t.status === 'running') {
     if (backendId) {
@@ -848,20 +1147,32 @@ function pauseTask(t: Transfer) {
     t.status = 'paused'
     t.speed = 0
     reportLog('warn', SFTP_TRANSFER_PAUSE, '已暂停', { name: t.name, pct: Math.floor(t.pct) })
+    touchGroup(t)
     schedulePump() // 释放槽位，启动下一个排队任务
   } else if (t.status === 'pending') {
     t.status = 'paused'
     reportLog('warn', SFTP_TRANSFER_PAUSE, '排队任务已挂起', { name: t.name, pct: 0 })
+    touchGroup(t)
   }
 }
-/** 继续任务：通知后端恢复并直接回到 running（invoke 仍在） */
-function resumeTask(t: Transfer) {
-  if (t.status !== 'paused') return
+/** 继续任务：通知后端恢复并直接回到 running（invoke 仍在）。
+ *  quiet 用于组级继续：并发配额不足时静默跳过，避免逐个文件弹提示 */
+function resumeTask(t: Transfer, quiet = false) {
   if (sftpLocked.value) return
+  if (t.kind === 'dir') {
+    if (t.status !== 'paused') return
+    const members = groupMembers(t)
+    // 扫描阶段挂起的汇总行：恢复为排队，等待扫描完成后再入队文件任务
+    if (!members.length && t.scanning) { t.status = 'pending'; return }
+    members.filter(m => m.status === 'paused').forEach(m => resumeTask(m, true))
+    syncGroup(t)
+    return
+  }
+  if (t.status !== 'paused') return
   const bid = t.backendId || activeSession.value?.backendId || ''
   // 恢复前校验并发配额，避免暂停期间补位的任务导致超过上限
   if (!hasCapacity(bid)) {
-    toast('并发任务已达上限，请先暂停其他任务', 'warn', 2000)
+    if (!quiet) toast('并发任务已达上限，请先暂停其他任务', 'warn', 2000)
     return
   }
   if (bid) {
@@ -872,14 +1183,24 @@ function resumeTask(t: Transfer) {
   reportLog('info', SFTP_TRANSFER_RESUME, `${t.dir === 'up' ? '上传' : '下载'}继续`, {
     name: t.name, pct: Math.floor(t.pct),
   })
+  touchGroup(t)
 }
-/** 失败/已取消任务重试：进度归零、清错误后重新入队 */
+/** 失败/已取消任务重试：进度归零、清错误后重新入队。
+ *  文件夹任务仅重跑失败/已取消的文件，已成功的自动跳过。 */
 function retryTask(t: Transfer) {
-  if (t.status !== 'error' && t.status !== 'cancelled') return
   if (sftpLocked.value) return
-  // 手动重试：取消待触发的自动重试，并重置自动重试计数
-  if (t.retryTimer) { clearTimeout(t.retryTimer); t.retryTimer = undefined }
-  t.retryCount = 0
+  if (t.kind === 'dir') {
+    if (t.status !== 'error' && t.status !== 'cancelled') return
+    const members = groupMembers(t)
+    // 扫描/建目录阶段失败：重新准备整个文件夹
+    if (!members.length) { retryFolderScan(t); return }
+    members.forEach(m => {
+      if (m.status === 'error' || m.status === 'cancelled') retryTask(m)
+    })
+    syncGroup(t)
+    return
+  }
+  if (t.status !== 'error' && t.status !== 'cancelled') return
   t.pct = 0
   t.speed = 0
   t.error = undefined
@@ -887,6 +1208,7 @@ function retryTask(t: Transfer) {
   reportLog('info', SFTP_TRANSFER_ENQUEUE, `${t.dir === 'up' ? '上传' : '下载'}重新加入队列`, {
     name: t.name, size: t.size, dir: t.dir, from: t.localPath, to: t.remotePath,
   })
+  touchGroup(t)
   schedulePump()
 }
 
@@ -908,12 +1230,23 @@ function pauseAllTasks() {
   transfers.value.forEach(t => { if (t.status === 'running' || t.status === 'pending') pauseTask(t) })
 }
 function resumeAllTasks() {
-  transfers.value.forEach(t => { if (t.status === 'paused') resumeTask(t) })
+  transfers.value.forEach(t => { if (t.status === 'paused') resumeTask(t, true) })
 }
 
-/** 清空终态记录（已完成/已取消；进行中、排队、暂停、失败保留） */
+/** 清空终态记录（已完成/已取消；进行中、排队、暂停、失败保留）。
+ *  文件夹任务连同其子文件任务一并清理 */
 function clearDoneTasks() {
-  transfers.value = transfers.value.filter(t => t.status !== 'success' && t.status !== 'cancelled')
+  const deadGroups = new Set(
+    transfers.value
+      .filter(t => t.kind === 'dir' && (t.status === 'success' || t.status === 'cancelled'))
+      .map(t => t.id),
+  )
+  transfers.value = transfers.value.filter(t => {
+    // 子文件任务跟随所属文件夹任务：仅当整组被清理时一并移除，
+    // 避免失败组内已成功文件被清空导致进度与重试统计失真
+    if (t.groupId !== undefined) return !deadGroups.has(t.groupId)
+    return t.status !== 'success' && t.status !== 'cancelled'
+  })
 }
 
 /** 当前侧选中的条目 */
@@ -938,23 +1271,195 @@ const TASK_TAG_TEXT: Record<TransferStatus, string> = {
 }
 
 /** 任务状态标签：覆盖策略跳过的任务虽为 success，但语义上应显示"已跳过"；
- *  字节传完但还在比对哈希时显示"校验中" */
+ *  字节传完但还在比对哈希时显示"校验中"；完成态（文件与目录）不再重复"完成"，
+ *  由进度 100%、校验结果与文件计数表达 */
+/* 目录任务失败口径：有成功项时为「部分失败」，全部失败时为「失败」；
+   两者沿用相同的红色标签，仅文案区分 */
+function folderFailText(t: Transfer): string {
+  const members = groupMembers(t)
+  const failed = members.filter(c => c.status === 'error').length
+  const ok = members.filter(c => c.status === 'success').length
+  return failed > 0 && ok > 0 ? '部分失败' : '失败'
+}
 function taskStatusText(t: Transfer): string {
+  if (t.kind === 'dir' && t.scanning) return '扫描中'
+  if (t.skipped) return '已跳过'
+  if (t.kind === 'dir' && t.status === 'error') return folderFailText(t)
+  if (t.status === 'success') return ''
   if (t.status === 'running' && t.verifying) return '校验中'
-  return t.skipped ? '已跳过' : TASK_TAG_TEXT[t.status]
+  return TASK_TAG_TEXT[t.status]
 }
 
-/** 将一个选中条目入队：仅支持单文件传输（目录递归传输暂未实现），
- *  拼出本地与远端绝对路径后入队。 */
-function enqueueEntry(dir: 'up' | 'down', e: FsEntry) {
+/** 将一个选中条目入队：文件直接传输，目录递归展开为文件级任务并归入文件夹汇总行。
+ *  targetDir 为对侧目标目录覆盖（拖拽落到目录行时使用），缺省为对侧当前目录 */
+function enqueueEntry(dir: 'up' | 'down', e: FsEntry, targetDir?: string) {
+  const localAbs = joinPath(localPath.value, e.name)
+  const remoteAbs = joinPath(remotePath.value, e.name)
+  const srcRoot = dir === 'up' ? localAbs : remoteAbs
+  const dstBase = targetDir ?? (dir === 'up' ? remotePath.value : localPath.value)
+  const dstRoot = joinPath(dstBase, e.name)
   if (e.type === 'dir') {
-    toast('暂不支持目录传输，请选择文件', 'warn')
+    startFolderTask(dir, e.name, srcRoot, dstRoot)
     return
   }
   startTask(dir, e.name, e.size, {
-    localPath: joinPath(localPath.value, e.name),
-    remotePath: joinPath(remotePath.value, e.name),
+    localPath: dir === 'up' ? localAbs : dstRoot,
+    remotePath: dir === 'up' ? dstRoot : remoteAbs,
   })
+}
+
+/** 文件夹传输上限：防御异常目录导致内存/队列失控 */
+const FOLDER_FILE_LIMIT = 10_000
+const FOLDER_BYTES_LIMIT = 100 * 1024 ** 3
+
+/** 文件夹传输入队：先建汇总行，再异步扫描源目录、创建目标目录、
+ *  把每个文件作为独立任务入队（支持单文件级的暂停/继续/重试/取消） */
+function startFolderTask(
+  dir: 'up' | 'down', name: string, srcRoot: string, dstRoot: string, cutSrc?: string,
+) {
+  if (sftpLocked.value) {
+    toast('会话已锁定，请先解锁', 'warn')
+    return
+  }
+  const backendId = activeSession.value?.backendId || ''
+  if (!backendId) { toast('请先建立 SSH 连接', 'warn'); return }
+  const wasIdle = transfers.value.length === 0
+  const g: Transfer = {
+    id: ++seq, name, dir, kind: 'dir', size: 0, pct: 0, status: 'pending',
+    speed: 0, startAt: 0,
+    localPath: dir === 'up' ? srcRoot : dstRoot,
+    remotePath: dir === 'up' ? dstRoot : srcRoot,
+    backendId, expanded: true, scanning: true, fileCount: 0, cutSrc,
+  }
+  transfers.value.push(g)
+  if (wasIdle) sftpQueueCollapsed.value = false
+  reportLog('info', SFTP_TRANSFER_ENQUEUE, `${dir === 'up' ? '上传' : '下载'}文件夹加入队列`, {
+    name, dir, from: srcRoot, to: dstRoot,
+  })
+  void prepareFolder(g)
+}
+
+/** 文件夹任务的源 / 目标根目录（localPath/remotePath 在 up/down 下语义相反） */
+function folderRoots(g: Transfer) {
+  return g.dir === 'up'
+    ? { src: g.localPath || '', dst: g.remotePath || '' }
+    : { src: g.remotePath || '', dst: g.localPath || '' }
+}
+
+/** 重新准备（扫描 + 建目录）准备阶段失败的文件夹任务 */
+function retryFolderScan(g: Transfer) {
+  if (g.scanning) return
+  g.scanning = true
+  g.status = 'pending'
+  g.pct = 0
+  g.speed = 0
+  g.error = undefined
+  void prepareFolder(g)
+}
+
+/**
+ * 文件夹任务准备流程：迭代遍历源目录 → 收集文件与子目录 →
+ * 在目标侧创建目录 → 为每个文件创建独立子任务并入队。
+ * 默认不跟随符号链接；文件数 / 总大小超限时中止整组。
+ */
+async function prepareFolder(g: Transfer) {
+  const { src, dst } = folderRoots(g)
+  const alive = () => transfers.value.some(x => x.id === g.id) && g.status !== 'cancelled'
+  try {
+    if (!src) throw new Error('传输路径缺失')
+    const files: { rel: string; size: number }[] = []
+    const dirs: string[] = []
+    const queue: { src: string; rel: string }[] = [{ src, rel: '' }]
+    const visited = new Set<string>()
+    let total = 0
+    while (queue.length) {
+      if (!alive()) return
+      if (sftpLocked.value) throw new Error('会话已锁定，文件夹传输已中止')
+      const cur = queue.shift()!
+      // 循环检测：同一真实路径只扫描一次（软链默认跳过，此处为额外兜底）
+      if (visited.has(cur.src)) continue
+      visited.add(cur.src)
+      const res = g.dir === 'up'
+        ? await invoke<DirListing>('list_local_dir', { path: cur.src })
+        : await invoke<DirListing>('sftp_list_dir', { sessionId: g.backendId, path: cur.src })
+      for (const ent of res.entries) {
+        if (ent.isSymlink) continue // 默认不跟随符号链接
+        const rel = cur.rel ? `${cur.rel}/${ent.name}` : ent.name
+        if (ent.isDir) {
+          dirs.push(rel)
+          queue.push({ src: joinPath(cur.src, ent.name), rel })
+          continue
+        }
+        if (g.dir === 'up' && isBlacklisted(ent.name)) continue
+        files.push({ rel, size: ent.size })
+        total += ent.size
+        if (files.length > FOLDER_FILE_LIMIT) {
+          throw new Error(`文件数超过 ${FOLDER_FILE_LIMIT} 上限，已中止`)
+        }
+        if (total > FOLDER_BYTES_LIMIT) {
+          throw new Error('文件夹总大小超过 100 GB 上限，已中止')
+        }
+      }
+    }
+    if (!alive()) return
+
+    // 目标目录：根目录 + 全部子目录，父目录先创建
+    const ordered = ['', ...dirs].sort((a, b) => a.split('/').length - b.split('/').length)
+    for (const rel of ordered) {
+      if (!alive()) return
+      if (sftpLocked.value) throw new Error('会话已锁定，文件夹传输已中止')
+      const p = rel ? joinPath(dst, rel) : dst
+      try {
+        if (g.dir === 'up') await invoke('sftp_mkdir', { sessionId: g.backendId, path: p })
+        else await invoke('mkdir', { path: p })
+      } catch (e) {
+        // 目标目录已存在属正常情况（SFTP 无法区分存在与权限错误，
+        // 统一放行，真正失败会在文件传输阶段以明确错误暴露）
+        const msg = String(e)
+        if (g.dir === 'down' && !/exist|已存在/i.test(msg)) throw e
+      }
+    }
+    if (!alive()) return
+
+    g.fileCount = files.length
+    g.size = total
+    g.scanning = false
+    // 文件过多时默认收起，避免一次性渲染大量子项行
+    g.expanded = files.length <= 200
+    const paused = g.status === 'paused' // 扫描期间被暂停：新任务直接置为已暂停
+    for (const f of files) {
+      transfers.value.push({
+        id: ++seq,
+        name: f.rel,
+        dir: g.dir,
+        size: f.size,
+        pct: 0,
+        speed: 0,
+        startAt: 0,
+        status: paused ? 'paused' : 'pending',
+        localPath: g.dir === 'up' ? joinPath(src, f.rel) : joinPath(dst, f.rel),
+        remotePath: g.dir === 'up' ? joinPath(dst, f.rel) : joinPath(src, f.rel),
+        backendId: g.backendId,
+        groupId: g.id,
+      })
+    }
+    if (!files.length) {
+      // 仅空目录：创建完目录即完成
+      g.status = 'success'
+      g.pct = 100
+      onFolderDone(g)
+      return
+    }
+    syncGroup(g)
+    schedulePump()
+  } catch (e) {
+    if (!alive()) return
+    g.scanning = false
+    g.status = 'error'
+    g.error = String((e as Error)?.message ?? e)
+    reportLog('error', SFTP_TRANSFER_FAILED, '文件夹传输准备失败', { name: g.name, err: g.error })
+    toast(`文件夹${g.dir === 'up' ? '上传' : '下载'}失败：${g.name}`, 'warn', 2600)
+  }
 }
 
 function onUpload() {
@@ -1052,12 +1557,15 @@ async function pasteTargets(side: Side) {
       void refreshSide(side)
     }
   } else {
-    /* 跨侧：本质下载/上传，入现有串行传输队列 */
+    /* 跨侧：本质下载/上传，入现有传输队列；目录递归展开为文件级任务 */
     const dir: 'up' | 'down' = side === 'remote' ? 'up' : 'down'
     for (const j of jobs) {
-      if (j.isDir) { toast('暂不支持目录传输，请选择文件', 'warn'); continue }
       const localAbs = dir === 'up' ? j.src : j.dst
       const remoteAbs = dir === 'up' ? j.dst : j.src
+      if (j.isDir) {
+        startFolderTask(dir, j.name, j.src, j.dst, cb.mode === 'cut' ? j.src : undefined)
+        continue
+      }
       startTask(dir, j.name, j.size, {
         localPath: localAbs,
         remotePath: remoteAbs,
@@ -1128,6 +1636,12 @@ function onBlankContext(e: MouseEvent, side: Side) {
   sideSel(side).value = new Set()
   menu.value = { x: e.clientX, y: e.clientY, side, targets: [] }
 }
+/** 列表横向滚动时同步表头偏移，避免表头参与滚动区导致可滚范围异常 */
+function onListScroll(e: Event) {
+  const list = e.currentTarget as HTMLElement
+  const header = list.closest('.pane')?.querySelector<HTMLElement>('.list-header')
+  if (header) header.style.transform = `translateX(${-list.scrollLeft}px)`
+}
 
 /* v-model 代理：ContextMenu 关闭即清空菜单状态 */
 const menuVisible = computed({
@@ -1138,7 +1652,8 @@ const menuX = computed(() => menu.value?.x ?? 0)
 const menuY = computed(() => menu.value?.y ?? 0)
 const menuItems = computed<MenuItem[]>(() => {
   const m = menu.value
-  return m ? buildMenu(m.side, m.targets) : []
+  if (!m) return []
+  return m.pane ? buildPaneMenu(m.side) : buildMenu(m.side, m.targets)
 })
 
 /* 图标 path d（24x24） */
@@ -1158,6 +1673,8 @@ const ICON = {
   up: 'M12 19V5M5 12l7-7 7 7',
   down: 'M12 5v14M5 12l7 7 7-7',
   refresh: 'M21 12a9 9 0 11-3-6.7L21 8 M21 3v5h-5',
+  back: 'M15 18l-6-6 6-6',
+  forward: 'M9 6l6 6-6 6',
 }
 
 /** 按场景构造菜单模型（空白/单项/多选） */
@@ -1171,6 +1688,15 @@ function buildMenu(side: Side, targets: FsEntry[]): MenuItem[] {
       { divider: true },
       { label: '全选', icon: ICON.all, shortcut: '⌘A', action: () => selectAll(side) },
       { label: '刷新', icon: ICON.refresh, action: () => void refreshSide(side) },
+      { divider: true },
+      {
+        label: '显示隐藏文件',
+        checked: savedSettings.sftpShowHidden,
+        action: () => {
+          savedSettings.sftpShowHidden = !savedSettings.sftpShowHidden
+          persistSettings()
+        },
+      },
     ]
   }
 
@@ -1208,7 +1734,7 @@ function buildMenu(side: Side, targets: FsEntry[]): MenuItem[] {
   }
   items.push({
     label: targets.length > 1 ? `删除 ${targets.length} 项` : '删除',
-    icon: ICON.del, shortcut: 'Del', danger: true,
+    icon: ICON.del, shortcut: 'Del',
     action: () => void deleteTargets(side, targets),
   })
   items.push({ divider: true })
@@ -1224,8 +1750,82 @@ function buildMenu(side: Side, targets: FsEntry[]): MenuItem[] {
   return items
 }
 
+/** 每栏「更多」菜单：导航 → 传输 → 编辑 → 新建 → 显示隐藏文件 */
+function buildPaneMenu(side: Side): MenuItem[] {
+  const entries = selectedEntries(side)
+  const single = entries.length === 1 ? entries[0]! : null
+  const remoteBlocked = side === 'remote' && (!connected.value || sftpLocked.value)
+  return [
+    {
+      label: '返回', icon: ICON.back,
+      disabled: !canGoBack(side),
+      action: () => void goBack(side),
+    },
+    {
+      label: '前进', icon: ICON.forward,
+      disabled: !canGoForward(side),
+      action: () => void goForward(side),
+    },
+    { divider: true },
+    {
+      label: '下载',
+      icon: ICON.down,
+      disabled: side !== 'remote' || !entries.length || !connected.value || sftpLocked.value,
+      action: () => onDownload(),
+    },
+    {
+      label: '上传',
+      icon: ICON.up,
+      disabled: side !== 'local' || !entries.length || !connected.value || sftpLocked.value,
+      action: () => onUpload(),
+    },
+    { divider: true },
+    {
+      label: entries.length > 1 ? `删除 ${entries.length} 项` : '删除',
+      icon: ICON.del,
+      disabled: !entries.length || remoteBlocked,
+      action: () => void deleteTargets(side, entries),
+    },
+    {
+      label: '重命名',
+      icon: ICON.rename,
+      disabled: !single || remoteBlocked,
+      action: () => { if (single) startEdit(side, 'rename', single) },
+    },
+    { divider: true },
+    {
+      label: '新建文件',
+      icon: ICON.mkfile,
+      disabled: remoteBlocked,
+      action: () => startEdit(side, 'mkfile'),
+    },
+    {
+      label: '新建文件夹',
+      icon: ICON.mkdir,
+      disabled: remoteBlocked,
+      action: () => startEdit(side, 'mkdir'),
+    },
+    { divider: true },
+    {
+      label: '显示隐藏文件',
+      checked: savedSettings.sftpShowHidden,
+      action: () => {
+        savedSettings.sftpShowHidden = !savedSettings.sftpShowHidden
+        persistSettings()
+      },
+    },
+  ]
+}
+
+/** 打开每栏工具行的「更多」菜单（锚定按钮左下角） */
+function openPaneMenu(side: Side, e: MouseEvent) {
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  menu.value = { x: Math.round(r.left), y: Math.round(r.bottom + 4), side, targets: [], pane: true }
+}
+
 /* 行交互：单击选择（Ctrl/⌘ 多选）、双击目录进入、双击文件传输 */
 function onRowClick(side: Side, entry: FsEntry, e: MouseEvent) {
+  if (Date.now() < suppressClickUntil) return // 刚结束拖拽：忽略释放时产生的 click
   lastSide.value = side
   const sel = side === 'local' ? localSelected : remoteSelected
   if (e.ctrlKey || e.metaKey) {
@@ -1261,6 +1861,227 @@ function onRowDblClick(side: Side, entry: FsEntry) {
     if (side === 'local') onUpload()
     else onDownload()
   }
+}
+
+/* ---- 跨侧拖拽传输（指针事件自绘，三端行为一致）----
+   本地行拖到远端列表 = 上传，远端行拖到本地列表 = 下载；
+   拖拽项为当前选中集合（拖未选中的行则先选中该行）；
+   落点缺省为对侧当前目录，拖到对侧目录行上则直接传入该目录。 */
+const dragSide = ref<Side | null>(null)
+/** 当前高亮的落点侧（恒为拖拽源的对侧）与落点目录 */
+const dropSide = ref<Side | null>(null)
+const dropDir = ref<string | null>(null)
+
+/** 已按下但未越过阈值的待定拖拽 */
+let pendingDrag: { side: Side; entry: FsEntry; x: number; y: number } | null = null
+/** 拖拽中指针位置与跟手信息条文案 */
+const dragPos = reactive({ x: 0, y: 0 })
+const dragLabel = ref('')
+/** 拖拽后短暂抑制行 click，避免释放时改写选区 */
+let suppressClickUntil = 0
+const DRAG_THRESHOLD = 5
+
+/* 边缘自动滚动：指针停靠在列表上下边缘时持续滚动，便于拖到视野外的目录 */
+let autoScrollList: HTMLElement | null = null
+let autoScrollRaf = 0
+const AUTO_SCROLL_EDGE = 28
+const AUTO_SCROLL_MAX = 12
+
+function scheduleAutoScroll() {
+  if (!autoScrollRaf && dragSide.value) autoScrollRaf = requestAnimationFrame(autoScrollStep)
+}
+
+function autoScrollStep() {
+  autoScrollRaf = 0
+  if (!dragSide.value) { autoScrollList = null; return }
+  const list = autoScrollList
+  if (list) {
+    const r = list.getBoundingClientRect()
+    let dy = 0
+    if (dragPos.y < r.top + AUTO_SCROLL_EDGE) {
+      dy = -Math.ceil(((r.top + AUTO_SCROLL_EDGE - dragPos.y) / AUTO_SCROLL_EDGE) * AUTO_SCROLL_MAX)
+    } else if (dragPos.y > r.bottom - AUTO_SCROLL_EDGE) {
+      dy = Math.ceil(((dragPos.y - (r.bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE) * AUTO_SCROLL_MAX)
+    }
+    if (dy) {
+      const before = list.scrollTop
+      list.scrollTop += dy
+      // 内容滚动后指针下的行可能变化，重算落点
+      if (list.scrollTop !== before) updateDropTarget(dragPos.x, dragPos.y)
+    }
+  }
+  scheduleAutoScroll()
+}
+
+function stopAutoScroll() {
+  if (autoScrollRaf) cancelAnimationFrame(autoScrollRaf)
+  autoScrollRaf = 0
+  autoScrollList = null
+}
+
+function clearDropTarget() {
+  dropSide.value = null
+  dropDir.value = null
+}
+
+function onRowPointerDown(side: Side, entry: FsEntry, e: PointerEvent) {
+  if (e.button !== 0 || sftpLocked.value) return
+  if ((e.target as HTMLElement).closest('input')) return // 行内重命名输入框不触发拖拽
+  pendingDrag = { side, entry, x: e.clientX, y: e.clientY }
+}
+
+function onRowPointerMove(e: PointerEvent) {
+  if (pendingDrag) {
+    const dx = e.clientX - pendingDrag.x
+    const dy = e.clientY - pendingDrag.y
+    if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return
+    startInternalDrag(e)
+  }
+  if (!dragSide.value) return
+  dragPos.x = e.clientX
+  dragPos.y = e.clientY
+  updateDropTarget(e.clientX, e.clientY)
+}
+
+function onRowPointerUp() {
+  if (pendingDrag) { pendingDrag = null; return } // 未越阈值：仍按普通点击处理
+  finishInternalDrag(true)
+}
+
+function onRowPointerCancel() {
+  pendingDrag = null
+  if (dragSide.value) finishInternalDrag(false)
+}
+
+function onDragKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape' || !dragSide.value) return
+  e.preventDefault()
+  finishInternalDrag(false)
+}
+
+function onDragBlur() {
+  if (dragSide.value || pendingDrag) finishInternalDrag(false)
+}
+
+function startInternalDrag(e: PointerEvent) {
+  const p = pendingDrag
+  if (!p) return
+  pendingDrag = null
+  const sel = sideSel(p.side)
+  if (!sel.value.has(p.entry.name)) sel.value = new Set([p.entry.name])
+  dragSide.value = p.side
+  dragLabel.value = sel.value.size > 1 ? `${p.entry.name} 等 ${sel.value.size} 项` : p.entry.name
+  dragPos.x = e.clientX
+  dragPos.y = e.clientY
+  document.body.classList.add('row-dragging')
+  clearDropTarget()
+  scheduleAutoScroll()
+}
+
+/** 指针命中：对侧列表内为落点，命中目录行则传入该目录 */
+function updateDropTarget(x: number, y: number) {
+  const src = dragSide.value
+  if (!src) return
+  const el = document.elementFromPoint(x, y) as HTMLElement | null
+  const list = (el?.closest('.pane-list') as HTMLElement | null) ?? null
+  autoScrollList = list
+  const pane = el?.closest('.pane.local, .pane.remote') as HTMLElement | null
+  const side: Side | null = pane?.classList.contains('remote') ? 'remote'
+    : pane?.classList.contains('local') ? 'local' : null
+  if (!el || !list || !side || side === src
+      || (side === 'remote' && !connected.value)) {
+    if (dropSide.value) clearDropTarget()
+    return
+  }
+  const name = (el.closest('.row.dir') as HTMLElement | null)?.dataset.name
+  dropSide.value = side
+  dropDir.value = name ? joinPath(sidePath(side), name) : sidePath(side)
+}
+
+function finishInternalDrag(commit: boolean) {
+  const src = dragSide.value
+  pendingDrag = null
+  dragSide.value = null
+  stopAutoScroll()
+  dragPos.x = 0
+  dragPos.y = 0
+  document.body.classList.remove('row-dragging')
+  if (!src) { clearDropTarget(); return }
+  // 拖拽结束后抑制一次 click（指针回到原行释放时浏览器仍会派发 click）
+  suppressClickUntil = Date.now() + 300
+  const target = commit ? dropSide.value : null
+  const targetDir = dropDir.value
+  clearDropTarget()
+  if (!target || !targetDir) return
+  if (target === 'remote' && (!connected.value || sftpLocked.value)) {
+    toast(sftpLocked.value ? '会话已锁定，请先解锁' : '请先建立 SSH 连接', 'warn')
+    return
+  }
+  const names = new Set(sideSel(src).value)
+  const entries = sideRaw(src).value.filter(x => names.has(x.name))
+  if (!entries.length) return
+  entries.forEach(en => enqueueEntry(src === 'local' ? 'up' : 'down', en, targetDir))
+  sideSel(src).value = new Set()
+}
+
+/* ---- 外部文件拖入（原生拖放，三端统一）：拖到远端栏即上传到落点目录 ----
+   原生事件只给坐标与本地绝对路径，落点靠命中测试确定。 */
+let unlistenExternalDrop: UnlistenFn | null = null
+
+/** 物理坐标命中远端栏：返回落点目录（目录行则进入该目录），否则 null。
+ *  坐标单位在平台间不一致（macOS WKWebView 为逻辑点，Windows 为物理像素），
+ *  先按逻辑点命中，未落在远端栏时再按 devicePixelRatio 换算兜底。 */
+function externalDropTargetAt(pos: { x: number; y: number }): string | null {
+  if (!connected.value || sftpLocked.value) return null
+  const pick = (x: number, y: number) => document.elementFromPoint(x, y) as HTMLElement | null
+  let el = pick(pos.x, pos.y)
+  const dpr = window.devicePixelRatio || 1
+  if (dpr !== 1 && (!el || !el.closest('.pane.remote'))) {
+    const scaled = pick(pos.x / dpr, pos.y / dpr)
+    if (scaled?.closest('.pane.remote')) el = scaled
+  }
+  if (!el || !el.closest('.pane.remote')) return null
+  const name = (el.closest('.row.dir') as HTMLElement | null)?.dataset.name
+  return name ? joinPath(remotePath.value, name) : remotePath.value
+}
+
+function onExternalDragEvent(ev: DragDropEvent) {
+  if (ev.type === 'leave') { clearDropTarget(); return }
+  if (ev.type === 'enter' || ev.type === 'over') {
+    const dir = externalDropTargetAt(ev.position)
+    if (dir) {
+      dropSide.value = 'remote'
+      dropDir.value = dir
+    } else if (dropSide.value) {
+      clearDropTarget()
+    }
+    return
+  }
+  const targetDir = externalDropTargetAt(ev.position)
+  clearDropTarget()
+  if (targetDir) void uploadExternalPaths(ev.paths, targetDir)
+}
+
+/** 外部路径入队上传：文件夹递归展开，文件按本地 stat 大小建单文件任务 */
+async function uploadExternalPaths(paths: string[], targetDir: string) {
+  if (!connected.value) { toast('请先建立 SSH 连接', 'warn'); return }
+  if (sftpLocked.value) { toast('会话已锁定，请先解锁', 'warn'); return }
+  let queued = 0
+  for (const p of paths) {
+    const name = p.split(/[\\/]/).filter(Boolean).pop() || p
+    try {
+      const info = await invoke<{ isDir: boolean; size: number }>('local_stat', { path: p })
+      const dst = joinPath(targetDir, name)
+      const before = transfers.value.length
+      if (info.isDir) startFolderTask('up', name, p, dst)
+      else startTask('up', name, info.size, { localPath: p, remotePath: dst })
+      // 命中上传黑名单等情况不会入队，按队列增量计数
+      if (transfers.value.length > before) queued++
+    } catch (e) {
+      toast(`无法读取 ${name}：${String(e)}`, 'warn', 3000)
+    }
+  }
+  if (queued) toast(`已加入上传队列：${queued} 项`, 'ok', 1800)
 }
 
 function goUp(side: 'local' | 'remote') {
@@ -1300,6 +2121,7 @@ watch(() => activeSession.value?.backendId, (id) => {
   remoteSelected.value = new Set()
   remoteLoading.value = false
   remoteReqSeq++ // 使在飞的旧会话请求全部过期
+  remoteHist.value = { stack: [], idx: -1 } // 历史属于单个会话，切换/断开即重置
   applySftpIdleTimeout() // 新会话继承当前空闲超时设置
   if (id) void loadRemote()
 })
@@ -1559,7 +2381,8 @@ function geometry() {
   const ws = el?.parentElement
   if (!el || !(ws instanceof HTMLElement)) return null
   const wsRect = ws.getBoundingClientRect()
-  const tabsEl = ws.querySelector(':scope > .tabs')
+  // Tab 栏真实 class 为 .tabs-bar；此前查 .tabs 恒为空，导致上限退化为整个 workspace 高度
+  const tabsEl = ws.querySelector('.tabs-bar')
   const tabsBottom = tabsEl?.getBoundingClientRect().bottom ?? wsRect.top
   return { wsBottom: wsRect.bottom, tabsBottom }
 }
@@ -1704,12 +2527,33 @@ onMounted(() => {
   document.addEventListener('mouseup', onUp)
   document.addEventListener('keydown', onFindShortcut)
   document.addEventListener('keydown', onSftpShortcut)
+  // 自绘拖拽（跨栏传输）
+  document.addEventListener('pointermove', onRowPointerMove)
+  document.addEventListener('pointerup', onRowPointerUp)
+  document.addEventListener('pointercancel', onRowPointerCancel)
+  document.addEventListener('keydown', onDragKeydown)
+  window.addEventListener('blur', onDragBlur)
+
+  // 原生文件拖入（外部拖拽上传，三端统一启用）
+  if (isTauri) {
+    void getCurrentWebview().onDragDropEvent((event) => onExternalDragEvent(event.payload)).then((fn) => {
+      unlistenExternalDrop = fn
+    })
+  }
 })
 onUnmounted(() => {
   document.removeEventListener('mousemove', onMove)
   document.removeEventListener('mouseup', onUp)
   document.removeEventListener('keydown', onFindShortcut)
   document.removeEventListener('keydown', onSftpShortcut)
+  document.removeEventListener('pointermove', onRowPointerMove)
+  document.removeEventListener('pointerup', onRowPointerUp)
+  document.removeEventListener('pointercancel', onRowPointerCancel)
+  document.removeEventListener('keydown', onDragKeydown)
+  window.removeEventListener('blur', onDragBlur)
+  stopAutoScroll()
+  unlistenExternalDrop?.()
+  unlistenExternalDrop = null
 })
 </script>
 
@@ -1797,10 +2641,20 @@ onUnmounted(() => {
                  :style="{ flex: `0 0 calc(100% * ${sftpLocalRatio})` }">
               <div class="pane-header">
                 <span class="pane-tag">本地</span>
-                <div class="pane-path">
-                  <template v-for="(c, i) in crumbs(localPath)" :key="c.path">
-                    <span v-if="i" class="sep">/</span>
-                    <span class="crumb" @click="gotoCrumb('local', c.path)">{{ c.label }}</span>
+                <div class="pane-path" :class="{ editing: pathEditing === 'local' }"
+                     :title="pathEditing === 'local' ? '不含 / 为筛选，含 / 为目录路径 · Esc 取消' : '单击筛选或输入路径'"
+                     @click="onPathClick('local', $event)">
+                  <input v-if="pathEditing === 'local'" v-model="pathDraft" class="pane-path-input"
+                         spellcheck="false" autocomplete="off" placeholder="筛选"
+                         @input="onPathInput('local')"
+                         @keydown="onPathKey($event, 'local')"
+                         @blur="pathEditing = null" />
+                  <span v-else-if="localFilter" class="path-filter-text">{{ localFilter }}</span>
+                  <template v-else>
+                    <template v-for="(c, i) in crumbs(localPath)" :key="c.path">
+                      <span v-if="i" class="sep">/</span>
+                      <span v-if="c.label" class="crumb" @click="gotoCrumb('local', c.path)">{{ c.label }}</span>
+                    </template>
                   </template>
                 </div>
                 <button class="pane-btn" title="上一级" @click="goUp('local')">
@@ -1822,8 +2676,6 @@ onUnmounted(() => {
                     <path d="M12 11v5M9.5 13.5h5" stroke-width="2.2"/>
                   </svg>
                 </button>
-                <!-- 导航区 | 传输区 -->
-                <span class="sep"></span>
                 <button class="pane-btn transfer-btn" :class="{ ready: localSel.length }"
                         :title="localSel.length ? `上传选中的 ${localSel.length} 个文件到远程` : '先在列表中选择文件'"
                         :disabled="!localSel.length || sftpLocked"
@@ -1833,15 +2685,24 @@ onUnmounted(() => {
                     <path d="M12 19V5M5 12l7-7 7 7"/>
                   </svg>
                 </button>
+                <button class="pane-btn" title="更多操作" @click="openPaneMenu('local', $event)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                       stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 12h.01M12 12h.01M19 12h.01"/>
+                  </svg>
+                </button>
               </div>
-              <div class="list-header">
-                <div class="lh-name" :class="{ sorted: localSort.key==='name' }" @click="changeSort('local','name')">名称</div>
-                <div class="lh-size" :class="{ sorted: localSort.key==='size' }" @click="changeSort('local','size')">大小</div>
-                <div class="lh-time" :class="{ sorted: localSort.key==='mtime' }" @click="changeSort('local','mtime')">修改时间</div>
-                <div class="lh-perm">权限</div>
-                <div class="lh-owner">用户/组</div>
+              <div class="list-header-wrap">
+                <div class="list-header">
+                  <div class="lh-name" :class="{ sorted: localSort.key==='name' }" @click="changeSort('local','name')">名称</div>
+                  <div class="lh-size" :class="{ sorted: localSort.key==='size' }" @click="changeSort('local','size')">大小</div>
+                  <div class="lh-time" :class="{ sorted: localSort.key==='mtime' }" @click="changeSort('local','mtime')">修改时间</div>
+                  <div class="lh-perm">权限</div>
+                  <div class="lh-owner">用户/组</div>
+                </div>
               </div>
-              <div class="pane-list" @contextmenu="onBlankContext($event, 'local')">
+              <div class="pane-list-wrap" :class="{ 'drop-active': dropSide === 'local' }">
+                <div class="pane-list" @contextmenu="onBlankContext($event, 'local')" @scroll="onListScroll">
                 <div v-if="!localEntries.length && !(edit && edit.side==='local' && edit.kind!=='rename')" class="pane-empty">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -1854,10 +2715,15 @@ onUnmounted(() => {
                     v-for="e in localEntries"
                     :key="e.name"
                     class="row"
-                    :class="{ dir: e.type==='dir', selected: localSelected.has(e.name) }"
+                    :class="{ dir: e.type==='dir', selected: localSelected.has(e.name),
+                              dragging: dragSide === 'local' && localSelected.has(e.name),
+                              'drop-target': dropSide === 'local' && e.type === 'dir'
+                                && dropDir === joinPath(localPath, e.name) }"
+                    :data-name="e.name"
                     @click="onRowClick('local', e, $event)"
                     @dblclick="onRowDblClick('local', e)"
                     @contextmenu.stop="onRowContext($event, 'local', e)"
+                    @pointerdown="onRowPointerDown('local', e, $event)"
                   >
                     <div class="row-name">
                       <svg class="row-icon" viewBox="0 0 24 24">
@@ -1873,7 +2739,12 @@ onUnmounted(() => {
                              @keydown.enter.prevent="confirmEdit"
                              @keydown.esc.prevent="cancelEdit"
                              @blur="confirmEdit" />
-                      <span v-else class="row-text">{{ e.name }}</span>
+                      <span v-else class="row-text">
+                        <template v-for="(seg, i) in nameSegments(e.name, 'local')" :key="i">
+                          <mark v-if="seg.hit" class="name-hit">{{ seg.text }}</mark>
+                          <template v-else>{{ seg.text }}</template>
+                        </template>
+                      </span>
                       <svg v-if="e.isSymlink" class="link-badge" viewBox="0 0 16 16" title="符号链接">
                         <path d="M7 2H4a3 3 0 0 0 0 6h2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
                         <path d="M9 14h3a3 3 0 0 0 0-6h-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
@@ -1904,6 +2775,7 @@ onUnmounted(() => {
                   </div>
                 </template>
               </div>
+              </div>
               <div class="pane-stats">
                 <b>{{ localEntries.filter(e=>e.type==='dir').length }}</b> 目录 /
                 <b>{{ localEntries.filter(e=>e.type==='file').length }}</b> 文件
@@ -1915,11 +2787,21 @@ onUnmounted(() => {
             <div class="pane remote">
               <div class="pane-header">
                 <span class="pane-tag">远程</span>
-                <div class="pane-path">
-                  <span v-if="!connected" class="crumb dim">未连接</span>
-                  <template v-else v-for="(c, i) in crumbs(remotePath)" :key="c.path">
-                    <span v-if="i" class="sep">/</span>
-                    <span class="crumb" @click="gotoCrumb('remote', c.path)">{{ c.label }}</span>
+                <div class="pane-path" :class="{ editing: pathEditing === 'remote' }"
+                     :title="pathEditing === 'remote' ? '不含 / 为筛选，含 / 为目录路径 · Esc 取消' : '单击筛选或输入路径'"
+                     @click="onPathClick('remote', $event)">
+                  <input v-if="pathEditing === 'remote'" v-model="pathDraft" class="pane-path-input"
+                         spellcheck="false" autocomplete="off" placeholder="筛选"
+                         @input="onPathInput('remote')"
+                         @keydown="onPathKey($event, 'remote')"
+                         @blur="pathEditing = null" />
+                  <span v-else-if="!connected" class="crumb dim">未连接</span>
+                  <span v-else-if="remoteFilter" class="path-filter-text">{{ remoteFilter }}</span>
+                  <template v-else>
+                    <template v-for="(c, i) in crumbs(remotePath)" :key="c.path">
+                      <span v-if="i" class="sep">/</span>
+                      <span v-if="c.label" class="crumb" @click="gotoCrumb('remote', c.path)">{{ c.label }}</span>
+                    </template>
                   </template>
                 </div>
                 <button class="pane-btn" title="上一级" :disabled="!connected || sftpLocked" @click="goUp('remote')">
@@ -1942,8 +2824,6 @@ onUnmounted(() => {
                     <path d="M12 11v5M9.5 13.5h5" stroke-width="2.2"/>
                   </svg>
                 </button>
-                <!-- 导航区 | 传输区 -->
-                <span class="sep"></span>
                 <button class="pane-btn transfer-btn" :class="{ ready: remoteSel.length }"
                         :title="remoteSel.length ? `下载选中的 ${remoteSel.length} 个文件到本地` : '先在列表中选择文件'"
                         :disabled="!remoteSel.length || sftpLocked"
@@ -1953,15 +2833,25 @@ onUnmounted(() => {
                     <path d="M12 5v14M5 12l7 7 7-7"/>
                   </svg>
                 </button>
+                <button class="pane-btn" title="更多操作" :disabled="!connected || sftpLocked"
+                        @click="openPaneMenu('remote', $event)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                       stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 12h.01M12 12h.01M19 12h.01"/>
+                  </svg>
+                </button>
               </div>
-              <div class="list-header">
-                <div class="lh-name" :class="{ sorted: remoteSort.key==='name' }" @click="changeSort('remote','name')">名称</div>
-                <div class="lh-size" :class="{ sorted: remoteSort.key==='size' }" @click="changeSort('remote','size')">大小</div>
-                <div class="lh-time" :class="{ sorted: remoteSort.key==='mtime' }" @click="changeSort('remote','mtime')">修改时间</div>
-                <div class="lh-perm">权限</div>
-                <div class="lh-owner">用户/组</div>
+              <div class="list-header-wrap">
+                <div class="list-header">
+                  <div class="lh-name" :class="{ sorted: remoteSort.key==='name' }" @click="changeSort('remote','name')">名称</div>
+                  <div class="lh-size" :class="{ sorted: remoteSort.key==='size' }" @click="changeSort('remote','size')">大小</div>
+                  <div class="lh-time" :class="{ sorted: remoteSort.key==='mtime' }" @click="changeSort('remote','mtime')">修改时间</div>
+                  <div class="lh-perm">权限</div>
+                  <div class="lh-owner">用户/组</div>
+                </div>
               </div>
-              <div class="pane-list" @contextmenu="onBlankContext($event, 'remote')">
+              <div class="pane-list-wrap" :class="{ 'drop-active': dropSide === 'remote' }">
+                <div class="pane-list" @contextmenu="onBlankContext($event, 'remote')" @scroll="onListScroll">
                 <div v-if="!remoteEntries.length && !(edit && edit.side==='remote' && edit.kind!=='rename')" class="pane-empty">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -1974,10 +2864,15 @@ onUnmounted(() => {
                     v-for="e in remoteEntries"
                     :key="e.name"
                     class="row"
-                    :class="{ dir: e.type==='dir', selected: remoteSelected.has(e.name) }"
+                    :class="{ dir: e.type==='dir', selected: remoteSelected.has(e.name),
+                              dragging: dragSide === 'remote' && remoteSelected.has(e.name),
+                              'drop-target': dropSide === 'remote' && e.type === 'dir'
+                                && dropDir === joinPath(remotePath, e.name) }"
+                    :data-name="e.name"
                     @click="onRowClick('remote', e, $event)"
                     @dblclick="onRowDblClick('remote', e)"
                     @contextmenu.stop="onRowContext($event, 'remote', e)"
+                    @pointerdown="onRowPointerDown('remote', e, $event)"
                   >
                     <div class="row-name">
                       <svg class="row-icon" viewBox="0 0 24 24">
@@ -1992,7 +2887,12 @@ onUnmounted(() => {
                              @keydown.enter.prevent="confirmEdit"
                              @keydown.esc.prevent="cancelEdit"
                              @blur="confirmEdit" />
-                      <span v-else class="row-text">{{ e.name }}</span>
+                      <span v-else class="row-text">
+                        <template v-for="(seg, i) in nameSegments(e.name, 'remote')" :key="i">
+                          <mark v-if="seg.hit" class="name-hit">{{ seg.text }}</mark>
+                          <template v-else>{{ seg.text }}</template>
+                        </template>
+                      </span>
                       <svg v-if="e.isSymlink" class="link-badge" viewBox="0 0 16 16" title="符号链接">
                         <path d="M7 2H4a3 3 0 0 0 0 6h2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
                         <path d="M9 14h3a3 3 0 0 0 0-6h-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
@@ -2023,6 +2923,7 @@ onUnmounted(() => {
                   </div>
                 </template>
               </div>
+              </div>
               <div class="pane-stats">
                 <b>{{ remoteEntries.filter(e=>e.type==='dir').length }}</b> 目录 /
                 <b>{{ remoteEntries.filter(e=>e.type==='file').length }}</b> 文件
@@ -2049,7 +2950,7 @@ onUnmounted(() => {
                  @click="onQueueHeadClick">
               <span class="queue-led" :class="{ idle: !runningCount && !pendingCount }"></span>
               <span class="queue-title">传输队列</span>
-              <span class="queue-badge">{{ transfers.length }}</span>
+              <span class="queue-badge">{{ queueItems.length }}</span>
               <span v-if="sftpQueueCollapsed && queueSummary" class="queue-summary"
                     :title="queueSummary">{{ queueSummary }}</span>
               <span class="spacer"></span>
@@ -2096,25 +2997,43 @@ onUnmounted(() => {
                       @click="queueFilter = f.k">{{ f.label }}</button>
             </div>
             <!-- 任务列表 -->
-            <div class="queue-list" :style="{ maxHeight: queueListMaxHeight }">
-              <div v-if="!transfers.length" class="queue-empty">暂无传输任务</div>
+            <div ref="queueListEl" class="queue-list" :style="{ maxHeight: queueListMaxHeight }"
+                 @scroll="onQueueScroll">
+              <div v-if="!queueItems.length" class="queue-empty">
+                暂无传输任务
+              </div>
               <div v-for="t in filteredTransfers" :key="t.id"
                    class="sftp-task"
-                   :class="[t.dir === 'up' ? 'upload' : 'download', t.status]">
+                   :class="[t.dir === 'up' ? 'upload' : 'download', t.status,
+                            { folder: t.kind === 'dir', expanded: t.kind === 'dir' && t.expanded }]">
                 <div class="task-row">
-                  <!-- 方向图标 -->
+                  <span class="task-main">
+                  <!-- 文件夹用目录图标；文件用上传/下载方向图标 -->
                   <span class="task-ico">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"
-                         stroke-linecap="round" stroke-linejoin="round">
-                      <path v-if="t.dir==='up'" d="M8 12.6V3.4M3.9 7.5L8 3.4l4.1 4.1"/>
-                      <path v-else d="M8 3.4v9.2M3.9 8.5L8 12.6l4.1-4.1"/>
+                    <svg v-if="t.kind === 'dir'" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                         stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M2 4.4a1.4 1.4 0 0 1 1.4-1.4h2.7l1.4 1.6h5.1A1.4 1.4 0 0 1 14 6v5.6a1.4 1.4 0 0 1-1.4 1.4H3.4A1.4 1.4 0 0 1 2 11.6z"/>
+                    </svg>
+                    <svg v-else viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                         stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 1.9h4.6l3.4 3.4v8.1a.9.9 0 0 1-.9.9H4a.9.9 0 0 1-.9-.9V2.8a.9.9 0 0 1 .9-.9z"/>
+                      <path d="M8.4 1.9v3.6h3.6"/>
                     </svg>
                   </span>
                   <!-- 文件名 / 方向 · 大小 · 目标路径 -->
                   <span class="task-info">
                     <span class="task-name" :title="t.name">
+                      <!-- 文件夹任务可展开子文件列表 -->
+                      <button v-if="t.kind === 'dir' && visibleChildren(t).length" class="task-twist"
+                              :title="t.expanded ? '收起文件列表' : '展开文件列表'"
+                              @click.stop="toggleTaskExpand(t)">
+                        <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6"
+                             stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M3.6 1.8 7 5l-3.4 3.2"/>
+                        </svg>
+                      </button>
                       <span class="task-name-text">{{ taskName(t) }}</span>
-                      <span class="file-tag"
+                      <span v-if="taskStatusText(t)" class="file-tag"
                             :class="[t.status, { verifying: t.status === 'running' && t.verifying }]">{{ taskStatusText(t) }}</span>
                     </span>
                     <span class="task-sub">
@@ -2130,28 +3049,13 @@ onUnmounted(() => {
                     <span class="track"><i class="fill" :style="{ width: Math.min(100, t.pct) + '%' }"></i></span>
                     <span class="bar-meta">
                       <span class="pct">{{ pctText(t) }}</span>
+                      <span v-if="folderCountText(t)" class="bar-count">{{ folderCountText(t) }}</span>
                       <span v-if="speedText(t)" class="speed">{{ speedText(t) }}</span>
-                      <span v-if="noteText(t)" class="bar-note" :title="noteText(t)">{{ noteText(t) }}</span>
-                      <!-- SHA-256 校验：仅在传输结束后显示，避免与速率/剩余时间争同一行 -->
-                      <span v-if="showHash(t)" class="bar-hash">
-                        <span class="hash-status" :class="hashState(t).cls">{{ hashState(t).text }}</span>
-                        <template v-if="t.hash">
-                          <code :title="t.hash">{{ shortHash(t.hash) }}</code>
-                          <button class="hash-copy" :class="{ copied: t.copied }"
-                                  title="复制完整 SHA-256" @click="copyHash(t)">
-                            <svg v-if="t.copied" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                 stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-                              <path d="M20 6L9 17l-5-5"/>
-                            </svg>
-                            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                              <rect x="9" y="9" width="12" height="12" rx="2.5"/>
-                              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                            </svg>
-                          </button>
-                        </template>
-                      </span>
+                      <span v-if="noteText(t)" class="bar-note"
+                            :class="{ verifying: t.status === 'running' && t.verifying }"
+                            :title="noteText(t)">{{ noteText(t) }}</span>
                     </span>
+                  </span>
                   </span>
                   <!-- 操作（图标保持不变，按状态显隐） -->
                   <span class="acts">
@@ -2205,7 +3109,90 @@ onUnmounted(() => {
                     </button>
                   </span>
                 </div>
+                <!-- 文件夹任务：展开后的文件清单（收起时不渲染子项行，避免大量 DOM） -->
+                <div v-if="t.kind === 'dir' && t.expanded && visibleChildren(t).length" class="task-children">
+                  <!-- 子项列：文件图标 | 文件名 | 大小 | 进度(条+百分比) | SHA-256 | 操作 | 状态 -->
+                  <div v-for="c in visibleChildren(t)" :key="c.id" class="tc-item"
+                       :class="[c.status, { verifying: c.status === 'running' && c.verifying, skipped: c.skipped }]">
+                    <span class="tc-main">
+                    <span class="tc-ico">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                           stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 1.9h4.6l3.4 3.4v8.1a.9.9 0 0 1-.9.9H4a.9.9 0 0 1-.9-.9V2.8a.9.9 0 0 1 .9-.9z"/>
+                        <path d="M8.4 1.9v3.6h3.6"/>
+                      </svg>
+                    </span>
+                    <span class="tc-file">
+                      <span class="tc-name" :title="c.name">{{ c.name }}</span>
+                      <span class="tc-size">{{ fmtSize(c.size || 0) }}</span>
+                    </span>
+                    <span class="tc-bar" :title="c.status === 'running' && c.speed ? fmtSpeed(c.speed) : ''">
+                      <i :style="{ width: Math.min(100, c.pct) + '%' }"></i>
+                    </span>
+                    <span class="tc-pct">{{ childPctText(c) }}</span>
+                    <!-- 结果列：展示传输状态 / 错误信息 -->
+                    <span class="tc-result" :class="{ verifying: c.status === 'running' && c.verifying }"
+                          :title="childStateText(c)">
+                      <span class="tc-state">{{ childStateText(c) }}</span>
+                    </span>
+                    </span>
+                    <!-- 单文件级操作：暂停/继续/重试/打开/取消/移除，常态显示 -->
+                    <span class="tc-acts">
+                      <button v-if="c.status === 'success'" class="tc-act"
+                              title="打开目录" @click.stop="openTaskDir(c)">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+                             stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M2.3 4.6a1 1 0 0 1 1-1h2.5l1.3 1.6h5.6a1 1 0 0 1 1 1v5.8a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1z"/>
+                        </svg>
+                      </button>
+                      <button v-if="c.status === 'pending' || c.status === 'running'" class="tc-act"
+                              title="暂停" @click.stop="pauseTask(c)">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                             stroke-width="1.8" stroke-linecap="round">
+                          <path d="M6 3.4v9.2"/><path d="M10 3.4v9.2"/>
+                        </svg>
+                      </button>
+                      <button v-if="c.status === 'paused'" class="tc-act"
+                              title="继续" @click.stop="resumeTask(c)">
+                        <svg viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M5.6 3.4 12.1 8l-6.5 4.6z"/>
+                        </svg>
+                      </button>
+                      <button v-if="c.status === 'error' || c.status === 'cancelled'" class="tc-act"
+                              title="重试" @click.stop="retryTask(c)">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+                             stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M13.1 8a5.1 5.1 0 1 1-1.6-3.7"/><path d="M13.1 2.7v3.1H10"/>
+                        </svg>
+                      </button>
+                      <button v-if="c.status === 'pending' || c.status === 'running' || c.status === 'paused'"
+                              class="tc-act tc-act-x" title="取消" @click.stop="cancelTask(c)">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+                             stroke-linecap="round">
+                          <path d="M4.3 4.3l7.4 7.4M11.7 4.3l-7.4 7.4"/>
+                        </svg>
+                      </button>
+                      <button v-else class="tc-act tc-act-x"
+                              title="移除记录" @click.stop="removeTask(c)">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+                             stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M3 4.4h10"/><path d="M6.4 4.4V3.2h3.2v1.2"/>
+                          <path d="M4.4 4.4l.6 8a1 1 0 0 0 1 .9h4a1 1 0 0 0 1-.9l.6-8"/>
+                        </svg>
+                      </button>
+                    </span>
+                  </div>
+                </div>
               </div>
+              <!-- 上滚查看历史时，新任务在此提示；点击回到最新 -->
+              <button v-if="queueNewCount && !sftpQueueCollapsed" class="queue-latest"
+                      @click="scrollQueueToLatest">
+                {{ queueNewCount }} 个新任务
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 3.4v9.2M4.4 8.9 8 12.5l3.6-3.6"/>
+                </svg>
+              </button>
             </div>
           </div>
 
@@ -2335,7 +3322,7 @@ onUnmounted(() => {
           >
             <span class="log-time">{{ l.time }}</span>
             <span class="log-level">{{ l.level }}</span>
-            <span class="log-msg">
+            <span class="log-msg" data-selectable>
               <template v-for="(seg, i) in highlightParts(l.msg)" :key="i">
                 <mark v-if="seg.hit" class="log-hit"
                       :class="{ current: l.id === currentMatchId }">{{ seg.text }}</mark>
@@ -2356,5 +3343,17 @@ onUnmounted(() => {
 
     <!-- 右键菜单（Teleport 到 body，定位与键盘导航由组件内部完成） -->
     <ContextMenu v-model:visible="menuVisible" :x="menuX" :y="menuY" :items="menuItems" />
+
+    <!-- 拖拽跟随光标的信息条（Teleport 到 body，避免被 dock 边框裁剪） -->
+    <Teleport to="body">
+      <div v-if="dragSide" class="row-drag-ghost"
+           :style="{ left: dragPos.x + 14 + 'px', top: dragPos.y + 12 + 'px' }">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M14 3H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V9z"/>
+          <path d="M14 3v6h6"/>
+        </svg>
+        <span>{{ dragLabel }}</span>
+      </div>
+    </Teleport>
   </section>
 </template>

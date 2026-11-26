@@ -184,7 +184,7 @@ const hasVars = (s: Snippet) => effectiveVars(s).length > 0
   letter-spacing: 0.03em;
   color: var(--muted-2);
   text-align: left;
-  cursor: pointer;
+  cursor: default;
   transition:
     background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
@@ -226,7 +226,7 @@ const hasVars = (s: Snippet) => effectiveVars(s).length > 0
   padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: var(--radius-tab);
-  cursor: pointer;
+  cursor: default;
   transition:
     background var(--dur-fast) var(--ease),
     border-color var(--dur-fast) var(--ease);
@@ -292,7 +292,7 @@ const hasVars = (s: Snippet) => effectiveVars(s).length > 0
   background: transparent;
   border: none;
   border-radius: var(--radius-control);
-  cursor: pointer;
+  cursor: default;
   transition:
     background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);

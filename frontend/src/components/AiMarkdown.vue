@@ -48,7 +48,7 @@ async function onClick(e: MouseEvent) {
 
 <template>
   <!-- markdown-it html:false 已转义传入 HTML，v-html 安全 -->
-  <div class="md" :class="{ 'term-ready': terminalReady }" v-html="html" @click="onClick"></div>
+  <div class="md" data-selectable :class="{ 'term-ready': terminalReady }" v-html="html" @click="onClick"></div>
 </template>
 
 <style scoped>
@@ -165,7 +165,7 @@ async function onClick(e: MouseEvent) {
   background: transparent;
   color: var(--muted-2);
   font-size: 10.5px;
-  cursor: pointer;
+  cursor: default;
   padding: 2px 4px;
   border-radius: 4px;
   transition: color 0.15s, background 0.15s;

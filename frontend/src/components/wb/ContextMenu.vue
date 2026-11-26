@@ -10,6 +10,8 @@ export interface MenuItem {
   disabled?: boolean
   danger?: boolean
   divider?: boolean
+  /** 勾选态：为 true 时在图标位置渲染对勾（用于「显示隐藏文件」这类开关项） */
+  checked?: boolean
   action?: () => void
 }
 
@@ -153,7 +155,8 @@ watch(appLocked, (locked) => {
              @click="pick(idx)" @mouseenter="activeIdx = idx">
           <svg class="ctx-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path v-if="item.icon" :d="item.icon"/>
+            <path v-if="item.checked" d="M5 12l4 4 10-10"/>
+            <path v-else-if="item.icon" :d="item.icon"/>
           </svg>
           <span class="ctx-label">{{ item.label }}</span>
           <span v-if="item.shortcut" class="ctx-shortcut">{{ item.shortcut }}</span>

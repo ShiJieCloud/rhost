@@ -155,10 +155,6 @@ export interface AppSettings {
   logMaxFiles: number
   /** 日志文件保留天数，超过后按时间清理旧文件 */
   logRetentionDays: number
-  /** 可恢复错误的自动重试最大次数 */
-  sftpRetryCount: number
-  /** 重试前等待毫秒 */
-  sftpRetryIntervalMs: number
   /** SFTP 子通道空闲超时秒数，超时自动关闭（SSH 终端不受影响），0 不自动关闭 */
   sftpIdleTimeoutSec: number
   /** 传输完成后对整文件做 SHA256 完整性校验 */
@@ -270,8 +266,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   logRotate: 'daily',
   logMaxFiles: 100,
   logRetentionDays: 30,
-  sftpRetryCount: 3,
-  sftpRetryIntervalMs: 1000,
   sftpIdleTimeoutSec: 300,
   sftpVerifyHash: false,
   sftpBlacklist: '.DS_Store\nThumbs.db',
