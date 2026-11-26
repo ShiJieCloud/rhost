@@ -1825,7 +1825,7 @@ function openPaneMenu(side: Side, e: MouseEvent) {
 
 /* 行交互：单击选择（Ctrl/⌘ 多选）、双击目录进入、双击文件传输 */
 function onRowClick(side: Side, entry: FsEntry, e: MouseEvent) {
-  if (Date.now() < suppressClickUntil) return // 刚结束拖拽：忽略释放时产生的 click
+  if (pointerMoved) return // 释放动作补发的 click：不改写选区
   lastSide.value = side
   const sel = side === 'local' ? localSelected : remoteSelected
   if (e.ctrlKey || e.metaKey) {
@@ -1877,9 +1877,120 @@ let pendingDrag: { side: Side; entry: FsEntry; x: number; y: number } | null = n
 /** 拖拽中指针位置与跟手信息条文案 */
 const dragPos = reactive({ x: 0, y: 0 })
 const dragLabel = ref('')
-/** 拖拽后短暂抑制行 click，避免释放时改写选区 */
-let suppressClickUntil = 0
 const DRAG_THRESHOLD = 5
+/** 行内可起文件拖拽的热区：图标、文件名、链接徽标、各列文字。
+ *  其余位置（列内空白、名称列空白）都视为空白，交给框选。 */
+const ROW_DRAG_HOT = '.row-icon, .row-text, .link-badge, .cell-text'
+
+/** 本轮按下（pointerdown → click）是否发生过框选或拖拽。
+ *  释放时浏览器会补发一次 click，用它把这次 click 从选中逻辑中排除，
+ *  避免刚框选完就被清空、拖拽后选区被改写；下一次 pointerdown 复位。 */
+let pointerMoved = false
+
+/* ---- 空白区域框选：在列表空白或行的非名称区域按下拖动，选中覆盖的文件 ---- */
+const marquee = ref<{
+  side: Side
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  additive: boolean
+  moved: boolean
+} | null>(null)
+let marqueeBase: Set<string> = new Set()
+
+/** 点击空白（列表空白或行内非文字区域）取消该侧选中 */
+function onPaneClick(side: Side, e: MouseEvent) {
+  if (pointerMoved) return // 释放动作补发的 click：不清空刚框选/刚拖拽的选区
+  const t = e.target as HTMLElement
+  if (t.closest('input') || t.closest(ROW_DRAG_HOT)) return
+  lastSide.value = side
+  sideSel(side).value = new Set()
+}
+
+function onPanePointerDown(e: PointerEvent, side: Side) {
+  if (e.button !== 0) return
+  pointerMoved = false // 新一轮交互开始
+  const el = e.currentTarget as HTMLElement
+  const t = e.target as HTMLElement
+  // 只有文字/图标热区参与行拖拽与点选；列内空白与名称列空白按空白处理，
+  // 这样列表被文件铺满时仍能在任意列的空白处起框选
+  if (t.closest('input') || t.closest(ROW_DRAG_HOT)) return
+  // 排除非 overlay 滚动条区域，避免拖滚动条时误触发框选
+  const rect = el.getBoundingClientRect()
+  if (e.clientX > rect.left + el.clientWidth || e.clientY > rect.top + el.clientHeight) return
+  lastSide.value = side
+  marqueeBase = new Set(sideSel(side).value)
+  marquee.value = {
+    side,
+    x1: e.clientX,
+    y1: e.clientY,
+    x2: e.clientX,
+    y2: e.clientY,
+    additive: e.ctrlKey || e.metaKey || e.shiftKey,
+    moved: false,
+  }
+  window.addEventListener('pointermove', onMarqueeMove)
+  window.addEventListener('pointerup', onMarqueeUp)
+  window.addEventListener('pointercancel', onMarqueeUp)
+}
+
+function marqueeBox() {
+  const m = marquee.value
+  if (!m) return { left: 0, top: 0, width: 0, height: 0 }
+  let left = Math.min(m.x1, m.x2)
+  let top = Math.min(m.y1, m.y2)
+  let right = Math.max(m.x1, m.x2)
+  let bottom = Math.max(m.y1, m.y2)
+  // 夹取到列表可视区：矩形不覆盖表头/工具栏，也不会选中被滚动裁掉的行
+  const list = document.querySelector<HTMLElement>(`.pane.${m.side} .pane-list`)
+  if (list) {
+    const r = list.getBoundingClientRect()
+    left = Math.max(left, r.left)
+    top = Math.max(top, r.top)
+    right = Math.min(right, r.right)
+    bottom = Math.min(bottom, r.bottom)
+  }
+  return { left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) }
+}
+
+/** 按矩形与行元素的实际矩形求交，实时刷新该侧选择集 */
+function applyMarquee() {
+  const m = marquee.value
+  if (!m) return
+  const list = document.querySelector<HTMLElement>(`.pane.${m.side} .pane-list`)
+  if (!list) return
+  const box = marqueeBox()
+  const right = box.left + box.width
+  const bottom = box.top + box.height
+  const hit = new Set<string>(m.additive ? marqueeBase : [])
+  for (const row of list.querySelectorAll<HTMLElement>('.row')) {
+    const b = row.getBoundingClientRect()
+    if (b.left < right && b.right > box.left && b.top < bottom && b.bottom > box.top) {
+      const name = row.dataset.name
+      if (name) hit.add(name)
+    }
+  }
+  sideSel(m.side).value = hit
+}
+
+function onMarqueeMove(e: PointerEvent) {
+  const m = marquee.value
+  if (!m) return
+  const moved = m.moved || Math.abs(e.clientX - m.x1) + Math.abs(e.clientY - m.y1) > 3
+  marquee.value = { ...m, x2: e.clientX, y2: e.clientY, moved }
+  if (moved) {
+    pointerMoved = true
+    applyMarquee()
+  }
+}
+
+function onMarqueeUp() {
+  marquee.value = null
+  window.removeEventListener('pointermove', onMarqueeMove)
+  window.removeEventListener('pointerup', onMarqueeUp)
+  window.removeEventListener('pointercancel', onMarqueeUp)
+}
 
 /* 边缘自动滚动：指针停靠在列表上下边缘时持续滚动，便于拖到视野外的目录 */
 let autoScrollList: HTMLElement | null = null
@@ -1926,7 +2037,11 @@ function clearDropTarget() {
 
 function onRowPointerDown(side: Side, entry: FsEntry, e: PointerEvent) {
   if (e.button !== 0 || sftpLocked.value) return
-  if ((e.target as HTMLElement).closest('input')) return // 行内重命名输入框不触发拖拽
+  pointerMoved = false // 新一轮交互开始
+  const t = e.target as HTMLElement
+  if (t.closest('input')) return // 行内重命名输入框不触发拖拽
+  // 只有按在图标/文件名/列内文字上才起拖；列内空白留给框选
+  if (!t.closest(ROW_DRAG_HOT)) return
   pendingDrag = { side, entry, x: e.clientX, y: e.clientY }
 }
 
@@ -1969,6 +2084,7 @@ function startInternalDrag(e: PointerEvent) {
   pendingDrag = null
   const sel = sideSel(p.side)
   if (!sel.value.has(p.entry.name)) sel.value = new Set([p.entry.name])
+  pointerMoved = true // 拖拽已启动：松手补发的 click 不改写选区
   dragSide.value = p.side
   dragLabel.value = sel.value.size > 1 ? `${p.entry.name} 等 ${sel.value.size} 项` : p.entry.name
   dragPos.x = e.clientX
@@ -2007,8 +2123,6 @@ function finishInternalDrag(commit: boolean) {
   dragPos.y = 0
   document.body.classList.remove('row-dragging')
   if (!src) { clearDropTarget(); return }
-  // 拖拽结束后抑制一次 click（指针回到原行释放时浏览器仍会派发 click）
-  suppressClickUntil = Date.now() + 300
   const target = commit ? dropSide.value : null
   const targetDir = dropDir.value
   clearDropTarget()
@@ -2702,7 +2816,9 @@ onUnmounted(() => {
                 </div>
               </div>
               <div class="pane-list-wrap" :class="{ 'drop-active': dropSide === 'local' }">
-                <div class="pane-list" @contextmenu="onBlankContext($event, 'local')" @scroll="onListScroll">
+                <div class="pane-list" @contextmenu="onBlankContext($event, 'local')"
+                     @scroll="onListScroll" @pointerdown="onPanePointerDown($event, 'local')"
+                     @click="onPaneClick('local', $event)">
                 <div v-if="!localEntries.length && !(edit && edit.side==='local' && edit.kind!=='rename')" class="pane-empty">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -2750,10 +2866,10 @@ onUnmounted(() => {
                         <path d="M9 14h3a3 3 0 0 0 0-6h-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
                       </svg>
                     </div>
-                    <div class="row-size">{{ e.type==='dir' ? '—' : fmtSize(e.size) }}</div>
-                    <div class="row-time">{{ e.mtime }}</div>
-                    <div class="row-perm">{{ e.perm }}</div>
-                    <div class="row-owner">{{ e.owner }}</div>
+                    <div class="row-size"><span class="cell-text">{{ e.type==='dir' ? '—' : fmtSize(e.size) }}</span></div>
+                    <div class="row-time"><span class="cell-text">{{ e.mtime }}</span></div>
+                    <div class="row-perm"><span class="cell-text">{{ e.perm }}</span></div>
+                    <div class="row-owner"><span class="cell-text">{{ e.owner }}</span></div>
                   </div>
                   <!-- 新建文件夹/文件编辑行（列表底部，不隐藏已有文件） -->
                   <div v-if="edit && edit.side==='local' && (edit.kind==='mkdir' || edit.kind==='mkfile')"
@@ -2851,7 +2967,9 @@ onUnmounted(() => {
                 </div>
               </div>
               <div class="pane-list-wrap" :class="{ 'drop-active': dropSide === 'remote' }">
-                <div class="pane-list" @contextmenu="onBlankContext($event, 'remote')" @scroll="onListScroll">
+                <div class="pane-list" @contextmenu="onBlankContext($event, 'remote')"
+                     @scroll="onListScroll" @pointerdown="onPanePointerDown($event, 'remote')"
+                     @click="onPaneClick('remote', $event)">
                 <div v-if="!remoteEntries.length && !(edit && edit.side==='remote' && edit.kind!=='rename')" class="pane-empty">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -2898,10 +3016,10 @@ onUnmounted(() => {
                         <path d="M9 14h3a3 3 0 0 0 0-6h-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
                       </svg>
                     </div>
-                    <div class="row-size">{{ e.type==='dir' ? '—' : fmtSize(e.size) }}</div>
-                    <div class="row-time">{{ e.mtime }}</div>
-                    <div class="row-perm">{{ e.perm }}</div>
-                    <div class="row-owner">{{ e.owner }}</div>
+                    <div class="row-size"><span class="cell-text">{{ e.type==='dir' ? '—' : fmtSize(e.size) }}</span></div>
+                    <div class="row-time"><span class="cell-text">{{ e.mtime }}</span></div>
+                    <div class="row-perm"><span class="cell-text">{{ e.perm }}</span></div>
+                    <div class="row-owner"><span class="cell-text">{{ e.owner }}</span></div>
                   </div>
                   <!-- 新建文件夹/文件编辑行（列表底部，不隐藏已有文件） -->
                   <div v-if="edit && edit.side==='remote' && (edit.kind==='mkdir' || edit.kind==='mkfile')"
